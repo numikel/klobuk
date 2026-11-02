@@ -298,8 +298,13 @@ pub struct CommentArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum MergeCmd {
-    /// Queue an issue's branch (`feat/<id>`) by hand.
-    Enqueue { id: IssueId },
+    /// Queue an issue's branch (`feat/<id>`). Requires a verified (`succeeded`) run unless `--force`.
+    Enqueue {
+        id: IssueId,
+        /// Queue even without a verified run (operator only; the merge still re-checks scope and gates).
+        #[arg(long)]
+        force: bool,
+    },
     /// The queue in FIFO order.
     List,
     /// Process queued items: rebase onto the default branch, run gates, fast-forward.

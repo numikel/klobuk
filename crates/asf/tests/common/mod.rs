@@ -44,6 +44,7 @@ impl Repo {
         let mut c = Command::cargo_bin("asf").unwrap();
         c.current_dir(cwd);
         c.env_remove("ASF_ISSUE");
+        c.env_remove("ASF_RUN");
         c
     }
 

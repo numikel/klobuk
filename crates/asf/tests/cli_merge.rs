@@ -234,11 +234,89 @@ fn enqueue_requires_known_issue_and_list_is_fifo() {
     let (code, ecode, _) = f.repo.err(&["merge", "enqueue", "asf-9"]);
     assert_eq!((code, ecode.as_str()), (1, "not_found"));
     let b = f.repo.create_issue("second", &["--ready"]);
-    f.repo.ok(&["merge", "enqueue", &b]);
-    f.repo.ok(&["merge", "enqueue", &f.issue]);
+    f.repo.ok(&["merge", "enqueue", &b, "--force"]);
+    f.repo.ok(&["merge", "enqueue", &f.issue, "--force"]);
     let l = f.repo.ok(&["merge", "list"]);
     assert_eq!(l[0]["issue_id"], "asf-2");
     assert_eq!(l[1]["issue_id"], "asf-1");
     let human = f.repo.asf().args(["merge", "list"]).output().unwrap();
     assert!(String::from_utf8_lossy(&human.stdout).contains("queued"));
+}
+
+#[test]
+fn enqueue_refuses_an_issue_without_a_verified_run_unless_forced() {
+    let f = setup();
+    let (code, ecode, msg) = f.repo.err(&["merge", "enqueue", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (3, "conflict"), "{msg}");
+    assert!(msg.contains("--force"), "{msg}");
+    f.repo.ok(&["merge", "enqueue", &f.issue, "--force"]);
+    assert_eq!(f.repo.ok(&["merge", "list"]).as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn enqueue_accepts_a_verified_run_without_force() {
+    let f = setup();
+    finished_run(&f, &[("src/lib2.rs", "pub fn b() {}\n")]);
+    // verification already queued it; skipping and enqueueing again by hand must work without --force
+    f.repo.ok(&["merge", "skip", &f.issue]);
+    f.repo.ok(&["merge", "enqueue", &f.issue]);
+    assert_eq!(f.repo.ok(&["merge", "list"]).as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn worker_context_cannot_drive_the_orchestrator() {
+    let f = setup();
+    let worker = |args: &[&str]| {
+        let out = f
+            .repo
+            .asf()
+            .env("ASF_RUN", "01RUN")
+            .env("ASF_ISSUE", &f.issue)
+            .args(args)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        (out.status.code().unwrap(), v)
+    };
+    for args in [
+        vec!["merge", "enqueue", f.issue.as_str(), "--force"],
+        vec!["merge", "tick", "--once"],
+        vec!["run", "start", f.issue.as_str()],
+        vec!["serve", "--once"],
+        vec!["issue", "status", f.issue.as_str(), "done"],
+        vec!["issue", "release", f.issue.as_str()],
+    ] {
+        let (code, v) = worker(&args);
+        assert_eq!(v["ok"], false, "{args:?}: {v}");
+        assert_eq!(v["error"]["code"], "forbidden", "{args:?}: {v}");
+        assert_eq!(code, 1, "{args:?}");
+    }
+    let (code, v) = worker(&["issue", "show", &f.issue]);
+    assert_eq!((code, v["ok"].as_bool()), (0, Some(true)), "{v}");
+    let (code, v) = worker(&[
+        "issue", "comment", &f.issue, "--type", "STATUS", "--body", "working",
+    ]);
+    assert_eq!((code, v["ok"].as_bool()), (0, Some(true)), "{v}");
+    assert!(f.repo.ok(&["merge", "list"]).as_array().unwrap().is_empty());
+}
+
+#[test]
+fn tick_blocks_when_the_branch_gained_out_of_scope_commits_after_verification() {
+    let f = setup();
+    finished_run(&f, &[("src/lib2.rs", "pub fn b() {}\n")]);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    commit_in(&wt, "docs/sneaky.md", "# not in scope\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "blocked", "{res}");
+    assert!(res["items"][0]["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("docs/sneaky.md"));
+    assert!(!main_has(&f, "docs/sneaky.md"));
+    assert!(!main_has(&f, "src/lib2.rs"));
+    let cs = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
+    assert!(cs
+        .iter()
+        .any(|c| c.kind == CommentType::Blocker && c.body.contains("docs/sneaky.md")));
 }

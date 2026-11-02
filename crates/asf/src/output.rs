@@ -13,6 +13,8 @@ pub enum ErrorCode {
     NotFound,
     /// A worker is waiting for a human (exit 1).
     Blocked,
+    /// An orchestrator command issued from inside a worker run (exit 1).
+    Forbidden,
     Validation,
     Io,
     Backend,
@@ -46,6 +48,10 @@ impl AppError {
 
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Conflict, message)
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Forbidden, message)
     }
 
     pub fn io(message: impl Into<String>) -> Self {

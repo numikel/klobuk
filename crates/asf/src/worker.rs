@@ -70,6 +70,24 @@ fn rt_err(e: RuntimeError) -> AppError {
     AppError::new(code, e.to_string())
 }
 
+/// Changed paths that no scope glob matches. An empty scope means "no restriction"; an invalid
+/// glob is ignored (validated at issue creation).
+pub(crate) fn files_outside_scope(changed: &[String], scope: &[String]) -> Vec<String> {
+    if scope.is_empty() {
+        return Vec::new();
+    }
+    let mut b = globset::GlobSetBuilder::new();
+    for g in scope {
+        if let Ok(gl) = globset::Glob::new(g) {
+            b.add(gl);
+        }
+    }
+    match b.build() {
+        Ok(set) => changed.iter().filter(|f| !set.is_match(f)).cloned().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn vcs_err(e: VcsError) -> AppError {
     match e {
         VcsError::NotFound(m) => AppError::not_found(m),
@@ -614,23 +632,13 @@ impl<'a> Worker<'a> {
         if changed.is_empty() {
             problems.push("no committed changes since the base".into());
         }
-        if !issue.file_scope.is_empty() {
-            let mut b = globset::GlobSetBuilder::new();
-            for g in &issue.file_scope {
-                if let Ok(gl) = globset::Glob::new(g) {
-                    b.add(gl);
-                }
-            }
-            if let Ok(set) = b.build() {
-                let outside: Vec<&String> = changed.iter().filter(|f| !set.is_match(f)).collect();
-                if !outside.is_empty() {
-                    problems.push(format!(
-                        "files outside scope [{}]: {}",
-                        issue.file_scope.join(", "),
-                        outside.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                    ));
-                }
-            }
+        let outside = files_outside_scope(&changed, &issue.file_scope);
+        if !outside.is_empty() {
+            problems.push(format!(
+                "files outside scope [{}]: {}",
+                issue.file_scope.join(", "),
+                outside.join(", ")
+            ));
         }
         let specs: Vec<GateSpec> = self
             .ctx

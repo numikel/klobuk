@@ -127,10 +127,7 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
             Some(format!("keys {} sent to {id}", keys.join(" ")))
         }
         Action::Enqueue(id) => {
-            let run_id = ctx.store.runs(Some(&id), false)?.into_iter().last().map(|r| r.id);
-            let m = ctx
-                .store
-                .enqueue_merge(&id, run_id.as_deref(), &format!("feat/{id}"))?;
+            let m = crate::commands::merge::enqueue_checked(ctx, &id, false)?;
             Some(format!("queued #{} {}", m.id, id))
         }
         Action::Abort(id) => {

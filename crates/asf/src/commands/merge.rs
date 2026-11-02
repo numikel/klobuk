@@ -11,6 +11,35 @@ use crate::cli::{Cli, MergeCmd};
 use crate::ctx::Ctx;
 use crate::output::{AppError, ErrorCode, Rendered};
 
+/// Queues `feat/<id>` linked to the issue's latest run. Without `force` the latest run must be
+/// `succeeded` (independently verified): a worker cannot push its own branch into the queue.
+pub fn enqueue_checked(ctx: &Ctx, id: &IssueId, force: bool) -> Result<MergeItem, AppError> {
+    if ctx.store.get_issue(id)?.is_none() {
+        return Err(AppError::not_found(format!("issue {id} not found")));
+    }
+    let latest = ctx.store.runs(Some(id), false)?.into_iter().last();
+    if !force {
+        match &latest {
+            Some(r) if r.state == RunState::Succeeded => {}
+            Some(r) => {
+                return Err(AppError::conflict(format!(
+                    "{id}: latest run {} is `{}`, not `succeeded`; let `asf run watch` verify it, or `asf merge enqueue {id} --force` as the operator",
+                    r.id, r.state
+                )))
+            }
+            None => {
+                return Err(AppError::conflict(format!(
+                    "{id} has no run to verify; `asf merge enqueue {id} --force` queues the branch by hand (operator only)"
+                )))
+            }
+        }
+    }
+    let run_id = latest.map(|r| r.id);
+    Ok(ctx
+        .store
+        .enqueue_merge(id, run_id.as_deref(), &format!("feat/{id}"))?)
+}
+
 #[derive(Serialize)]
 pub struct TickResult {
     pub processed: usize,
@@ -20,11 +49,8 @@ pub struct TickResult {
 pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
     let ctx = Ctx::load(cli)?;
     match cmd {
-        MergeCmd::Enqueue { id } => {
-            let run_id = ctx.store.runs(Some(id), false)?.into_iter().last().map(|r| r.id);
-            let item = ctx
-                .store
-                .enqueue_merge(id, run_id.as_deref(), &format!("feat/{id}"))?;
+        MergeCmd::Enqueue { id, force } => {
+            let item = enqueue_checked(&ctx, id, *force)?;
             Rendered::new(
                 &item,
                 format!("#{} {} queued ({})", item.id, item.issue_id, item.branch),
@@ -247,7 +273,35 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
         Err(e) => return fail(ctx, item, MergeState::Failed, format!("rebase failed: {e}"), None),
     }
 
-    // 2. gates
+    // 2. scope re-check: the branch may have gained commits after verification
+    if let Some(issue) = ctx.store.get_issue(&item.issue_id)? {
+        let changed = vcs
+            .changed_files(&wt, &main_head)
+            .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
+        let outside = crate::worker::files_outside_scope(&changed, &issue.file_scope);
+        if !outside.is_empty() {
+            let msg = format!(
+                "{} touches files outside scope [{}]: {}",
+                item.branch,
+                issue.file_scope.join(", "),
+                outside.join(", ")
+            );
+            let updated = fail(ctx, item, MergeState::Blocked, msg.clone(), None)?;
+            comment(
+                ctx,
+                &item.issue_id,
+                CommentType::Blocker,
+                LANE_HUMAN,
+                format!(
+                    "{msg}\n\nDrop or move those changes in the worktree, then `asf merge retry {}`.",
+                    item.issue_id
+                ),
+            )?;
+            return Ok(updated);
+        }
+    }
+
+    // 3. gates
     set(
         ctx,
         item.id,
@@ -302,7 +356,7 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
         },
     )?;
 
-    // 3. fast-forward
+    // 4. fast-forward
     set(
         ctx,
         item.id,
