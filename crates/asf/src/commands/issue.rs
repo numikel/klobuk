@@ -373,6 +373,16 @@ fn finish(ctx: &Ctx, id: &IssueId, report: &Path) -> Result<Rendered, AppError> 
         body: format!("finished; report: {report_str}"),
         reply_to: None,
     })?;
+    if let Some(run) = ctx.store.runs(Some(id), true)?.into_iter().last() {
+        ctx.store.update_run(
+            &run.id,
+            &RunPatch {
+                state: Some(RunState::Finishing),
+                report_path: Some(report_str.clone()),
+                ..RunPatch::default()
+            },
+        )?;
+    }
     let text = format!("{} -> in-review; report {report_str}", issue.id);
     Rendered::new(&FinishView { issue, comment }, text)
 }

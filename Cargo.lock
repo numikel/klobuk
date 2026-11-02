@@ -76,6 +76,7 @@ dependencies = [
  "asf-store",
  "assert_cmd",
  "clap",
+ "globset",
  "predicates",
  "serde",
  "serde_json",

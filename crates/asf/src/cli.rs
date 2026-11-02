@@ -56,6 +56,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: RunCmd,
     },
+    /// Claude Code hooks (run inside a worker session; JSON on stdin).
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
     /// Write `.factory/issues.jsonl` (or `--out`).
     Export(ExportArgs),
     /// Load a JSONL export into this store.
@@ -252,6 +257,18 @@ pub struct CommentArgs {
     pub body_file: Option<PathBuf>,
     #[arg(long)]
     pub reply_to: Option<i64>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookCmd {
+    /// PreToolUse: deny edits outside the issue's file scope or worktree.
+    PreTool,
+    /// PostToolUse: count tool calls, record session, enforce max_tool_calls.
+    PostTool,
+    /// Stop: block once until `asf issue finish` ran.
+    Stop,
+    /// statusLine: record cost from Claude's estimate, enforce budget.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
