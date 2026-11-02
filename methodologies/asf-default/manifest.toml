@@ -1,0 +1,31 @@
+# asf-default: idea -> PRD -> issues, both steps headless (`claude -p --json-schema`).
+# `asf plan new --from idea.md` runs these two stages and imports the result.
+
+[methodology]
+name = "asf-default"
+version = "0.1.0"
+language = "en"
+description = "Idea to PRD to issues via headless Claude with JSON schemas; no external tooling."
+
+[[stage]]
+id = "idea-to-prd"
+title = "Idea to PRD"
+kind = "prompt"
+prompt = "prompts/idea-to-prd.md"
+schema = "schemas/prd.json"
+inputs = ["idea.md"]
+outputs = [".factory/plan/<slug>/prd.json"]
+
+[[stage]]
+id = "prd-to-issues"
+title = "PRD to issues"
+kind = "prompt"
+prompt = "prompts/prd-to-issues.md"
+schema = "schemas/issues.json"
+inputs = [".factory/plan/<slug>/prd.json"]
+outputs = [".factory/plan/<slug>/issues.json"]
+parser = "builtin:json-issues"
+
+[issue_defaults]
+labels = []
+priority = 2

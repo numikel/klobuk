@@ -4,6 +4,7 @@ pub mod hook;
 pub mod issue;
 pub mod lane;
 pub mod merge;
+pub mod method;
 pub mod plan;
 pub mod repo;
 pub mod run;
@@ -18,7 +19,7 @@ use crate::output::{AppError, Rendered};
 /// orchestrator's and is refused there, whatever the Claude Code allowlist says.
 fn allowed_in_worker(cmd: &Cmd) -> bool {
     match cmd {
-        Cmd::Hook { .. } | Cmd::Lane { .. } => true,
+        Cmd::Hook { .. } | Cmd::Lane { .. } | Cmd::Method { .. } => true,
         Cmd::Repo { cmd } => !matches!(cmd, crate::cli::RepoCmd::Init(_)),
         Cmd::Issue { cmd } => matches!(
             cmd,
@@ -46,6 +47,7 @@ fn top_level_name(cmd: &Cmd) -> &'static str {
         Cmd::Issue { .. } => "issue",
         Cmd::Plan { .. } => "plan",
         Cmd::Lane { .. } => "lane",
+        Cmd::Method { .. } => "method",
         Cmd::Run { .. } => "run",
         Cmd::Merge { .. } => "merge",
         Cmd::Hook { .. } => "hook",
@@ -70,6 +72,7 @@ pub fn dispatch(cli: &Cli) -> Result<Rendered, AppError> {
         Cmd::Issue { cmd } => issue::run(cli, cmd),
         Cmd::Plan { cmd } => plan::run(cli, cmd),
         Cmd::Lane { cmd } => lane::run(cli, cmd),
+        Cmd::Method { cmd } => method::run(cli, cmd),
         Cmd::Run { cmd } => run::run(cli, cmd),
         Cmd::Merge { cmd } => merge::run(cli, cmd),
         Cmd::Hook { cmd } => hook::run(cli, cmd),

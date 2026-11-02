@@ -187,6 +187,21 @@ impl Default for PlannerCfg {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MethodologyCfg {
+    /// Name of the active methodology (`asf method list`).
+    pub name: String,
+}
+
+impl Default for MethodologyCfg {
+    fn default() -> Self {
+        MethodologyCfg {
+            name: "asf-default".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewCfg {
@@ -207,6 +222,7 @@ pub struct Config {
     pub merge: MergeCfg,
     pub review: ReviewCfg,
     pub planner: PlannerCfg,
+    pub methodology: MethodologyCfg,
 }
 
 const TEMPLATE: &str = r#"# auto-software-factory configuration (committed). Unknown sections are ignored.
@@ -226,6 +242,9 @@ export_comments = true
 
 [ui]
 language = "en"           # en | pl
+
+[methodology]
+name = "asf-default"      # `asf method list`; repo-local ones live in .factory/methodologies/<name>/
 
 [worker]
 runtime = "herdr"         # herdr | fake

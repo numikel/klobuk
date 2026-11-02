@@ -51,6 +51,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: PlanCmd,
     },
+    /// Planning methodologies: shipped manifests and `.factory/methodologies/`.
+    Method {
+        #[command(subcommand)]
+        cmd: MethodCmd,
+    },
     /// Lanes = active claims and their worktrees.
     Lane {
         #[command(subcommand)]
@@ -329,6 +334,14 @@ pub enum HookCmd {
     Stop,
     /// statusLine: record cost from Claude's estimate, enforce budget.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MethodCmd {
+    /// Shipped and repo-local methodologies; `*` marks the one in `[methodology] name`.
+    List,
+    /// Parse `<dir>/manifest.toml` and check its stages and referenced files.
+    Validate { dir: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]

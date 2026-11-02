@@ -15,6 +15,7 @@ pub mod error;
 pub mod ids;
 pub mod jsonl;
 pub mod lane;
+pub mod method;
 pub mod model;
 pub mod plan;
 pub mod ports;

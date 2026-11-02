@@ -1,0 +1,30 @@
+# superpowers (MIT): brainstorming -> writing-plans produces docs/superpowers/plans/<date>-<name>.md
+# with `### Task N:` headings, `**Files:**` blocks and checkbox steps.
+# asf imports it: `asf plan import docs/superpowers/plans/<file>.md`.
+
+[methodology]
+name = "superpowers"
+version = "0.1.0"
+language = "en"
+description = "Brainstorm and plan with the superpowers skills; asf imports the writing-plans markdown."
+
+[[stage]]
+id = "brainstorm"
+title = "Brainstorm the design"
+kind = "skill"
+skill = "superpowers:brainstorming"
+runner = "interactive"
+outputs = ["docs/superpowers/specs/*.md"]
+
+[[stage]]
+id = "plan"
+title = "Write the implementation plan"
+kind = "skill"
+skill = "superpowers:writing-plans"
+runner = "interactive"
+inputs = ["docs/superpowers/specs/*.md"]
+outputs = ["docs/superpowers/plans/*.md"]
+parser = "builtin:md-tasks"
+
+[issue_defaults]
+labels = ["superpowers"]
