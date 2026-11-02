@@ -9,6 +9,7 @@
 /plans/
 *.md
 !CLAUDE.md
+!methodologies/**/*.md
 !crates/**/README.md.keep
 
 # --- Factory runtime state (per repo, local only) ---

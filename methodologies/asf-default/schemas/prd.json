@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "summary", "goals", "non_goals", "constraints", "prd_markdown"],
+  "properties": {
+    "title": { "type": "string", "minLength": 3, "maxLength": 80 },
+    "summary": { "type": "string" },
+    "goals": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "non_goals": { "type": "array", "items": { "type": "string" } },
+    "constraints": { "type": "array", "items": { "type": "string" } },
+    "prd_markdown": { "type": "string" }
+  }
+}

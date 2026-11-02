@@ -28,6 +28,7 @@ pub struct DraftTask {
     /// Task numbers this task depends on (explicit, or the implicit previous task).
     pub depends_on: Vec<u32>,
     pub parallel: bool,
+    pub estimate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +152,7 @@ pub fn parse_md_tasks(md: &str) -> Result<ParsedPlan, PlanParseError> {
                 acceptance: Vec::new(),
                 depends_on: Vec::new(),
                 parallel,
+                estimate: None,
             });
             explicit.push(None);
             files_mode = false;

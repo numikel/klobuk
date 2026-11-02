@@ -335,6 +335,20 @@ pub enum PlanCmd {
         #[arg(long)]
         no_epic: bool,
     },
+    /// Idea → PRD → issues via headless Claude (`[planner]` in config); artifacts under `.factory/plan/<slug>/`.
+    New {
+        /// Markdown/text file with the idea or brainstorm.
+        #[arg(long)]
+        from: PathBuf,
+        /// Generate artifacts, create no issues.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        no_epic: bool,
+        /// Plan folder name (default: slug of the PRD title).
+        #[arg(long)]
+        slug: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -166,6 +166,27 @@ impl Default for MergeCfg {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlannerCfg {
+    /// `claude` (headless `claude -p`) or `fake` (tests).
+    pub runner: String,
+    pub model: String,
+    pub budget_usd: f64,
+    pub max_turns: u32,
+}
+
+impl Default for PlannerCfg {
+    fn default() -> Self {
+        PlannerCfg {
+            runner: "claude".into(),
+            model: "claude-haiku-5-5".into(),
+            budget_usd: 1.0,
+            max_turns: 15,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewCfg {
@@ -185,6 +206,7 @@ pub struct Config {
     pub gates: Vec<GateCfg>,
     pub merge: MergeCfg,
     pub review: ReviewCfg,
+    pub planner: PlannerCfg,
 }
 
 const TEMPLATE: &str = r#"# auto-software-factory configuration (committed). Unknown sections are ignored.
@@ -233,6 +255,12 @@ require_clean_main = true
 [review]
 required = false
 on_labels = []            # e.g. ["risky"]: labels that force a review worker before merge
+
+[planner]
+runner = "claude"         # claude (headless `claude -p`, read-only tools) | fake (tests)
+model = "claude-haiku-5-5"
+budget_usd = 1.0          # per planning step
+max_turns = 15
 "#;
 
 impl Config {
@@ -279,6 +307,12 @@ impl Config {
                     g.name
                 )));
             }
+        }
+        if !matches!(self.planner.runner.as_str(), "claude" | "fake") {
+            return Err(ConfigError::Invalid(format!(
+                "planner.runner `{}` must be claude or fake",
+                self.planner.runner
+            )));
         }
         if !matches!(self.merge.target.as_str(), "local" | "github") {
             return Err(ConfigError::Invalid(format!(

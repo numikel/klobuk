@@ -111,3 +111,117 @@ fn import_without_epic_and_bad_file() {
     assert_eq!((code, ecode.as_str()), (1, "validation"));
     assert!(msg.contains("no tasks"), "{msg}");
 }
+
+fn fake_llm(repo: &Repo, responses: serde_json::Value) {
+    std::fs::write(
+        repo.path().join(".factory/fake-llm.json"),
+        serde_json::json!({ "responses": responses }).to_string(),
+    )
+    .unwrap();
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("runner = \"claude\"", "runner = \"fake\"");
+    assert!(
+        s.contains("runner = \"fake\""),
+        "config template lacks [planner] runner"
+    );
+    std::fs::write(&cfg, s).unwrap();
+}
+
+fn canned() -> serde_json::Value {
+    serde_json::json!({
+        "prd": {
+            "title": "Greeting feature",
+            "summary": "Add greet() to the crate.",
+            "goals": ["greet(name) returns Hello, <name>!"],
+            "non_goals": ["i18n"],
+            "constraints": ["no new dependencies"],
+            "prd_markdown": "# Greeting feature
+
+Add greet() to the crate.
+"
+        },
+        "issues": {
+            "epic": { "title": "Greeting feature", "body": "Add greet() to the crate." },
+            "tasks": [
+                { "number": 1, "title": "Implement greet", "body": "Add pub fn greet.", "file_scope": ["src/lib.rs"], "acceptance": ["greet(\"Ada\") == Hello, Ada!"], "depends_on": [], "estimate": "S" },
+                { "number": 2, "title": "Document greet", "body": "README section.", "file_scope": ["README.md"], "acceptance": ["README mentions greet"], "depends_on": [1], "estimate": "S" }
+            ]
+        }
+    })
+}
+
+#[test]
+fn plan_new_runs_prd_then_issues_and_creates_them() {
+    let r = Repo::initialised();
+    fake_llm(&r, canned());
+    let idea = r.path().join("idea.md");
+    std::fs::write(
+        &idea,
+        "I want a greet function.
+",
+    )
+    .unwrap();
+    let res = r.ok(&["plan", "new", "--from", idea.to_str().unwrap()]);
+    assert_eq!(res["slug"], "greeting-feature", "{res}");
+    assert_eq!(res["epic"], "asf-1");
+    assert_eq!(res["created"].as_array().unwrap().len(), 2);
+    assert_eq!(res["cost_usd"], 0.0);
+    let prd = std::fs::read_to_string(r.path().join(".factory/plan/greeting-feature/prd.md")).unwrap();
+    assert!(prd.contains("# Greeting feature"));
+    assert!(r
+        .path()
+        .join(".factory/plan/greeting-feature/issues.json")
+        .exists());
+    let t2 = r.ok(&["issue", "show", "asf-3"]);
+    assert_eq!(t2["issue"]["title"], "Document greet");
+    assert_eq!(t2["deps"][0]["id"], "asf-2");
+    assert_eq!(t2["issue"]["estimate"], "S");
+    assert_eq!(t2["issue"]["parent_id"], "asf-1");
+    assert!(t2["issue"]["source"]
+        .as_str()
+        .unwrap()
+        .starts_with("plan:greeting-feature#task-2"));
+    // the fake recorded both calls with the idea on stdin of the first and the PRD on stdin of the second
+    let log: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(r.path().join(".factory/fake-llm.json")).unwrap())
+            .unwrap();
+    let calls = log["log"].as_array().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["schema_name"], "prd");
+    assert!(calls[0]["stdin"]
+        .as_str()
+        .unwrap()
+        .contains("I want a greet function."));
+    assert_eq!(calls[1]["schema_name"], "issues");
+    assert!(calls[1]["stdin"].as_str().unwrap().contains("# Greeting feature"));
+}
+
+#[test]
+fn plan_new_dry_run_saves_artifacts_but_creates_no_issues_and_reports_llm_errors() {
+    let r = Repo::initialised();
+    fake_llm(&r, canned());
+    let idea = r.path().join("idea.md");
+    std::fs::write(
+        &idea, "idea
+",
+    )
+    .unwrap();
+    let res = r.ok(&["plan", "new", "--from", idea.to_str().unwrap(), "--dry-run"]);
+    assert_eq!(res["dry_run"], true);
+    assert_eq!(res["tasks"].as_array().unwrap().len(), 2, "{res}");
+    assert!(r.path().join(".factory/plan/greeting-feature/prd.md").exists());
+    assert_eq!(r.ok(&["issue", "list"]).as_array().unwrap().len(), 0);
+
+    // missing canned issues response → error names the step
+    let mut only_prd = canned();
+    only_prd.as_object_mut().unwrap().remove("issues");
+    fake_llm(&r, only_prd);
+    let (code, ecode, msg) = r.err(&["plan", "new", "--from", idea.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert_eq!(ecode, "backend");
+    assert!(msg.contains("issues"), "{msg}");
+    let (code, _, _) = r.err(&["plan", "new", "--from", "nope.md"]);
+    assert_eq!(code, 1);
+}

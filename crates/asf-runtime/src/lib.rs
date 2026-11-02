@@ -6,6 +6,7 @@
 pub mod exec;
 pub mod fake;
 pub mod herdr;
+pub mod llm;
 
 use std::path::Path;
 
