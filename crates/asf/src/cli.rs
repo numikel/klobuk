@@ -99,6 +99,9 @@ pub struct ServeArgs {
     /// Run a single tick and exit.
     #[arg(long)]
     pub once: bool,
+    /// Also start workers for the ready issues the allocation plan selects (autonomous mode).
+    #[arg(long)]
+    pub dispatch: bool,
 }
 
 #[derive(Args, Debug)]

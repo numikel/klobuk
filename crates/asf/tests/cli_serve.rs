@@ -77,3 +77,41 @@ fn serve_interval_is_validated() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn serve_dispatch_starts_ready_slots_from_the_plan() {
+    let repo = Repo::initialised();
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("runtime = \"herdr\"", "runtime = \"fake\"")
+        .replace("max_parallel = 3", "max_parallel = 2");
+    std::fs::write(&cfg, s).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "cfg"]);
+    let a = repo.create_issue("a", &["--ready", "--scope", "src/a.rs"]);
+    let b = repo.create_issue("b", &["--ready", "--scope", "src/b.rs"]);
+    let c = repo.create_issue("c", &["--ready", "--scope", "src/c.rs"]);
+    let d = repo.create_issue("d", &["--dep", &a, "--scope", "docs/**"]);
+
+    let res = repo.ok(&["serve", "--once", "--dispatch"]);
+    assert_eq!(res["started"], serde_json::json!([a, b]), "capacity 2: {res}");
+    assert_eq!(res["start_errors"].as_array().unwrap().len(), 0, "{res}");
+    assert_eq!(
+        repo.ok(&["issue", "show", &c])["issue"]["status"],
+        "ready",
+        "third waits for a slot"
+    );
+    assert_eq!(repo.ok(&["issue", "show", &d])["issue"]["status"], "backlog");
+    assert_eq!(repo.ok(&["run", "list"]).as_array().unwrap().len(), 2);
+    // without --dispatch nothing is started
+    let res = repo.ok(&["serve", "--once"]);
+    assert!(
+        res.get("started").is_none() || res["started"].as_array().unwrap().is_empty(),
+        "{res}"
+    );
+    assert_eq!(repo.ok(&["run", "list"]).as_array().unwrap().len(), 2);
+    // a second dispatch tick is idempotent while the slots are full
+    let res = repo.ok(&["serve", "--once", "--dispatch"]);
+    assert_eq!(res["started"].as_array().unwrap().len(), 0, "{res}");
+}
