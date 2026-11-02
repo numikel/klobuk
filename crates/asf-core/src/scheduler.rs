@@ -138,6 +138,14 @@ pub fn promotable(issues: &[Issue], deps: &[Dep]) -> Vec<IssueId> {
     out
 }
 
+/// Validates every glob in a scope; the error names the offending pattern.
+pub fn validate_scope(scope: &[String]) -> Result<(), String> {
+    for g in scope {
+        Glob::new(g).map_err(|e| format!("bad glob `{g}`: {e}"))?;
+    }
+    Ok(())
+}
+
 fn is_literal(pattern: &str) -> bool {
     !pattern.chars().any(|c| matches!(c, '*' | '?' | '[' | '{'))
 }

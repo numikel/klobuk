@@ -1,0 +1,157 @@
+//! Row ↔ model mapping and shared read queries.
+
+use asf_core::*;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+
+use crate::backend;
+
+fn json_col<T: serde::de::DeserializeOwned>(row: &Row<'_>, idx: usize) -> rusqlite::Result<T> {
+    let s: String = row.get(idx)?;
+    serde_json::from_str(&s)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e)))
+}
+
+fn id_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<IssueId> {
+    let s: String = row.get(idx)?;
+    s.parse()
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e)))
+}
+
+fn opt_id_col(row: &Row<'_>, idx: usize) -> rusqlite::Result<Option<IssueId>> {
+    let s: Option<String> = row.get(idx)?;
+    s.map(|s| {
+        s.parse().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+        })
+    })
+    .transpose()
+}
+
+fn enum_col<T: std::str::FromStr>(row: &Row<'_>, idx: usize) -> rusqlite::Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let s: String = row.get(idx)?;
+    s.parse()
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e)))
+}
+
+pub(crate) const ISSUE_COLS: &str =
+    "id, uid, title, body, type, status, priority, parent_id, file_scope, acceptance, \
+     estimate, labels, source, created_at, updated_at, closed_at";
+
+pub(crate) fn issue(row: &Row<'_>) -> rusqlite::Result<Issue> {
+    Ok(Issue {
+        id: id_col(row, 0)?,
+        uid: row.get(1)?,
+        title: row.get(2)?,
+        body: row.get(3)?,
+        kind: enum_col(row, 4)?,
+        status: enum_col(row, 5)?,
+        priority: row.get(6)?,
+        parent_id: opt_id_col(row, 7)?,
+        file_scope: json_col(row, 8)?,
+        acceptance: json_col(row, 9)?,
+        estimate: row.get(10)?,
+        labels: json_col(row, 11)?,
+        source: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        closed_at: row.get(15)?,
+    })
+}
+
+pub(crate) fn issue_by_id(c: &Connection, id: &IssueId) -> Result<Option<Issue>, StoreError> {
+    c.query_row(
+        &format!("SELECT {ISSUE_COLS} FROM issues WHERE id = ?1"),
+        params![id.as_str()],
+        issue,
+    )
+    .optional()
+    .map_err(backend)
+}
+
+/// Ordered by sequence number (numeric part of the id).
+pub(crate) fn list_issues(c: &Connection, f: &IssueFilter) -> Result<Vec<Issue>, StoreError> {
+    let mut sql = format!("SELECT {ISSUE_COLS} FROM issues WHERE 1=1");
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(s) = &f.status {
+        sql.push_str(" AND status = ?");
+        args.push(Box::new(s.as_str().to_string()));
+    }
+    if let Some(k) = &f.kind {
+        sql.push_str(" AND type = ?");
+        args.push(Box::new(k.as_str().to_string()));
+    }
+    if let Some(l) = &f.label {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(issues.labels) WHERE json_each.value = ?)");
+        args.push(Box::new(l.clone()));
+    }
+    if let Some(p) = &f.parent {
+        sql.push_str(" AND parent_id = ?");
+        args.push(Box::new(p.as_str().to_string()));
+    }
+    sql.push_str(" ORDER BY CAST(substr(id, instr(id, '-') + 1) AS INTEGER)");
+    let mut stmt = c.prepare(&sql).map_err(backend)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), issue)
+        .map_err(backend)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+}
+
+pub(crate) fn deps(c: &Connection) -> Result<Vec<Dep>, StoreError> {
+    let mut stmt = c
+        .prepare("SELECT issue_id, depends_on FROM issue_deps ORDER BY issue_id, depends_on")
+        .map_err(backend)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Dep {
+                issue_id: id_col(r, 0)?,
+                depends_on: id_col(r, 1)?,
+            })
+        })
+        .map_err(backend)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+}
+
+pub(crate) fn repo(c: &Connection) -> Result<RepoInfo, StoreError> {
+    c.query_row(
+        "SELECT id, root, id_prefix, next_seq, default_branch, created_at FROM repos LIMIT 1",
+        [],
+        |r| {
+            Ok(RepoInfo {
+                id: r.get(0)?,
+                root: r.get(1)?,
+                id_prefix: r.get(2)?,
+                next_seq: r.get(3)?,
+                default_branch: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(backend)?
+    .ok_or_else(|| StoreError::NotFound("repository not initialised (run `asf repo init`)".into()))
+}
+
+pub(crate) fn events_since(c: &Connection, seq: u64, limit: usize) -> Result<Vec<Event>, StoreError> {
+    let mut stmt = c
+        .prepare(
+            "SELECT seq, ts, kind, issue_id, run_id, actor, payload FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+        )
+        .map_err(backend)?;
+    let rows = stmt
+        .query_map(params![seq as i64, limit as i64], |r| {
+            Ok(Event {
+                seq: r.get::<_, i64>(0)? as u64,
+                ts: r.get(1)?,
+                kind: r.get(2)?,
+                issue_id: opt_id_col(r, 3)?,
+                run_id: r.get(4)?,
+                actor: r.get(5)?,
+                payload: json_col(r, 6)?,
+            })
+        })
+        .map_err(backend)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+}

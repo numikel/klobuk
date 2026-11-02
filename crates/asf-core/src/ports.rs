@@ -56,7 +56,7 @@ pub trait IssueStore: Send + Sync {
     /// Ordered by sequence number.
     fn list_issues(&self, f: &IssueFilter) -> Result<Vec<Issue>, StoreError>;
     fn update_issue(&self, id: &IssueId, p: &IssuePatch) -> Result<Issue, StoreError>;
-    /// `Validation` when the current status is terminal.
+    /// `Conflict` when the current status is terminal.
     fn set_status(&self, id: &IssueId, s: Status, actor: &str) -> Result<Issue, StoreError>;
 
     fn deps(&self) -> Result<Vec<Dep>, StoreError>;
