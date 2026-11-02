@@ -376,6 +376,21 @@ impl<'a> Worker<'a> {
         ) {
             Ok(a) => a,
             Err(RuntimeError::Timeout(_)) => agent,
+            Err(RuntimeError::Stalled(_)) => {
+                // Verified live: the text can sit in Claude's input box with Enter swallowed. Never retype
+                // the prompt; press Enter once and give the agent a moment to start.
+                self.rt
+                    .send_keys(&handle, &["enter"])
+                    .map_err(|e| self.block_start(&run, &handle, e))?;
+                match self.rt.wait(
+                    &handle,
+                    &[AgentState::Working],
+                    self.ctx.config.worker.prompt_timeout_ms,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => return Err(self.block_start(&run, &handle, e)),
+                }
+            }
             Err(e) => return Err(self.block_start(&run, &handle, e)),
         };
         let run = store.update_run(

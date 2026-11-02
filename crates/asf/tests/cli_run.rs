@@ -426,3 +426,25 @@ fn watch_blocked_agent_posts_inbox_item_once_per_revision() {
     f.repo.ok(&["run", "reply", &f.issue, "y"]);
     assert_eq!(active_run(&f).state, RunState::Working);
 }
+
+#[test]
+fn start_recovers_from_stalled_kickoff_by_pressing_enter() {
+    let f = setup();
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "stalled"}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    let log = fake(&f).log();
+    let i_prompt = log.iter().position(|e| e.op == "prompt").unwrap();
+    let i_enter = log
+        .iter()
+        .position(|e| e.op == "send_keys" && e.args["keys"] == serde_json::json!(["enter"]))
+        .unwrap();
+    assert!(i_enter > i_prompt, "Enter is sent after the stalled prompt");
+    assert_eq!(
+        log.iter().filter(|e| e.op == "prompt").count(),
+        1,
+        "the prompt is not typed twice"
+    );
+}

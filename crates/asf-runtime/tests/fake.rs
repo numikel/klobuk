@@ -140,3 +140,42 @@ fn wait_returns_current_state_when_it_matches_and_times_out_otherwise() {
         RuntimeError::Timeout(_)
     ));
 }
+
+#[test]
+fn script_can_make_prompt_stall_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "prompt": [{"error": "stalled"}] }))
+        .unwrap();
+    let ws = rt
+        .open_workspace(&OpenWorkspace {
+            cwd: dir.path().to_path_buf(),
+            label: "x".into(),
+            env: vec![],
+        })
+        .unwrap();
+    rt.start_agent(&StartAgent {
+        name: "a".into(),
+        pane_id: ws.pane_id,
+        args: vec![],
+        timeout_ms: 1,
+    })
+    .unwrap();
+    let h = handle("a");
+    assert!(matches!(
+        rt.prompt(&h, "go", &[AgentState::Working], 1).unwrap_err(),
+        RuntimeError::Stalled(_)
+    ));
+    assert_eq!(
+        rt.info(&h).unwrap().state,
+        AgentState::Idle,
+        "a stalled prompt leaves the agent idle"
+    );
+    // the text still landed in the input box: Enter submits it
+    rt.send_keys(&h, &["enter"]).unwrap();
+    assert_eq!(rt.info(&h).unwrap().state, AgentState::Working);
+    assert_eq!(
+        rt.prompt(&h, "again", &[AgentState::Working], 1).unwrap().state,
+        AgentState::Working
+    );
+}

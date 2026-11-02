@@ -20,6 +20,8 @@ pub struct LogEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Agent {
     info: AgentInfo,
+    #[serde(default)]
+    pending_enter: bool,
     pane_id: String,
     workspace_id: String,
     screen: String,
@@ -31,6 +33,8 @@ struct Script {
     start_agent: VecDeque<Value>,
     #[serde(default)]
     info: VecDeque<Value>,
+    #[serde(default)]
+    prompt: VecDeque<Value>,
     #[serde(default)]
     screen: String,
 }
@@ -103,6 +107,9 @@ impl FakeRuntime {
         if !s.info.is_empty() {
             st.script.info = s.info;
         }
+        if !s.prompt.is_empty() {
+            st.script.prompt = s.prompt;
+        }
         if !s.screen.is_empty() {
             st.script.screen = s.screen;
         }
@@ -173,6 +180,7 @@ impl AgentRuntime for FakeRuntime {
                     launch_pending: true,
                     ..AgentInfo::default()
                 },
+                pending_enter: false,
                 pane_id: r.pane_id.clone(),
                 workspace_id,
                 screen,
@@ -212,8 +220,17 @@ impl AgentRuntime for FakeRuntime {
     ) -> Result<AgentInfo, RuntimeError> {
         let args = json!({ "name": h.name, "text": text, "until": until });
         self.with("prompt", args, |st| {
+            let scripted = st.script.prompt.pop_front();
             let a = agent_mut(st, &h.name)?;
             a.screen.push_str(&format!("\n> {text}\n"));
+            if scripted.as_ref().and_then(|v| v.get("error")).is_some() {
+                // text landed in the input box but Enter was not accepted
+                a.pending_enter = true;
+                return Err(RuntimeError::Stalled(format!(
+                    "agent prompt produced no observed working or blocked state (fake); current status is {}",
+                    a.info.state
+                )));
+            }
             a.info.state = until.first().copied().unwrap_or(AgentState::Working);
             a.info.revision += 1;
             a.info.state_change_seq = Some(a.info.revision);
@@ -275,7 +292,13 @@ impl AgentRuntime for FakeRuntime {
 
     fn send_keys(&self, h: &AgentHandle, keys: &[&str]) -> Result<(), RuntimeError> {
         self.with("send_keys", json!({ "name": h.name, "keys": keys }), |st| {
-            agent_mut(st, &h.name)?;
+            let a = agent_mut(st, &h.name)?;
+            if a.pending_enter && keys.contains(&"enter") {
+                a.pending_enter = false;
+                a.info.state = AgentState::Working;
+                a.info.revision += 1;
+                a.info.state_change_seq = Some(a.info.revision);
+            }
             Ok(())
         })
     }
