@@ -56,6 +56,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: RunCmd,
     },
+    /// Local merge queue: rebase, gates, fast-forward.
+    Merge {
+        #[command(subcommand)]
+        cmd: MergeCmd,
+    },
     /// Claude Code hooks (run inside a worker session; JSON on stdin).
     Hook {
         #[command(subcommand)]
@@ -257,6 +262,24 @@ pub struct CommentArgs {
     pub body_file: Option<PathBuf>,
     #[arg(long)]
     pub reply_to: Option<i64>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MergeCmd {
+    /// Queue an issue's branch (`feat/<id>`) by hand.
+    Enqueue { id: IssueId },
+    /// The queue in FIFO order.
+    List,
+    /// Process queued items: rebase onto the default branch, run gates, fast-forward.
+    Tick {
+        /// Process at most one item.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Re-queue a failed or blocked item.
+    Retry { id: IssueId },
+    /// Drop a pending item (the issue can be enqueued again later).
+    Skip { id: IssueId },
 }
 
 #[derive(Subcommand, Debug)]
