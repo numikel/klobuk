@@ -9,6 +9,7 @@
 //! is `human`. The `orchestrator` lane sees every comment. Only comments above the lane's read
 //! cursor for that issue are returned.
 
+pub mod brief;
 pub mod config;
 pub mod error;
 pub mod ids;
@@ -21,6 +22,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod vcs;
 
+pub use brief::{render_brief, render_claude_local, render_settings, BriefInput, SettingsInput};
 pub use config::{Config, ConfigError};
 pub use error::{ClaimError, StoreError};
 pub use ids::{is_valid_prefix, IssueId};
