@@ -113,6 +113,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "asf-vcs"
+version = "0.1.0"
+dependencies = [
+ "asf-core",
+ "tempfile",
+]
+
+[[package]]
 name = "assert_cmd"
 version = "2.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

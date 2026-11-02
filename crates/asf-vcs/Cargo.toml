@@ -1,0 +1,16 @@
+[package]
+name = "asf-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Git subprocess implementation of the asf Vcs port and the gate runner"
+
+[lints]
+workspace = true
+
+[dependencies]
+asf-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
