@@ -25,6 +25,7 @@ globset = "0.4"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 clap = { version = "4.6", features = ["derive"] }
+ratatui = "0.30"
 
 # dev
 tempfile = "3.27"

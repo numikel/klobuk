@@ -3,6 +3,7 @@ mod commands;
 mod ctx;
 mod git;
 mod output;
+mod tui;
 mod worker;
 
 use clap::error::ErrorKind;

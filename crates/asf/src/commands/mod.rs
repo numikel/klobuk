@@ -7,6 +7,7 @@ pub mod merge;
 pub mod repo;
 pub mod run;
 pub mod serve;
+pub mod tui;
 
 use crate::cli::{Cli, Cmd};
 use crate::output::{AppError, Rendered};
@@ -19,6 +20,7 @@ pub fn dispatch(cli: &Cli) -> Result<Rendered, AppError> {
         Cmd::Run { cmd } => run::run(cli, cmd),
         Cmd::Merge { cmd } => merge::run(cli, cmd),
         Cmd::Hook { cmd } => hook::run(cli, cmd),
+        Cmd::Tui(a) => tui::run(cli, a),
         Cmd::Serve(a) => serve::run(cli, a),
         Cmd::Export(a) => export::export(cli, a),
         Cmd::Import(a) => export::import(cli, a),

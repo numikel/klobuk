@@ -66,12 +66,24 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: HookCmd,
     },
+    /// Terminal UI (run it as a pane in Herdr).
+    Tui(TuiArgs),
     /// Orchestrator loop: promote ready issues, watch runs, process the merge queue.
     Serve(ServeArgs),
     /// Write `.factory/issues.jsonl` (or `--out`).
     Export(ExportArgs),
     /// Load a JSONL export into this store.
     Import(ImportArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TuiArgs {
+    /// Render one frame as plain text and exit (no raw mode).
+    #[arg(long)]
+    pub once: bool,
+    /// Initial view: board | agents | inbox | queue | log.
+    #[arg(long)]
+    pub view: Option<String>,
 }
 
 #[derive(Args, Debug)]
