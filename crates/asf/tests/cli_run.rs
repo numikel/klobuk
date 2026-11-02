@@ -272,7 +272,7 @@ fn list_show_reply_keys_nudge() {
         .any(|e| e.op == "send_keys" && e.args["keys"] == serde_json::json!(["enter"])));
     assert!(log
         .iter()
-        .any(|e| e.op == "prompt" && e.args["text"].as_str().unwrap().contains("asf issue finish")));
+        .any(|e| e.op == "prompt" && e.args["text"].as_str().unwrap().contains("issue finish")));
     let (code, ecode, _) = f.repo.err(&["run", "show", "asf-9"]);
     assert_eq!((code, ecode.as_str()), (1, "not_found"));
 }

@@ -73,3 +73,13 @@ impl Ctx {
         }
     }
 }
+
+/// The running asf binary as a forward-slash path (what workers and hooks call).
+pub fn asf_bin() -> String {
+    std::env::current_exe()
+        .map(|p| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            s.strip_prefix("//?/").map(str::to_string).unwrap_or(s)
+        })
+        .unwrap_or_else(|_| "asf".into())
+}

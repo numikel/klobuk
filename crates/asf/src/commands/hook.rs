@@ -263,9 +263,10 @@ fn stop(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
     Ok(block(&format!(
         "asf: before stopping, finish the ritual for {id}: make sure everything is committed (`git status` clean), \
          write the report to `{report}` (what changed, how verified, open questions) and run \
-         `asf issue finish {id} --report {report}`. If you are blocked instead, post \
+         `{asf} issue finish {id} --report {report}`. If you are blocked instead, post \
          `asf issue comment {id} --type BLOCKER --to human --body \"...\"` and then stop.",
-        id = run.issue_id
+        id = run.issue_id,
+        asf = crate::ctx::asf_bin()
     )))
 }
 

@@ -179,6 +179,7 @@ impl<'a> Worker<'a> {
         let comments = store.comments(&issue.id)?;
         let runs_dir = self.runs_dir(&issue.id);
         std::fs::create_dir_all(&runs_dir)?;
+        let asf_bin = crate::ctx::asf_bin();
         let report_rel = format!("{FACTORY_DIR}/{RUNS_DIR}/{}/report.md", issue.id);
         let brief = render_brief(&BriefInput {
             issue,
@@ -189,11 +190,9 @@ impl<'a> Worker<'a> {
             branch: &run.branch,
             report_path: &report_rel,
             budget_usd: run.budget_usd.unwrap_or(0.0),
+            asf_bin: &asf_bin,
         });
         std::fs::write(runs_dir.join("brief.md"), brief)?;
-        let asf_bin = std::env::current_exe()
-            .map(|p| fwd(&p))
-            .unwrap_or_else(|_| "asf".into());
         let w = &self.ctx.config.worker;
         let settings = render_settings(&SettingsInput {
             asf_bin: &asf_bin,
@@ -210,7 +209,7 @@ impl<'a> Worker<'a> {
         let brief_rel = format!("{FACTORY_DIR}/{RUNS_DIR}/{}/brief.md", issue.id);
         std::fs::write(
             wt_abs.join("CLAUDE.local.md"),
-            render_claude_local(&issue.id, &brief_rel),
+            render_claude_local(&issue.id, &brief_rel, &asf_bin),
         )?;
         Ok(settings_path)
     }
@@ -460,9 +459,10 @@ impl<'a> Worker<'a> {
     }
 
     pub fn nudge(&self, id: &IssueId) -> Result<Run, AppError> {
+        let asf = crate::ctx::asf_bin();
         let text = format!(
             "Reminder from asf: when the acceptance criteria hold, commit everything, write {FACTORY_DIR}/{RUNS_DIR}/{id}/report.md \
-             and run `asf issue finish {id} --report {FACTORY_DIR}/{RUNS_DIR}/{id}/report.md`. If you are blocked, post a BLOCKER comment."
+             and run `{asf} issue finish {id} --report {FACTORY_DIR}/{RUNS_DIR}/{id}/report.md`. If you are blocked, post a BLOCKER comment."
         );
         self.reply(id, &text)
     }

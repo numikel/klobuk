@@ -243,7 +243,7 @@ fn stop_blocks_once_until_finish_then_allows() {
     let v: serde_json::Value = serde_json::from_str(&out).expect("block json");
     assert_eq!(v["decision"], "block");
     assert!(
-        v["reason"].as_str().unwrap().contains("asf issue finish asf-1"),
+        v["reason"].as_str().unwrap().contains("issue finish asf-1"),
         "{v}"
     );
     // second stop while the hook is already active: let Claude stop (no loop)
