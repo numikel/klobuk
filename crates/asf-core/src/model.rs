@@ -63,6 +63,8 @@ macro_rules! str_enum {
     };
 }
 
+pub(crate) use str_enum;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IssueType {
