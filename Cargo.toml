@@ -22,6 +22,7 @@ toml = "1.1"
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
 ulid = "3.0"
 globset = "0.4"
+uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 clap = { version = "4.6", features = ["derive"] }
 

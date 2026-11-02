@@ -11,6 +11,8 @@ pub enum ErrorCode {
     Usage,
     Conflict,
     NotFound,
+    /// A worker is waiting for a human (exit 1).
+    Blocked,
     Validation,
     Io,
     Backend,

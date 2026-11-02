@@ -259,8 +259,15 @@ impl AgentRuntime for FakeRuntime {
 
     fn read(&self, h: &AgentHandle, lines: u32) -> Result<String, RuntimeError> {
         self.with("read", json!({ "name": h.name, "lines": lines }), |st| {
+            // the scripted `screen` acts as the live display, appended to what the agent accumulated
+            let live = st.script.screen.clone();
             let a = agent_mut(st, &h.name)?;
-            let all: Vec<&str> = a.screen.lines().collect();
+            let mut screen = a.screen.clone();
+            if !live.is_empty() && !screen.ends_with(&live) {
+                screen.push('\n');
+                screen.push_str(&live);
+            }
+            let all: Vec<&str> = screen.lines().collect();
             let start = all.len().saturating_sub(lines as usize);
             Ok(all[start..].join("\n"))
         })

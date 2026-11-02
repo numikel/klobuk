@@ -498,6 +498,21 @@ impl IssueStore for SqliteStore {
         })
     }
 
+    fn set_claim_run(&self, id: &IssueId, run_id: &str) -> Result<(), StoreError> {
+        self.with_tx(|tx| {
+            let n = tx
+                .execute(
+                    "UPDATE claims SET run_id = ?2 WHERE issue_id = ?1",
+                    params![id.as_str(), run_id],
+                )
+                .map_err(backend)?;
+            if n == 0 {
+                return Err(StoreError::NotFound(format!("no active claim on {id}")));
+            }
+            Ok(())
+        })
+    }
+
     fn active_claims(&self) -> Result<Vec<Claim>, StoreError> {
         self.read(row::active_claims)
     }

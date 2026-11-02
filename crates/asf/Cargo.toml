@@ -16,6 +16,8 @@ workspace = true
 [dependencies]
 asf-core = { workspace = true }
 asf-store = { workspace = true }
+asf-runtime = { workspace = true }
+asf-vcs = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +25,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 time = { workspace = true }
 globset = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

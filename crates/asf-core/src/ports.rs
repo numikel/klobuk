@@ -85,6 +85,8 @@ pub trait IssueStore: Send + Sync {
     fn claim(&self, id: &IssueId, c: &NewClaim) -> Result<Claim, ClaimError>;
     /// Deletes the claim; status `in-progress` goes back to `ready`.
     fn release(&self, id: &IssueId) -> Result<(), StoreError>;
+    /// Links the active claim to a run (`NotFound` without a claim).
+    fn set_claim_run(&self, id: &IssueId, run_id: &str) -> Result<(), StoreError>;
     fn active_claims(&self) -> Result<Vec<Claim>, StoreError>;
 
     fn add_comment(&self, c: &NewComment) -> Result<Comment, StoreError>;

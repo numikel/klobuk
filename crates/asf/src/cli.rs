@@ -283,4 +283,33 @@ pub enum LaneCmd {
 pub enum RunCmd {
     /// Deterministic allocation plan: which ready issues can start now and why the rest wait.
     Plan,
+    /// Claim the issue, create its worktree and launch a worker in the runtime (Herdr workspace).
+    Start {
+        id: IssueId,
+        /// `inputs_hash` from `asf run plan`; refuses to start if the plan changed since.
+        #[arg(long)]
+        approve: Option<String>,
+    },
+    /// All runs (active and finished).
+    List,
+    /// Latest run of an issue plus the live agent state.
+    Show { id: IssueId },
+    /// Send a prompt to the worker (also unblocks a `blocked` run).
+    Reply { id: IssueId, text: String },
+    /// Send logical keys (`enter`, `esc`, `down`, `y`, `ctrl+c`, …) to the worker pane.
+    Keys {
+        id: IssueId,
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
+    /// Remind the worker about the finish ritual.
+    Nudge { id: IssueId },
+    /// Stop the worker, release the claim, close the workspace; the worktree is kept.
+    Abort { id: IssueId },
+    /// Poll active runs: post BLOCKERs for waiting agents, verify finished work, enqueue merges.
+    Watch {
+        /// One pass (the default for now; `asf serve` loops).
+        #[arg(long)]
+        once: bool,
+    },
 }
