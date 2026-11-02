@@ -42,7 +42,7 @@ fn serve_once_watches_merges_and_promotes() {
     repo.ok(&["run", "start", &a]);
     let wt = repo.path().join(".worktrees").join(&a);
     commit_in(&wt, "src/x.rs", "");
-    let report = repo.path().join(".factory/runs").join(&a).join("report.md");
+    let report = wt.join(".factory").join("runs").join(&a).join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
     repo.ok(&[
         "--lane",

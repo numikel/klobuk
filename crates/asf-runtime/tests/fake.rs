@@ -179,3 +179,28 @@ fn script_can_make_prompt_stall_once() {
         AgentState::Working
     );
 }
+
+#[test]
+fn script_start_timeout_registers_the_agent_anyway() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "start_agent": [{"error": "timeout"}] }))
+        .unwrap();
+    let ws = rt
+        .open_workspace(&OpenWorkspace {
+            cwd: dir.path().to_path_buf(),
+            label: "x".into(),
+            env: vec![],
+        })
+        .unwrap();
+    let e = rt
+        .start_agent(&StartAgent {
+            name: "a".into(),
+            pane_id: ws.pane_id,
+            args: vec![],
+            timeout_ms: 1,
+        })
+        .unwrap_err();
+    assert!(matches!(e, RuntimeError::Timeout(_)), "{e:?}");
+    assert_eq!(rt.info(&handle("a")).unwrap().state, AgentState::Unknown);
+}

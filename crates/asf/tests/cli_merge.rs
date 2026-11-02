@@ -59,12 +59,7 @@ fn finished_run(f: &F, files: &[(&str, &str)]) {
     for (rel, content) in files {
         commit_in(&wt, rel, content);
     }
-    let report = f
-        .repo
-        .path()
-        .join(".factory/runs")
-        .join(&f.issue)
-        .join("report.md");
+    let report = wt.join(".factory").join("runs").join(&f.issue).join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
     f.repo.ok(&[
         "--lane",
@@ -177,12 +172,7 @@ fn tick_fails_on_gate_and_retry_requeues() {
     let mut ex = std::fs::read_to_string(&exclude).unwrap();
     ex.push_str("PASS\n");
     std::fs::write(&exclude, ex).unwrap();
-    let report = f
-        .repo
-        .path()
-        .join(".factory/runs")
-        .join(&f.issue)
-        .join("report.md");
+    let report = wt.join(".factory").join("runs").join(&f.issue).join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
     f.repo.ok(&[
         "--lane",

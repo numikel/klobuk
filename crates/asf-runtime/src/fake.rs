@@ -186,6 +186,15 @@ impl AgentRuntime for FakeRuntime {
                 screen,
             });
             match scripted {
+                Some(v) if v.get("error").and_then(Value::as_str) == Some("timeout") => {
+                    // Herdr gave up waiting for the agent status, but the agent is actually coming up
+                    agent.info.state = AgentState::Unknown;
+                    agent.info.launch_pending = false;
+                    Err(RuntimeError::Timeout(format!(
+                        "timed out waiting for agent status of {} (fake)",
+                        r.name
+                    )))
+                }
                 Some(v) if v.get("error").is_some() => {
                     agent.info.state = AgentState::Blocked;
                     agent.info.launch_pending = true;

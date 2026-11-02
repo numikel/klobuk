@@ -102,7 +102,8 @@ fn start_happy_path_creates_worktree_files_workspace_and_agent() {
     assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "feat/asf-1");
 
     // brief, settings, CLAUDE.local.md
-    let runs_dir = f.repo.path().join(".factory/runs/asf-1");
+    // brief + settings live inside the worktree (the worker's cwd) under the gitignored .factory/runs/
+    let runs_dir = wt(&f).join(".factory").join("runs").join("asf-1");
     let brief = std::fs::read_to_string(runs_dir.join("brief.md")).unwrap();
     assert!(brief.contains("add greeting") && brief.contains("prints hello") && brief.contains("src/**"));
     let settings: serde_json::Value =
@@ -303,7 +304,11 @@ fn watch_verifies_finished_run_and_enqueues_merge() {
     f.repo.ok(&["run", "start", &f.issue]);
     // the worker: commits an in-scope change, writes the report, runs the finish ritual
     commit_in(&wt(&f), "src/greet.rs", "pub fn hello() {}\n");
-    let report = f.repo.path().join(".factory/runs/asf-1/report.md");
+    let report = wt(&f)
+        .join(".factory")
+        .join("runs")
+        .join("asf-1")
+        .join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
     f.repo.ok(&[
         "--lane",
@@ -340,7 +345,11 @@ fn watch_fails_run_with_out_of_scope_change_and_dirty_tree() {
     f.repo.ok(&["run", "start", &f.issue]);
     commit_in(&wt(&f), "Cargo.toml", "[package]\nname = \"changed\"\n");
     std::fs::write(wt(&f).join("src/untracked.rs"), "").unwrap();
-    let report = f.repo.path().join(".factory/runs/asf-1/report.md");
+    let report = wt(&f)
+        .join(".factory")
+        .join("runs")
+        .join("asf-1")
+        .join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
     f.repo.ok(&[
         "--lane",
@@ -376,7 +385,11 @@ fn watch_runs_gates_and_records_failure() {
     std::fs::write(&cfg, s).unwrap();
     f.repo.ok(&["run", "start", &f.issue]);
     commit_in(&wt(&f), "src/greet.rs", "");
-    let report = f.repo.path().join(".factory/runs/asf-1/report.md");
+    let report = wt(&f)
+        .join(".factory")
+        .join("runs")
+        .join("asf-1")
+        .join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
     f.repo.ok(&[
         "--lane",
@@ -446,5 +459,20 @@ fn start_recovers_from_stalled_kickoff_by_pressing_enter() {
         log.iter().filter(|e| e.op == "prompt").count(),
         1,
         "the prompt is not typed twice"
+    );
+}
+
+#[test]
+fn start_tolerates_a_startup_detection_timeout_when_the_agent_comes_up() {
+    let f = setup();
+    fake(&f)
+        .script(serde_json::json!({ "start_agent": [{"error": "timeout"}], "info": [{"state": "idle"}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(
+        fake(&f).log().iter().filter(|e| e.op == "start_agent").count(),
+        1,
+        "never restarted"
     );
 }

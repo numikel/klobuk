@@ -4,6 +4,7 @@
 //! worker ran `asf issue finish` (issue `in-review`), and only the orchestrator decides `succeeded`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use asf_core::*;
 use asf_vcs::{run_gates, GitCli};
@@ -89,8 +90,10 @@ impl<'a> Worker<'a> {
         Ok(Worker { ctx, rt, vcs: GitCli })
     }
 
-    fn runs_dir(&self, id: &IssueId) -> PathBuf {
-        self.ctx.root.join(FACTORY_DIR).join(RUNS_DIR).join(id.as_str())
+    /// Brief, settings and the worker's report live inside the worktree (the worker's cwd), under
+    /// the gitignored `.factory/runs/<id>/`.
+    fn runs_dir(wt_abs: &Path, id: &IssueId) -> PathBuf {
+        wt_abs.join(FACTORY_DIR).join(RUNS_DIR).join(id.as_str())
     }
 
     fn worktree_rel(&self, id: &IssueId) -> String {
@@ -177,7 +180,7 @@ impl<'a> Worker<'a> {
             }
         }
         let comments = store.comments(&issue.id)?;
-        let runs_dir = self.runs_dir(&issue.id);
+        let runs_dir = Self::runs_dir(wt_abs, &issue.id);
         std::fs::create_dir_all(&runs_dir)?;
         let asf_bin = crate::ctx::asf_bin();
         let report_rel = format!("{FACTORY_DIR}/{RUNS_DIR}/{}/report.md", issue.id);
@@ -363,6 +366,22 @@ impl<'a> Worker<'a> {
                     }
                 } else {
                     return Err(self.block_start(&run, &handle, RuntimeError::NotReady(msg)));
+                }
+            }
+            Err(RuntimeError::Timeout(msg)) => {
+                // Herdr's startup detection gave up; the agent may still be coming up. Poll instead of blocking.
+                let deadline = std::time::Instant::now()
+                    + Duration::from_millis(self.ctx.config.worker.start_timeout_ms);
+                loop {
+                    if let Ok(info) = self.rt.info(&handle) {
+                        if info.state.is_settled() || info.state == AgentState::Working {
+                            break info;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(self.block_start(&run, &handle, RuntimeError::Timeout(msg)));
+                    }
+                    std::thread::sleep(Duration::from_millis(2000));
                 }
             }
             Err(e) => return Err(self.block_start(&run, &handle, e)),
