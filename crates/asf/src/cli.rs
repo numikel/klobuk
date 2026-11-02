@@ -66,10 +66,22 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: HookCmd,
     },
+    /// Orchestrator loop: promote ready issues, watch runs, process the merge queue.
+    Serve(ServeArgs),
     /// Write `.factory/issues.jsonl` (or `--out`).
     Export(ExportArgs),
     /// Load a JSONL export into this store.
     Import(ImportArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ServeArgs {
+    /// Seconds between ticks (>= 1).
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+    pub interval: u64,
+    /// Run a single tick and exit.
+    #[arg(long)]
+    pub once: bool,
 }
 
 #[derive(Args, Debug)]

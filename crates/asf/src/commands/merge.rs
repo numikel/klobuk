@@ -12,9 +12,9 @@ use crate::ctx::Ctx;
 use crate::output::{AppError, ErrorCode, Rendered};
 
 #[derive(Serialize)]
-struct TickResult {
-    processed: usize,
-    items: Vec<MergeItem>,
+pub struct TickResult {
+    pub processed: usize,
+    pub items: Vec<MergeItem>,
 }
 
 pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
@@ -40,23 +40,7 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
             Rendered::new(&q, text)
         }
         MergeCmd::Tick { once } => {
-            let mut items = Vec::new();
-            while let Some(next) = ctx
-                .store
-                .merge_queue()?
-                .into_iter()
-                .find(|m| m.state == MergeState::Queued)
-            {
-                let done = process(&ctx, &next)?;
-                items.push(done);
-                if *once {
-                    break;
-                }
-            }
-            let res = TickResult {
-                processed: items.len(),
-                items,
-            };
+            let res = tick_all(&ctx, *once)?;
             let text = if res.items.is_empty() {
                 "merge queue: nothing queued".to_string()
             } else {
@@ -103,6 +87,27 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
             Rendered::new(&updated, format!("#{} {} skipped", updated.id, id))
         }
     }
+}
+
+/// Processes queued items in FIFO order (`once` = at most one).
+pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
+    let mut items = Vec::new();
+    while let Some(next) = ctx
+        .store
+        .merge_queue()?
+        .into_iter()
+        .find(|m| m.state == MergeState::Queued)
+    {
+        let done = process(ctx, &next)?;
+        items.push(done);
+        if once {
+            break;
+        }
+    }
+    Ok(TickResult {
+        processed: items.len(),
+        items,
+    })
 }
 
 fn find(ctx: &Ctx, id: &IssueId) -> Result<MergeItem, AppError> {
