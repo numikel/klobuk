@@ -26,6 +26,28 @@ pub(crate) fn backend(e: rusqlite::Error) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// Lets `with_tx` carry a `ClaimError` out of a transaction without losing the `StoreError` path.
+enum ClaimErrorOrStore {
+    Claim(ClaimError),
+    Store(StoreError),
+}
+
+impl From<StoreError> for ClaimErrorOrStore {
+    fn from(e: StoreError) -> Self {
+        ClaimErrorOrStore::Store(e)
+    }
+}
+
+impl From<ClaimError> for ClaimErrorOrStore {
+    fn from(e: ClaimError) -> Self {
+        ClaimErrorOrStore::Claim(e)
+    }
+}
+
+pub(crate) fn is_constraint(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation)
+}
+
 impl SqliteStore {
     /// Opens (creating if needed) the database at `path`, applies pragmas and migrations.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -113,16 +135,16 @@ impl SqliteStore {
     }
 
     /// Runs `f` inside an IMMEDIATE transaction, committing on `Ok`.
-    pub(crate) fn with_tx<T>(
-        &self,
-        f: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
+    pub(crate) fn with_tx<T, E>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(backend)?;
+            .map_err(|e| E::from(backend(e)))?;
         let out = f(&tx)?;
-        tx.commit().map_err(backend)?;
+        tx.commit().map_err(|e| E::from(backend(e)))?;
         Ok(out)
     }
 
@@ -391,30 +413,177 @@ impl IssueStore for SqliteStore {
         })
     }
 
-    fn claim(&self, _id: &IssueId, _c: &NewClaim) -> Result<Claim, ClaimError> {
-        Err(ClaimError::Store(StoreError::Backend(
-            "claim: not implemented".into(),
-        )))
+    fn claim(&self, id: &IssueId, c: &NewClaim) -> Result<Claim, ClaimError> {
+        if c.worker.trim().is_empty() {
+            return Err(ClaimError::Store(StoreError::Validation(
+                "worker must not be empty".into(),
+            )));
+        }
+        self.with_tx(|tx| -> Result<Claim, ClaimErrorOrStore> {
+            let issue = require_issue(tx, id)?;
+            if let Some(cur) = row::claim_by_issue(tx, id)? {
+                return Err(ClaimError::AlreadyClaimed { by: cur.worker }.into());
+            }
+            if issue.status != Status::Ready {
+                return Err(ClaimError::NotReady { status: issue.status }.into());
+            }
+            let now = now_rfc3339();
+            tx.execute(
+                "INSERT INTO claims (issue_id, worker, run_id, worktree, branch, claimed_at, note)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id.as_str(),
+                    c.worker.trim(),
+                    c.run_id,
+                    c.worktree,
+                    c.branch,
+                    now,
+                    c.note
+                ],
+            )
+            .map_err(|e| {
+                if is_constraint(&e) {
+                    StoreError::Conflict(format!("issue {id} already claimed"))
+                } else {
+                    backend(e)
+                }
+            })?;
+            tx.execute(
+                "UPDATE issues SET status='in-progress', updated_at=?2 WHERE id=?1",
+                params![id.as_str(), now],
+            )
+            .map_err(backend)?;
+            append_event_tx(
+                tx,
+                &event(
+                    "claim.taken",
+                    id,
+                    Some(c.worker.trim()),
+                    serde_json::json!({ "worker": c.worker.trim() }),
+                ),
+            )?;
+            row::claim_by_issue(tx, id)?
+                .ok_or_else(|| ClaimErrorOrStore::Store(StoreError::Backend("claim vanished".into())))
+        })
+        .map_err(|e| match e {
+            ClaimErrorOrStore::Claim(c) => c,
+            ClaimErrorOrStore::Store(s) => ClaimError::Store(s),
+        })
     }
 
-    fn release(&self, _id: &IssueId) -> Result<(), StoreError> {
-        Err(StoreError::Backend("release: not implemented".into()))
+    fn release(&self, id: &IssueId) -> Result<(), StoreError> {
+        self.with_tx(|tx| {
+            let cur = row::claim_by_issue(tx, id)?
+                .ok_or_else(|| StoreError::NotFound(format!("no active claim on {id}")))?;
+            tx.execute("DELETE FROM claims WHERE issue_id=?1", params![id.as_str()])
+                .map_err(backend)?;
+            let now = now_rfc3339();
+            tx.execute(
+                "UPDATE issues SET status='ready', updated_at=?2 WHERE id=?1 AND status='in-progress'",
+                params![id.as_str(), now],
+            )
+            .map_err(backend)?;
+            append_event_tx(
+                tx,
+                &event(
+                    "claim.released",
+                    id,
+                    Some(&cur.worker),
+                    serde_json::json!({ "worker": cur.worker }),
+                ),
+            )?;
+            Ok(())
+        })
     }
 
     fn active_claims(&self) -> Result<Vec<Claim>, StoreError> {
-        Err(StoreError::Backend("active_claims: not implemented".into()))
+        self.read(row::active_claims)
     }
 
-    fn add_comment(&self, _c: &NewComment) -> Result<Comment, StoreError> {
-        Err(StoreError::Backend("add_comment: not implemented".into()))
+    fn add_comment(&self, c: &NewComment) -> Result<Comment, StoreError> {
+        if c.body.trim().is_empty() {
+            return Err(StoreError::Validation("comment body must not be empty".into()));
+        }
+        if c.author.trim().is_empty() || c.to_lane.trim().is_empty() {
+            return Err(StoreError::Validation(
+                "author and to_lane must not be empty".into(),
+            ));
+        }
+        self.with_tx(|tx| {
+            require_issue(tx, &c.issue_id)?;
+            if let Some(r) = c.reply_to {
+                let exists: Option<i64> = tx
+                    .query_row("SELECT id FROM comments WHERE id=?1", params![r], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(backend)?;
+                if exists.is_none() {
+                    return Err(StoreError::NotFound(format!("comment #{r}")));
+                }
+            }
+            tx.execute(
+                "INSERT INTO comments (issue_id, author, type, to_lane, body, reply_to, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    c.issue_id.as_str(),
+                    c.author.trim(),
+                    c.kind.as_str(),
+                    c.to_lane.trim(),
+                    c.body,
+                    c.reply_to,
+                    now_rfc3339()
+                ],
+            )
+            .map_err(backend)?;
+            let cid = tx.last_insert_rowid();
+            append_event_tx(
+                tx,
+                &event(
+                    "comment.added",
+                    &c.issue_id,
+                    Some(c.author.trim()),
+                    serde_json::json!({ "comment_id": cid, "type": c.kind.as_str(), "to": c.to_lane.trim() }),
+                ),
+            )?;
+            row::comment_by_id(tx, cid)?.ok_or_else(|| StoreError::Backend("comment vanished".into()))
+        })
     }
 
-    fn comments(&self, _id: &IssueId) -> Result<Vec<Comment>, StoreError> {
-        Err(StoreError::Backend("comments: not implemented".into()))
+    fn comments(&self, id: &IssueId) -> Result<Vec<Comment>, StoreError> {
+        self.read(|c| row::comments(c, id))
     }
 
-    fn inbox(&self, _lane: &str, _peek: bool, _all: bool) -> Result<Vec<Comment>, StoreError> {
-        Err(StoreError::Backend("inbox: not implemented".into()))
+    fn inbox(&self, lane: &str, peek: bool, all: bool) -> Result<Vec<Comment>, StoreError> {
+        let lane = lane.trim();
+        if lane.is_empty() {
+            return Err(StoreError::Validation("lane must not be empty".into()));
+        }
+        let own_author = if lane == LANE_ORCHESTRATOR {
+            LANE_ORCHESTRATOR.to_string()
+        } else {
+            format!("agent:{lane}")
+        };
+        let items = self.read(|c| row::inbox(c, lane, &own_author, all || lane == LANE_ORCHESTRATOR))?;
+        if !peek && !items.is_empty() {
+            self.with_tx(|tx| {
+                let mut last: std::collections::BTreeMap<&IssueId, i64> = std::collections::BTreeMap::new();
+                for it in &items {
+                    let e = last.entry(&it.issue_id).or_insert(it.id);
+                    *e = (*e).max(it.id);
+                }
+                for (issue, id) in last {
+                    tx.execute(
+                        "INSERT INTO cursors (lane, issue_id, last_comment_id) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(lane, issue_id) DO UPDATE SET last_comment_id = max(last_comment_id, excluded.last_comment_id)",
+                        params![lane, issue.as_str(), id],
+                    )
+                    .map_err(backend)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(items)
     }
 
     fn append_event(&self, e: &NewEvent) -> Result<u64, StoreError> {

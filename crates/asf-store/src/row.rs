@@ -155,3 +155,104 @@ pub(crate) fn events_since(c: &Connection, seq: u64, limit: usize) -> Result<Vec
         .map_err(backend)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(backend)
 }
+
+pub(crate) const CLAIM_COLS: &str = "issue_id, worker, run_id, worktree, branch, claimed_at, note";
+
+pub(crate) fn claim(row: &Row<'_>) -> rusqlite::Result<Claim> {
+    Ok(Claim {
+        issue_id: id_col(row, 0)?,
+        worker: row.get(1)?,
+        run_id: row.get(2)?,
+        worktree: row.get(3)?,
+        branch: row.get(4)?,
+        claimed_at: row.get(5)?,
+        note: row.get(6)?,
+    })
+}
+
+pub(crate) fn claim_by_issue(c: &Connection, id: &IssueId) -> Result<Option<Claim>, StoreError> {
+    c.query_row(
+        &format!("SELECT {CLAIM_COLS} FROM claims WHERE issue_id = ?1"),
+        params![id.as_str()],
+        claim,
+    )
+    .optional()
+    .map_err(backend)
+}
+
+pub(crate) fn active_claims(c: &Connection) -> Result<Vec<Claim>, StoreError> {
+    let mut stmt = c
+        .prepare(&format!(
+            "SELECT {CLAIM_COLS} FROM claims ORDER BY claimed_at, issue_id"
+        ))
+        .map_err(backend)?;
+    let rows = stmt.query_map([], claim).map_err(backend)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+}
+
+pub(crate) const COMMENT_COLS: &str =
+    "id, issue_id, author, type, to_lane, body, reply_to, resolved_at, created_at";
+
+pub(crate) fn comment(row: &Row<'_>) -> rusqlite::Result<Comment> {
+    Ok(Comment {
+        id: row.get(0)?,
+        issue_id: id_col(row, 1)?,
+        author: row.get(2)?,
+        kind: enum_col(row, 3)?,
+        to_lane: row.get(4)?,
+        body: row.get(5)?,
+        reply_to: row.get(6)?,
+        resolved_at: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+pub(crate) fn comment_by_id(c: &Connection, id: i64) -> Result<Option<Comment>, StoreError> {
+    c.query_row(
+        &format!("SELECT {COMMENT_COLS} FROM comments WHERE id = ?1"),
+        params![id],
+        comment,
+    )
+    .optional()
+    .map_err(backend)
+}
+
+pub(crate) fn comments(c: &Connection, id: &IssueId) -> Result<Vec<Comment>, StoreError> {
+    let mut stmt = c
+        .prepare(&format!(
+            "SELECT {COMMENT_COLS} FROM comments WHERE issue_id = ?1 ORDER BY id"
+        ))
+        .map_err(backend)?;
+    let rows = stmt.query_map(params![id.as_str()], comment).map_err(backend)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+}
+
+/// Unread comments for `lane`. With `all`, relevance is ignored (cursor and own-author exclusion still apply).
+pub(crate) fn inbox(
+    c: &Connection,
+    lane: &str,
+    own_author: &str,
+    all: bool,
+) -> Result<Vec<Comment>, StoreError> {
+    let sql = format!(
+        "SELECT {} FROM comments c
+         LEFT JOIN cursors cu ON cu.lane = ?1 AND cu.issue_id = c.issue_id
+         WHERE c.id > COALESCE(cu.last_comment_id, 0)
+           AND c.author <> ?2
+           AND ( ?3
+                 OR c.to_lane IN (?1, 'all')
+                 OR c.author = 'human'
+                 OR EXISTS (SELECT 1 FROM claims cl WHERE cl.issue_id = c.issue_id AND cl.worker = ?1) )
+         ORDER BY c.id",
+        COMMENT_COLS
+            .split(", ")
+            .map(|col| format!("c.{col}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut stmt = c.prepare(&sql).map_err(backend)?;
+    let rows = stmt
+        .query_map(params![lane, own_author, all], comment)
+        .map_err(backend)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+}
