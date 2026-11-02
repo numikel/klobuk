@@ -209,6 +209,33 @@ fn promote_ready_moves_backlog_with_done_deps() {
 }
 
 #[test]
+fn close_completed_epics_marks_epic_done_once() {
+    let (_d, s) = open();
+    let mut e = new_issue("epic");
+    e.kind = IssueType::Epic;
+    let epic = s.create_issue(&e).unwrap();
+    let mut c1 = new_issue("c1");
+    c1.parent_id = Some(epic.id.clone());
+    let c1 = s.create_issue(&c1).unwrap();
+    let mut c2 = new_issue("c2");
+    c2.parent_id = Some(epic.id.clone());
+    let c2 = s.create_issue(&c2).unwrap();
+
+    assert!(s.close_completed_epics().unwrap().is_empty());
+    s.set_status(&c1.id, Status::Done, "human").unwrap();
+    assert!(s.close_completed_epics().unwrap().is_empty());
+    s.set_status(&c2.id, Status::Cancelled, "human").unwrap();
+    assert_eq!(s.close_completed_epics().unwrap(), vec![epic.id.clone()]);
+    let got = s.get_issue(&epic.id).unwrap().unwrap();
+    assert_eq!(got.status, Status::Done);
+    assert!(got.closed_at.is_some());
+    assert!(s.close_completed_epics().unwrap().is_empty());
+    let last = s.events_since(0, 100).unwrap().pop().unwrap();
+    assert_eq!(last.kind, "issue.status");
+    assert_eq!(last.payload["to"], "done");
+}
+
+#[test]
 fn list_filter_by_status_type_label_parent() {
     let (_d, s) = open();
     let mut e = new_issue("epic");

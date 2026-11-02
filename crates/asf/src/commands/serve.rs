@@ -1,5 +1,6 @@
 //! `asf serve [--interval N] [--once]` — the orchestrator loop:
-//! promote ready issues → watch active runs → process the merge queue → sleep.
+//! watch active runs → process the merge queue → promote ready issues → close completed epics
+//! → (with `--dispatch`) start workers for the planned slots → sleep.
 
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use super::merge::{tick_all, TickResult};
 #[derive(Serialize)]
 pub struct TickReport {
     pub promoted: Vec<IssueId>,
+    pub closed_epics: Vec<IssueId>,
     pub watch: WatchResult,
     pub merge: TickResult,
     pub started: Vec<IssueId>,
@@ -29,6 +31,7 @@ fn tick(ctx: &Ctx, dispatch: bool) -> Result<TickReport, AppError> {
     let watch = worker.watch()?;
     let merge = tick_all(ctx, false)?;
     let promoted = ctx.store.promote_ready()?;
+    let closed_epics = ctx.store.close_completed_epics()?;
     let mut started = Vec::new();
     let mut start_errors = Vec::new();
     if dispatch {
@@ -44,6 +47,7 @@ fn tick(ctx: &Ctx, dispatch: bool) -> Result<TickReport, AppError> {
     }
     Ok(TickReport {
         promoted,
+        closed_epics,
         watch,
         merge,
         started,
@@ -70,6 +74,9 @@ fn text(t: &TickReport) -> String {
     for m in &t.merge.items {
         s.push_str(&format!("\nmerge #{} {} -> {}", m.id, m.issue_id, m.state));
     }
+    for id in &t.closed_epics {
+        s.push_str(&format!("\nclosed epic {id}"));
+    }
     for id in &t.started {
         s.push_str(&format!("\nstarted {id}"));
     }
@@ -94,6 +101,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         match tick(&ctx, a.dispatch) {
             Ok(t) => {
                 if !t.promoted.is_empty()
+                    || !t.closed_epics.is_empty()
                     || !t.watch.transitions.is_empty()
                     || !t.merge.items.is_empty()
                     || !t.started.is_empty()

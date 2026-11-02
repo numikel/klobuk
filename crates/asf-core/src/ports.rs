@@ -81,6 +81,9 @@ pub trait IssueStore: Send + Sync {
     fn remove_dep(&self, issue: &IssueId, on: &IssueId) -> Result<(), StoreError>;
     /// Moves `backlog` issues whose deps are all `done` to `ready`; returns the promoted ids.
     fn promote_ready(&self) -> Result<Vec<IssueId>, StoreError>;
+    /// Marks epics `done` once every child is terminal and at least one is `done`
+    /// (see `scheduler::completable_epics`); returns the closed ids.
+    fn close_completed_epics(&self) -> Result<Vec<IssueId>, StoreError>;
 
     fn claim(&self, id: &IssueId, c: &NewClaim) -> Result<Claim, ClaimError>;
     /// Deletes the claim; status `in-progress` goes back to `ready`.

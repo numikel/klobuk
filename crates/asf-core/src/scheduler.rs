@@ -138,6 +138,33 @@ pub fn promotable(issues: &[Issue], deps: &[Dep]) -> Vec<IssueId> {
     out
 }
 
+/// Open epics whose children are all terminal and at least one is `done`.
+///
+/// An epic without children, or whose children were all cancelled, is left to the operator.
+pub fn completable_epics(issues: &[Issue]) -> Vec<IssueId> {
+    let mut out: Vec<IssueId> = issues
+        .iter()
+        .filter(|e| e.kind == IssueType::Epic && !e.status.is_terminal())
+        .filter(|e| {
+            let mut children = issues
+                .iter()
+                .filter(|c| c.parent_id.as_ref() == Some(&e.id))
+                .peekable();
+            children.peek().is_some() && {
+                let mut any_done = false;
+                let all_terminal = children.all(|c| {
+                    any_done |= c.status == Status::Done;
+                    c.status.is_terminal()
+                });
+                all_terminal && any_done
+            }
+        })
+        .map(|e| e.id.clone())
+        .collect();
+    out.sort();
+    out
+}
+
 /// Validates every glob in a scope; the error names the offending pattern.
 pub fn validate_scope(scope: &[String]) -> Result<(), String> {
     for g in scope {
@@ -501,6 +528,44 @@ mod tests {
         let deps = [dep("asf-2", "asf-1"), dep("asf-3", "asf-4")];
         let p = promotable(&issues, &deps);
         assert_eq!(p, vec![id("asf-2"), id("asf-5")]);
+    }
+
+    #[test]
+    fn completable_epics_need_all_children_terminal_and_one_done() {
+        let mut epic = mk("asf-1", Status::Backlog, &[]);
+        epic.kind = IssueType::Epic;
+        let mut empty_epic = mk("asf-2", Status::Backlog, &[]);
+        empty_epic.kind = IssueType::Epic;
+        let mut open_epic = mk("asf-3", Status::Backlog, &[]);
+        open_epic.kind = IssueType::Epic;
+        let mut cancelled_epic = mk("asf-4", Status::Backlog, &[]);
+        cancelled_epic.kind = IssueType::Epic;
+        let child = |i: &str, parent: &str, status: Status| {
+            let mut c = mk(i, status, &[]);
+            c.parent_id = Some(id(parent));
+            c
+        };
+        let issues = [
+            epic,
+            empty_epic,
+            open_epic,
+            cancelled_epic,
+            child("asf-5", "asf-1", Status::Done),
+            child("asf-6", "asf-1", Status::Cancelled),
+            child("asf-7", "asf-3", Status::Done),
+            child("asf-8", "asf-3", Status::InProgress),
+            child("asf-9", "asf-4", Status::Cancelled),
+        ];
+        assert_eq!(completable_epics(&issues), vec![id("asf-1")]);
+    }
+
+    #[test]
+    fn completable_epics_skips_already_closed() {
+        let mut epic = mk("asf-1", Status::Done, &[]);
+        epic.kind = IssueType::Epic;
+        let mut c = mk("asf-2", Status::Done, &[]);
+        c.parent_id = Some(id("asf-1"));
+        assert!(completable_epics(&[epic, c]).is_empty());
     }
 
     #[test]

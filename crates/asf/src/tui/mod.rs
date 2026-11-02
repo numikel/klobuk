@@ -88,11 +88,13 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
             let w = worker.watch()?;
             let m = tick_all(ctx, false)?;
             let p = ctx.store.promote_ready()?;
+            let closed = ctx.store.close_completed_epics()?;
             Some(format!(
-                "tick: {} transition(s), {} merge item(s), {} promoted",
+                "tick: {} transition(s), {} merge item(s), {} promoted, {} epic(s) closed",
                 w.transitions.len(),
                 m.items.len(),
-                p.len()
+                p.len(),
+                closed.len()
             ))
         }
         Action::Start(id) => {

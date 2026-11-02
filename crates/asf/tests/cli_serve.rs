@@ -68,6 +68,28 @@ fn serve_once_watches_merges_and_promotes() {
 }
 
 #[test]
+fn serve_once_closes_epics_whose_children_are_all_done() {
+    let repo = Repo::initialised();
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("runtime = \"herdr\"", "runtime = \"fake\"");
+    std::fs::write(&cfg, s).unwrap();
+    let epic = repo.create_issue("epic", &["--type", "epic"]);
+    let child = repo.create_issue("child", &["--parent", &epic]);
+
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["closed_epics"], serde_json::json!([]), "{res}");
+    repo.ok(&["issue", "status", &child, "done"]);
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["closed_epics"], serde_json::json!([epic.clone()]), "{res}");
+    assert_eq!(repo.ok(&["issue", "show", &epic])["issue"]["status"], "done");
+
+    let human = repo.asf().args(["serve", "--once"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&human.stdout).contains("tick"));
+}
+
+#[test]
 fn serve_interval_is_validated() {
     let repo = Repo::initialised();
     let out = repo

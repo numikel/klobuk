@@ -415,6 +415,37 @@ impl IssueStore for SqliteStore {
         })
     }
 
+    fn close_completed_epics(&self) -> Result<Vec<IssueId>, StoreError> {
+        self.with_tx(|tx| {
+            let issues = row::list_issues(tx, &IssueFilter::default())?;
+            let closed = scheduler::completable_epics(&issues);
+            let now = now_rfc3339();
+            for id in &closed {
+                let from = issues
+                    .iter()
+                    .find(|i| &i.id == id)
+                    .map(|i| i.status.as_str())
+                    .unwrap_or("backlog");
+                tx.execute(
+                    "UPDATE issues SET status='done', updated_at=?2, closed_at=?2
+                     WHERE id=?1 AND status NOT IN ('done','cancelled')",
+                    params![id.as_str(), now],
+                )
+                .map_err(backend)?;
+                append_event_tx(
+                    tx,
+                    &event(
+                        "issue.status",
+                        id,
+                        Some("scheduler"),
+                        serde_json::json!({ "from": from, "to": "done", "reason": "children-complete" }),
+                    ),
+                )?;
+            }
+            Ok(closed)
+        })
+    }
+
     fn claim(&self, id: &IssueId, c: &NewClaim) -> Result<Claim, ClaimError> {
         if c.worker.trim().is_empty() {
             return Err(ClaimError::Store(StoreError::Validation(
