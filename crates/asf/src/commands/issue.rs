@@ -19,7 +19,12 @@ pub fn run(cli: &Cli, cmd: &IssueCmd) -> Result<Rendered, AppError> {
         IssueCmd::Ready => ready(&ctx),
         IssueCmd::Status { id, status } => set_status(&ctx, id, *status),
         IssueCmd::Dep { cmd } => dep(&ctx, cmd),
+        IssueCmd::Claim { id, worker, note } => claim(&ctx, id, worker.as_deref(), note.clone()),
+        IssueCmd::Release { id } => release(&ctx, id),
+        IssueCmd::Finish { id, report } => finish(&ctx, id, report),
         IssueCmd::Comment(a) => comment(&ctx, a),
+        IssueCmd::Inbox { peek, all } => inbox(&ctx, *peek, *all),
+        IssueCmd::Handoff { id, to, body } => handoff(&ctx, id, to, body),
     }
 }
 
@@ -42,6 +47,24 @@ fn issue_line(i: &Issue) -> String {
         "{:<10} {:<12} P{} {:<6} {}",
         i.id, i.status, i.priority, i.kind, i.title
     )
+}
+
+fn comment_line(c: &Comment) -> String {
+    format!(
+        "#{} {} **[{}] {}** -> to: {}\n    {}",
+        c.id,
+        c.issue_id,
+        c.author,
+        c.kind,
+        c.to_lane,
+        c.body.trim_end()
+    )
+}
+
+fn require(ctx: &Ctx, id: &IssueId) -> Result<Issue, AppError> {
+    ctx.store
+        .get_issue(id)?
+        .ok_or_else(|| AppError::not_found(format!("issue {id}")))
 }
 
 fn list(ctx: &Ctx, a: &ListArgs) -> Result<Rendered, AppError> {
@@ -76,16 +99,10 @@ struct ShowView {
     comments: Option<Vec<Comment>>,
 }
 
-fn require(ctx: &Ctx, id: &IssueId) -> Result<Issue, AppError> {
-    ctx.store
-        .get_issue(id)?
-        .ok_or_else(|| AppError::not_found(format!("issue {id}")))
-}
-
 fn show(ctx: &Ctx, id: &IssueId, dossier: bool) -> Result<Rendered, AppError> {
     let issue = require(ctx, id)?;
     let deps = ctx.store.deps()?;
-    let mut view_of = |other: &IssueId, with_handoffs: bool| -> Result<DepView, AppError> {
+    let view_of = |other: &IssueId, with_handoffs: bool| -> Result<DepView, AppError> {
         let o = require(ctx, other)?;
         let handoffs = if with_handoffs {
             Some(
@@ -149,11 +166,8 @@ fn show(ctx: &Ctx, id: &IssueId, dossier: bool) -> Result<Rendered, AppError> {
     if !view.issue.acceptance.is_empty() {
         text.push_str("\nacceptance:\n");
         for a in &view.issue.acceptance {
-            text.push_str(&format!(
-                "  - {}{}\n",
-                a.text,
-                a.verify.as_ref().map(|v| format!(" [{v}]")).unwrap_or_default()
-            ));
+            let verify = a.verify.as_ref().map(|v| format!(" [{v}]")).unwrap_or_default();
+            text.push_str(&format!("  - {}{verify}\n", a.text));
         }
     }
     if !view.deps.is_empty() {
@@ -171,14 +185,7 @@ fn show(ctx: &Ctx, id: &IssueId, dossier: bool) -> Result<Rendered, AppError> {
     if let Some(cs) = &view.comments {
         text.push_str(&format!("\ncomments ({}):\n", cs.len()));
         for c in cs {
-            text.push_str(&format!(
-                "  #{} **[{}] {}** -> to: {}\n    {}\n",
-                c.id,
-                c.author,
-                c.kind,
-                c.to_lane,
-                c.body.trim_end()
-            ));
+            text.push_str(&format!("  {}\n", comment_line(c)));
         }
     }
     Rendered::new(&view, text.trim_end())
@@ -296,19 +303,111 @@ fn dep(ctx: &Ctx, cmd: &DepCmd) -> Result<Rendered, AppError> {
     }
 }
 
+fn claim(ctx: &Ctx, id: &IssueId, worker: Option<&str>, note: Option<String>) -> Result<Rendered, AppError> {
+    let worker = match worker {
+        Some(w) => w.to_string(),
+        None if ctx.lane == LANE_ORCHESTRATOR || ctx.lane == LANE_HUMAN => {
+            return Err(AppError::validation(
+                "no worker: pass --worker <name> or act as a lane (--lane <id>, ASF_ISSUE, worktree cwd)",
+            ))
+        }
+        None => ctx.lane.clone(),
+    };
+    let c = ctx.store.claim(
+        id,
+        &NewClaim {
+            worker,
+            run_id: None,
+            worktree: Some(format!(
+                "{}/{}",
+                ctx.config.repo.worktrees_dir.trim_end_matches('/'),
+                id
+            )),
+            branch: Some(format!("feat/{id}")),
+            note,
+        },
+    )?;
+    let text = format!(
+        "{} claimed by {} ({})",
+        c.issue_id,
+        c.worker,
+        c.branch.as_deref().unwrap_or("-")
+    );
+    Rendered::new(&c, text)
+}
+
+fn release(ctx: &Ctx, id: &IssueId) -> Result<Rendered, AppError> {
+    ctx.store.release(id)?;
+    let issue = require(ctx, id)?;
+    let text = format!("{} released ({})", issue.id, issue.status);
+    Rendered::new(&issue, text)
+}
+
+#[derive(Serialize)]
+struct FinishView {
+    issue: Issue,
+    comment: Comment,
+}
+
+fn finish(ctx: &Ctx, id: &IssueId, report: &Path) -> Result<Rendered, AppError> {
+    if !report.is_file() {
+        return Err(AppError::validation(format!(
+            "report file {} does not exist",
+            report.display()
+        )));
+    }
+    let report_str = report.to_string_lossy().replace('\\', "/");
+    let issue = ctx.store.set_status(id, Status::InReview, &ctx.author())?;
+    let comment = ctx.store.add_comment(&NewComment {
+        issue_id: id.clone(),
+        author: ctx.author(),
+        kind: CommentType::Status,
+        to_lane: LANE_ALL.to_string(),
+        body: format!("finished; report: {report_str}"),
+        reply_to: None,
+    })?;
+    let text = format!("{} -> in-review; report {report_str}", issue.id);
+    Rendered::new(&FinishView { issue, comment }, text)
+}
+
 fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<Rendered, AppError> {
     let body = read_body(a.body.as_deref(), a.body_file.as_deref())?;
+    post(ctx, &a.id, a.kind, &a.to, body, a.reply_to)
+}
+
+fn handoff(ctx: &Ctx, id: &IssueId, to: &str, body: &str) -> Result<Rendered, AppError> {
+    post(ctx, id, CommentType::Handoff, to, body.to_string(), None)
+}
+
+fn post(
+    ctx: &Ctx,
+    id: &IssueId,
+    kind: CommentType,
+    to: &str,
+    body: String,
+    reply_to: Option<i64>,
+) -> Result<Rendered, AppError> {
     let c = ctx.store.add_comment(&NewComment {
-        issue_id: a.id.clone(),
+        issue_id: id.clone(),
         author: ctx.author(),
-        kind: a.kind,
-        to_lane: a.to.trim().to_string(),
+        kind,
+        to_lane: to.trim().to_string(),
         body,
-        reply_to: a.reply_to,
+        reply_to,
     })?;
     let text = format!(
         "#{} {} {} -> to: {} on {}",
         c.id, c.author, c.kind, c.to_lane, c.issue_id
     );
     Rendered::new(&c, text)
+}
+
+fn inbox(ctx: &Ctx, peek: bool, all: bool) -> Result<Rendered, AppError> {
+    let items = ctx.store.inbox(&ctx.lane, peek, all)?;
+    let text = if items.is_empty() {
+        "INBOX-EMPTY".to_string()
+    } else {
+        items.iter().map(comment_line).collect::<Vec<_>>().join("\n")
+    };
+    Rendered::new(&items, text)
 }

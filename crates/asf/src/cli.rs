@@ -32,6 +32,8 @@ pub struct Cli {
     pub cmd: Cmd,
 }
 
+// Parsed once per process; the size difference between variants is irrelevant here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Repository registration and health.
@@ -43,6 +45,16 @@ pub enum Cmd {
     Issue {
         #[command(subcommand)]
         cmd: IssueCmd,
+    },
+    /// Lanes = active claims and their worktrees.
+    Lane {
+        #[command(subcommand)]
+        cmd: LaneCmd,
+    },
+    /// Worker runs (M1: allocation plan only).
+    Run {
+        #[command(subcommand)]
+        cmd: RunCmd,
     },
 }
 
@@ -84,8 +96,40 @@ pub enum IssueCmd {
         #[command(subcommand)]
         cmd: DepCmd,
     },
+    /// Claim a ready issue for a worker (default worker = current lane). Exit 3 if already claimed.
+    Claim {
+        id: IssueId,
+        #[arg(long)]
+        worker: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Drop the claim; `in-progress` goes back to `ready`.
+    Release { id: IssueId },
+    /// Worker ritual: mark `in-review` and post a STATUS comment pointing at the report file.
+    Finish {
+        id: IssueId,
+        #[arg(long)]
+        report: PathBuf,
+    },
     /// Post a typed comment on an issue.
     Comment(CommentArgs),
+    /// Unread comments relevant to the current lane (advances the read cursor unless `--peek`).
+    Inbox {
+        #[arg(long)]
+        peek: bool,
+        /// Ignore relevance; show every unread comment.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Shorthand for `comment --type HANDOFF`.
+    Handoff {
+        id: IssueId,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        body: String,
+    },
 }
 
 #[derive(Args, Debug, Default)]
@@ -188,4 +232,18 @@ pub struct CommentArgs {
     pub body_file: Option<PathBuf>,
     #[arg(long)]
     pub reply_to: Option<i64>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LaneCmd {
+    /// Active claims with worktree existence.
+    List,
+    /// Report claims whose worktree directory is missing (`stale`).
+    Check,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RunCmd {
+    /// Deterministic allocation plan: which ready issues can start now and why the rest wait.
+    Plan,
 }

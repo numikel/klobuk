@@ -14,11 +14,8 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub const DB_FILE: &str = "factory.db";
 pub const ENV_ISSUE: &str = "ASF_ISSUE";
 
-#[allow(dead_code)] // fields consumed by issue/run commands (M1 tasks 11-13)
 pub struct Ctx {
     pub root: PathBuf,
-    pub factory_dir: PathBuf,
-    pub db_path: PathBuf,
     pub config: Config,
     pub store: SqliteStore,
     pub lane: String,
@@ -62,8 +59,6 @@ impl Ctx {
         );
         Ok(Ctx {
             root,
-            factory_dir,
-            db_path,
             config,
             store,
             lane,

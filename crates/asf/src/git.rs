@@ -41,7 +41,6 @@ pub fn locate_root(start: &Path) -> Result<PathBuf, AppError> {
     Ok(root.to_path_buf())
 }
 
-#[allow(dead_code)] // used by `asf run plan` (task 12)
 /// Tracked files relative to the root, forward slashes (as `git ls-files` prints them).
 pub fn tracked_files(root: &Path) -> Result<Vec<String>, AppError> {
     let s = run(root, &["ls-files", "-z"])?;

@@ -18,6 +18,7 @@ impl Repo {
         git(dir.path(), &["init", "-q", "-b", "main"]);
         git(dir.path(), &["config", "user.email", "t@example.com"]);
         git(dir.path(), &["config", "user.name", "t"]);
+        git(dir.path(), &["config", "core.autocrlf", "false"]);
         std::fs::write(dir.path().join("README.txt"), "hi\n").unwrap();
         git(dir.path(), &["add", "README.txt"]);
         git(dir.path(), &["commit", "-q", "-m", "init"]);
