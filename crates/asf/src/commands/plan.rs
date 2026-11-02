@@ -49,7 +49,8 @@ pub fn run(cli: &Cli, cmd: &PlanCmd) -> Result<Rendered, AppError> {
             file,
             dry_run,
             no_epic,
-        } => import(cli, file, *dry_run, *no_epic),
+            format,
+        } => import(cli, file, *dry_run, *no_epic, *format),
         PlanCmd::New {
             from,
             dry_run,
@@ -167,9 +168,15 @@ fn create_from_plan(
     })
 }
 
-fn import(cli: &Cli, file: &Path, dry_run: bool, no_epic: bool) -> Result<Rendered, AppError> {
+fn import(
+    cli: &Cli,
+    file: &Path,
+    dry_run: bool,
+    no_epic: bool,
+    format: PlanFormat,
+) -> Result<Rendered, AppError> {
     let text = read_md(file)?;
-    let plan = parse_md_tasks(&text).map_err(|e| AppError::validation(e.to_string()))?;
+    let plan = parse_plan(&text, format).map_err(|e| AppError::validation(e.to_string()))?;
     if dry_run {
         return dry_run_view(&plan, None);
     }

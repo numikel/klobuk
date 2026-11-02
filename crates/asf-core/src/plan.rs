@@ -259,6 +259,210 @@ pub fn parse_md_tasks(md: &str) -> Result<ParsedPlan, PlanParseError> {
     Ok(ParsedPlan { title, goal, tasks })
 }
 
+/// Which markdown dialect to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanFormat {
+    /// Detect: spec-kit when `- [ ] T001 …` lines are present, md-tasks otherwise.
+    Auto,
+    /// `### Task N: Title` with Files/checkbox blocks (superpowers writing-plans and similar).
+    MdTasks,
+    /// GitHub spec-kit `tasks.md`: `- [ ] T001 [P] Description in path/a.rs, path/b.rs`.
+    SpecKit,
+}
+
+impl std::str::FromStr for PlanFormat {
+    type Err = crate::model::ParseEnumError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(PlanFormat::Auto),
+            "md-tasks" => Ok(PlanFormat::MdTasks),
+            "spec-kit" => Ok(PlanFormat::SpecKit),
+            _ => Err(crate::model::ParseEnumError {
+                kind: "plan format",
+                value: s.to_string(),
+            }),
+        }
+    }
+}
+
+fn spec_kit_task_number(line: &str) -> Option<(u32, &str)> {
+    let t = line.trim();
+    let rest = t
+        .strip_prefix("- [ ]")
+        .or_else(|| t.strip_prefix("- [x]"))
+        .or_else(|| t.strip_prefix("- [X]"))?
+        .trim_start();
+    let rest = rest.strip_prefix('T')?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 2 {
+        return None;
+    }
+    Some((digits.parse().ok()?, rest[digits.len()..].trim_start()))
+}
+
+pub fn detect_format(md: &str) -> PlanFormat {
+    if md.lines().any(|l| spec_kit_task_number(l).is_some()) {
+        PlanFormat::SpecKit
+    } else {
+        PlanFormat::MdTasks
+    }
+}
+
+pub fn parse_plan(md: &str, format: PlanFormat) -> Result<ParsedPlan, PlanParseError> {
+    match format {
+        PlanFormat::Auto => parse_plan(md, detect_format(md)),
+        PlanFormat::MdTasks => parse_md_tasks(md),
+        PlanFormat::SpecKit => parse_spec_kit(md),
+    }
+}
+
+fn looks_like_path(tok: &str) -> bool {
+    let t = tok.trim_matches(|c: char| c == '`' || c == ',' || c == ';' || c == ')' || c == '(');
+    !t.is_empty()
+        && !t.contains(' ')
+        && (t.contains('/')
+            || t.rsplit_once('.')
+                .map(|(a, ext)| {
+                    !a.is_empty()
+                        && (1..=5).contains(&ext.len())
+                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+                .unwrap_or(false))
+}
+
+/// "Configure linting in .clippy.toml and rustfmt.toml" → ("Configure linting", [".clippy.toml", "rustfmt.toml"])
+fn split_description(desc: &str) -> (String, Vec<String>) {
+    let desc = desc.trim().trim_end_matches('.');
+    if let Some(i) = desc.rfind(" in ") {
+        let tail = &desc[i + 4..];
+        let toks: Vec<String> = tail
+            .split([',', ';'])
+            .flat_map(|part| part.split(" and "))
+            .map(|t| t.trim().trim_matches('`').to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !toks.is_empty() && toks.iter().all(|t| looks_like_path(t)) {
+            return (
+                desc[..i].trim().to_string(),
+                toks.into_iter().map(|t| t.replace('\\', "/")).collect(),
+            );
+        }
+    }
+    let paths: Vec<String> = desc
+        .split_whitespace()
+        .filter(|t| looks_like_path(t))
+        .map(|t| {
+            t.trim_matches(|c: char| c == '`' || c == ',' || c == ';')
+                .replace('\\', "/")
+        })
+        .collect();
+    (desc.to_string(), paths)
+}
+
+/// Parses a GitHub spec-kit `tasks.md`.
+///
+/// Dependencies: a task depends on the previous task of its phase; consecutive `[P]` tasks share the
+/// dependencies of the first one in their group; the first task of a phase depends on every task of
+/// the previous phase. Lines `- T005 depends on T003, T004` in a `## Dependencies` section override.
+pub fn parse_spec_kit(md: &str) -> Result<ParsedPlan, PlanParseError> {
+    let mut title: Option<String> = None;
+    let mut tasks: Vec<DraftTask> = Vec::new();
+    let mut phases: Vec<Vec<u32>> = Vec::new();
+    let mut phase_name = String::new();
+    let mut in_deps = false;
+    let mut explicit: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    let mut prev_in_phase: Option<(u32, bool, Vec<u32>)> = None; // (number, parallel, deps)
+
+    for raw in md.lines() {
+        let line = raw.trim_end();
+        let t = line.trim();
+        if title.is_none() {
+            if let Some(h) = t.strip_prefix("# ") {
+                title = Some(h.trim().to_string());
+                continue;
+            }
+        }
+        if let Some(h) = t.strip_prefix("## ") {
+            let h = h.trim();
+            in_deps = h.to_ascii_lowercase().starts_with("dependenc");
+            if !in_deps {
+                phase_name = h.to_string();
+                phases.push(Vec::new());
+                prev_in_phase = None;
+            }
+            continue;
+        }
+        if in_deps {
+            let lower = t.to_ascii_lowercase();
+            if lower.contains("depends on") {
+                let nums = numbers_in(t);
+                if let Some((first, rest)) = nums.split_first() {
+                    explicit.insert(*first, rest.to_vec());
+                }
+            }
+            continue;
+        }
+        let Some((number, rest)) = spec_kit_task_number(t) else {
+            continue;
+        };
+        let (parallel, desc) = match rest.strip_prefix("[P]").or_else(|| rest.strip_prefix("[p]")) {
+            Some(d) => (true, d.trim()),
+            None => (false, rest),
+        };
+        let (title_txt, scope) = split_description(desc);
+        if phases.is_empty() {
+            phases.push(Vec::new());
+        }
+        let deps: Vec<u32> = match &prev_in_phase {
+            Some((_, prev_par, prev_deps)) if parallel && *prev_par => prev_deps.clone(),
+            Some((n, _, _)) => vec![*n],
+            None => phases.iter().rev().nth(1).cloned().unwrap_or_default(),
+        };
+        phases.last_mut().expect("phase").push(number);
+        prev_in_phase = Some((number, parallel, deps.clone()));
+        tasks.push(DraftTask {
+            number,
+            title: title_txt.clone(),
+            body: phase_name.clone(),
+            file_scope: scope,
+            acceptance: vec![format!("T{number:03} done: {title_txt}")],
+            depends_on: deps,
+            parallel,
+            estimate: None,
+        });
+    }
+    if tasks.is_empty() {
+        return Err(PlanParseError::NoTasks);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for t in &tasks {
+        if !seen.insert(t.number) {
+            return Err(PlanParseError::DuplicateTask(t.number));
+        }
+    }
+    let numbers: Vec<u32> = tasks.iter().map(|t| t.number).collect();
+    for t in &mut tasks {
+        if let Some(e) = explicit.get(&t.number) {
+            t.depends_on = e.clone();
+        }
+        for on in &t.depends_on {
+            if !numbers.contains(on) {
+                return Err(PlanParseError::UnknownDependency {
+                    task: t.number,
+                    on: *on,
+                });
+            }
+        }
+    }
+    Ok(ParsedPlan {
+        title: title.unwrap_or_else(|| tasks[0].title.clone()),
+        goal: None,
+        tasks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +574,85 @@ Some prose about the task.
         let p = parse_md_tasks("## Task 1: Only\n- [ ] x\n").unwrap();
         assert_eq!(p.title, "Only");
         assert!(p.goal.is_none());
+    }
+
+    const SPEC_KIT: &str = r#"# Tasks: Hello CLI
+
+**Input**: Design documents from specs/001-hello/
+
+## Phase 3.1: Setup
+- [ ] T001 Create project structure per implementation plan in src/main.rs
+- [ ] T002 [P] Configure linting in .clippy.toml and rustfmt.toml
+
+## Phase 3.2: Tests First (TDD)
+- [ ] T003 [P] Contract test for greet in tests/greet.rs
+- [ ] T004 [P] Integration test for cli in tests/cli.rs
+
+## Phase 3.3: Core
+- [ ] T005 Implement greet and main in src/lib.rs, src/main.rs
+
+## Dependencies
+- T005 depends on T003, T004
+- Tests (T003-T004) before implementation (T005)
+"#;
+
+    #[test]
+    fn spec_kit_tasks_parse_with_parallel_groups_and_phases() {
+        let p = parse_spec_kit(SPEC_KIT).unwrap();
+        assert_eq!(p.title, "Tasks: Hello CLI");
+        assert_eq!(p.tasks.len(), 5);
+        let t = |n: u32| p.tasks.iter().find(|t| t.number == n).unwrap();
+        assert_eq!(t(1).title, "Create project structure per implementation plan");
+        assert_eq!(t(1).file_scope, vec!["src/main.rs"]);
+        assert!(!t(1).parallel);
+        assert!(t(1).depends_on.is_empty());
+        assert_eq!(t(2).file_scope, vec![".clippy.toml", "rustfmt.toml"]);
+        assert!(t(2).parallel);
+        assert_eq!(
+            t(2).depends_on,
+            vec![1],
+            "a [P] task still follows the previous sequential task"
+        );
+        assert_eq!(
+            t(3).depends_on,
+            vec![1, 2],
+            "new phase waits for the whole previous phase"
+        );
+        assert_eq!(t(4).depends_on, vec![1, 2]);
+        assert_eq!(t(5).depends_on, vec![3, 4], "explicit Dependencies section wins");
+        assert_eq!(t(5).file_scope, vec!["src/lib.rs", "src/main.rs"]);
+        assert_eq!(t(3).body, "Phase 3.2: Tests First (TDD)");
+        assert_eq!(
+            t(1).acceptance,
+            vec!["T001 done: Create project structure per implementation plan"]
+        );
+    }
+
+    #[test]
+    fn spec_kit_errors_and_detection() {
+        assert!(matches!(
+            parse_spec_kit(
+                "# nothing
+"
+            )
+            .unwrap_err(),
+            PlanParseError::NoTasks
+        ));
+        assert!(matches!(
+            parse_spec_kit(
+                "- [ ] T001 a
+- [ ] T001 b
+"
+            )
+            .unwrap_err(),
+            PlanParseError::DuplicateTask(1)
+        ));
+        assert_eq!(detect_format(SPEC_KIT), PlanFormat::SpecKit);
+        assert_eq!(detect_format(PLAN), PlanFormat::MdTasks);
+        assert_eq!(detect_format("random text"), PlanFormat::MdTasks);
+        let via_any = parse_plan(SPEC_KIT, PlanFormat::Auto).unwrap();
+        assert_eq!(via_any.tasks.len(), 5);
+        assert_eq!(parse_plan(PLAN, PlanFormat::Auto).unwrap().tasks.len(), 3);
+        assert!(parse_plan(PLAN, PlanFormat::SpecKit).is_err());
     }
 }

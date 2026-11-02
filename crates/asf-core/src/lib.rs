@@ -29,7 +29,10 @@ pub use error::{ClaimError, StoreError};
 pub use ids::{is_valid_prefix, IssueId};
 pub use jsonl::{CommentRecord, IssueRecord, Record, FORMAT};
 pub use model::*;
-pub use plan::{parse_md_tasks, DraftTask, ParsedPlan, PlanParseError};
+pub use plan::{
+    detect_format, parse_md_tasks, parse_plan, parse_spec_kit, DraftTask, ParsedPlan, PlanFormat,
+    PlanParseError,
+};
 pub use ports::{ExportOpts, ImportMode, ImportReport, IssueStore};
 pub use run::*;
 pub use runtime::*;

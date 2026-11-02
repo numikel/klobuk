@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use asf_core::{CommentType, ImportMode, IssueId, IssueType, Status};
+use asf_core::{CommentType, ImportMode, IssueId, IssueType, PlanFormat, Status};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -334,6 +334,9 @@ pub enum PlanCmd {
         /// Do not create a parent epic.
         #[arg(long)]
         no_epic: bool,
+        /// auto | md-tasks | spec-kit
+        #[arg(long, default_value = "auto")]
+        format: PlanFormat,
     },
     /// Idea → PRD → issues via headless Claude (`[planner]` in config); artifacts under `.factory/plan/<slug>/`.
     New {
