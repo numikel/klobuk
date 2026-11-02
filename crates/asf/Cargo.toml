@@ -1,0 +1,29 @@
+[package]
+name = "asf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "auto-software-factory CLI"
+
+[[bin]]
+name = "asf"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+asf-core = { workspace = true }
+asf-store = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }

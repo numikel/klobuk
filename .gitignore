@@ -1,0 +1,30 @@
+# --- Build ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- Documentation and implementation artifacts (never committed by policy) ---
+/docs/
+/context/
+/plans/
+*.md
+!CLAUDE.md
+!crates/**/README.md.keep
+
+# --- Factory runtime state (per repo, local only) ---
+/.factory/factory.db
+/.factory/factory.db-wal
+/.factory/factory.db-shm
+/.factory/runs/
+/.worktrees/
+
+# --- Claude Code local config ---
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/lanes/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
