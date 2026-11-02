@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use asf_core::{CommentType, IssueId, IssueType, Status};
+use asf_core::{CommentType, ImportMode, IssueId, IssueType, Status};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -56,6 +56,24 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: RunCmd,
     },
+    /// Write `.factory/issues.jsonl` (or `--out`).
+    Export(ExportArgs),
+    /// Load a JSONL export into this store.
+    Import(ImportArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ExportArgs {
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ImportArgs {
+    pub file: PathBuf,
+    /// `upsert` (match on uid, newer wins) or `replace` (wipe first).
+    #[arg(long, default_value = "upsert")]
+    pub mode: ImportMode,
 }
 
 #[derive(Subcommand, Debug)]
@@ -64,6 +82,8 @@ pub enum RepoCmd {
     Init(InitArgs),
     /// Counts per status, active claims, next id.
     Status,
+    /// Check git, config, database and optional tools (herdr, claude).
+    Doctor,
 }
 
 #[derive(Args, Debug)]

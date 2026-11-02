@@ -29,6 +29,7 @@ pub fn run(cli: &Cli, cmd: &RepoCmd) -> Result<Rendered, AppError> {
     match cmd {
         RepoCmd::Init(args) => init(cli, args),
         RepoCmd::Status => status(&Ctx::load(cli)?),
+        RepoCmd::Doctor => super::doctor::run(cli),
     }
 }
 

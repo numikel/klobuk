@@ -11,7 +11,7 @@ use crate::output::{AppError, Rendered};
 
 pub fn run(cli: &Cli, cmd: &IssueCmd) -> Result<Rendered, AppError> {
     let ctx = Ctx::load(cli)?;
-    match cmd {
+    let out = match cmd {
         IssueCmd::List(a) => list(&ctx, a),
         IssueCmd::Show { id, dossier } => show(&ctx, id, *dossier),
         IssueCmd::Create(a) => create(&ctx, a),
@@ -25,7 +25,14 @@ pub fn run(cli: &Cli, cmd: &IssueCmd) -> Result<Rendered, AppError> {
         IssueCmd::Comment(a) => comment(&ctx, a),
         IssueCmd::Inbox { peek, all } => inbox(&ctx, *peek, *all),
         IssueCmd::Handoff { id, to, body } => handoff(&ctx, id, to, body),
+    }?;
+    if !matches!(
+        cmd,
+        IssueCmd::List(_) | IssueCmd::Show { .. } | IssueCmd::Inbox { .. }
+    ) {
+        super::export::auto(&ctx)?;
     }
+    Ok(out)
 }
 
 /// Reads `--body` or `--body-file` (UTF-8, BOM stripped, CRLF normalised).

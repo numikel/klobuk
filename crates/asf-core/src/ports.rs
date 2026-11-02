@@ -18,6 +18,21 @@ pub enum ImportMode {
     Replace,
 }
 
+impl std::str::FromStr for ImportMode {
+    type Err = crate::model::ParseEnumError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "upsert" => Ok(ImportMode::Upsert),
+            "replace" => Ok(ImportMode::Replace),
+            _ => Err(crate::model::ParseEnumError {
+                kind: "import mode",
+                value: s.to_string(),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportReport {
     pub issues_created: usize,
