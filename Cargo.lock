@@ -99,6 +99,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "asf-runtime"
+version = "0.1.0"
+dependencies = [
+ "asf-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "asf-store"
 version = "0.1.0"
 dependencies = [

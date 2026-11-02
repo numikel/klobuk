@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/asf-core", "crates/asf-store", "crates/asf-vcs", "crates/asf"]
+members = ["crates/asf-core", "crates/asf-store", "crates/asf-vcs", "crates/asf-runtime", "crates/asf"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ rust-version = "1.85"
 asf-core = { path = "crates/asf-core" }
 asf-store = { path = "crates/asf-store" }
 asf-vcs = { path = "crates/asf-vcs" }
+asf-runtime = { path = "crates/asf-runtime" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
