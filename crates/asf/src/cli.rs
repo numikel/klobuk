@@ -46,6 +46,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: IssueCmd,
     },
+    /// Plans: import a markdown task list as issues.
+    Plan {
+        #[command(subcommand)]
+        cmd: PlanCmd,
+    },
     /// Lanes = active claims and their worktrees.
     Lane {
         #[command(subcommand)]
@@ -316,6 +321,20 @@ pub enum HookCmd {
     Stop,
     /// statusLine: record cost from Claude's estimate, enforce budget.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlanCmd {
+    /// Create an epic + one issue per `### Task N:` heading (deps, file scope and acceptance from the text).
+    Import {
+        file: PathBuf,
+        /// Parse and print, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not create a parent epic.
+        #[arg(long)]
+        no_epic: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

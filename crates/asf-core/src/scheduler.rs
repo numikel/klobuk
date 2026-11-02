@@ -126,7 +126,7 @@ pub fn promotable(issues: &[Issue], deps: &[Dep]) -> Vec<IssueId> {
     let status: HashMap<&IssueId, Status> = issues.iter().map(|i| (&i.id, i.status)).collect();
     let mut out: Vec<IssueId> = issues
         .iter()
-        .filter(|i| i.status == Status::Backlog)
+        .filter(|i| i.status == Status::Backlog && i.kind != IssueType::Epic)
         .filter(|i| {
             deps.iter()
                 .filter(|d| d.issue_id == i.id)
