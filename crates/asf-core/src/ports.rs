@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ClaimError, StoreError};
 use crate::ids::IssueId;
 use crate::model::*;
+use crate::run::{MergeItem, MergePatch, NewRun, Run, RunPatch};
 
 /// How `import_jsonl` treats existing rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,4 +98,25 @@ pub trait IssueStore: Send + Sync {
 
     fn export_jsonl(&self, w: &mut dyn Write, o: &ExportOpts) -> Result<(), StoreError>;
     fn import_jsonl(&self, r: &mut dyn BufRead, m: ImportMode) -> Result<ImportReport, StoreError>;
+
+    // ---- runs (M2) ----
+    /// Attempt = number of earlier runs for the issue + 1; state `starting`; id = ULID.
+    fn create_run(&self, n: &NewRun) -> Result<Run, StoreError>;
+    /// Emits `run.state` only when the state changes.
+    fn update_run(&self, id: &str, p: &RunPatch) -> Result<Run, StoreError>;
+    fn get_run(&self, id: &str) -> Result<Option<Run>, StoreError>;
+    /// Ordered by start; `active_only` excludes terminal states.
+    fn runs(&self, issue: Option<&IssueId>, active_only: bool) -> Result<Vec<Run>, StoreError>;
+
+    // ---- merge queue (M2) ----
+    /// `Conflict` while a non-terminal item for the issue exists.
+    fn enqueue_merge(
+        &self,
+        issue: &IssueId,
+        run_id: Option<&str>,
+        branch: &str,
+    ) -> Result<MergeItem, StoreError>;
+    /// FIFO by id.
+    fn merge_queue(&self) -> Result<Vec<MergeItem>, StoreError>;
+    fn update_merge(&self, id: i64, p: &MergePatch) -> Result<MergeItem, StoreError>;
 }

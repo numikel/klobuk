@@ -6,6 +6,7 @@
 
 mod jsonl;
 mod row;
+mod runs;
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -601,5 +602,38 @@ impl IssueStore for SqliteStore {
 
     fn import_jsonl(&self, r: &mut dyn BufRead, m: ImportMode) -> Result<ImportReport, StoreError> {
         jsonl::import(self, r, m)
+    }
+
+    fn create_run(&self, n: &NewRun) -> Result<Run, StoreError> {
+        runs::create_run(self, n)
+    }
+
+    fn update_run(&self, id: &str, p: &RunPatch) -> Result<Run, StoreError> {
+        runs::update_run(self, id, p)
+    }
+
+    fn get_run(&self, id: &str) -> Result<Option<Run>, StoreError> {
+        runs::get_run(self, id)
+    }
+
+    fn runs(&self, issue: Option<&IssueId>, active_only: bool) -> Result<Vec<Run>, StoreError> {
+        runs::runs(self, issue, active_only)
+    }
+
+    fn enqueue_merge(
+        &self,
+        issue: &IssueId,
+        run_id: Option<&str>,
+        branch: &str,
+    ) -> Result<MergeItem, StoreError> {
+        runs::enqueue_merge(self, issue, run_id, branch)
+    }
+
+    fn merge_queue(&self) -> Result<Vec<MergeItem>, StoreError> {
+        runs::merge_queue(self)
+    }
+
+    fn update_merge(&self, id: i64, p: &MergePatch) -> Result<MergeItem, StoreError> {
+        runs::update_merge(self, id, p)
     }
 }
