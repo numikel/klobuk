@@ -339,3 +339,23 @@ fn pre_tool_always_allows_the_run_report_path() {
     let (_, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&other, "Write"));
     assert!(out.contains("deny"), "{out}");
 }
+
+#[test]
+fn pre_tool_denies_dot_dot_traversal_even_under_the_report_dir() {
+    let f = fixture(None);
+    let env = [("ASF_RUN", f.run_id.as_str())];
+    let sneaky =
+        f.wt.join(".factory")
+            .join("runs")
+            .join("asf-1")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("Cargo.toml");
+    let (code, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&sneaky, "Write"));
+    assert_eq!(code, 0);
+    assert!(out.contains("deny"), "{out}");
+    let dotted = f.wt.join("src").join(".").join("..").join("Cargo.toml");
+    let (_, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&dotted, "Edit"));
+    assert!(out.contains("deny"), "{out}");
+}

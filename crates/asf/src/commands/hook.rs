@@ -109,9 +109,16 @@ fn canonical(p: &Path) -> PathBuf {
 fn relative_to_worktree(root: &Path, worktree_rel: &str, file: &Path) -> Option<String> {
     let wt = canonical(&root.join(worktree_rel));
     let f = canonical(file);
-    f.strip_prefix(&wt)
-        .ok()
-        .map(|r| r.to_string_lossy().replace('\\', "/"))
+    let rel = f.strip_prefix(&wt).ok()?;
+    // A non-existent tail is appended lexically by `canonical`, so `..`/`.` could survive; refuse
+    // them outright instead of trusting a string prefix check (reviewer finding).
+    if rel
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
