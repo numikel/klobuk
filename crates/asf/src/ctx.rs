@@ -70,7 +70,6 @@ impl Ctx {
         })
     }
 
-    #[allow(dead_code)] // used by comment commands (task 12)
     /// `agent:<lane>`, `orchestrator` or `human` — the author string for comments and events.
     pub fn author(&self) -> String {
         match self.lane.as_str() {
