@@ -67,15 +67,16 @@ fn worktree_add_creates_branch_from_base_and_returns_sha() {
 }
 
 #[test]
-fn worktree_add_reuses_existing_branch_and_refuses_existing_dir() {
+fn worktree_add_reuses_existing_branch_and_is_idempotent() {
     let (_d, root) = repo();
     let v = GitCli;
     git(&root, &["branch", "feat/asf-2", "main"]);
     let wt = root.join(".worktrees").join("asf-2");
     v.worktree_add(&root, &wt, "feat/asf-2", "main").unwrap();
     assert_eq!(v.current_branch(&wt).unwrap(), "feat/asf-2");
-    let e = v.worktree_add(&root, &wt, "feat/asf-2", "main").unwrap_err();
-    assert!(matches!(e, VcsError::Git(_)), "{e}");
+    // a second add on the same dir + branch is idempotent (restart after abort)
+    let again = v.worktree_add(&root, &wt, "feat/asf-2", "main").unwrap();
+    assert_eq!(again, v.head(&root).unwrap());
 }
 
 #[test]
@@ -193,5 +194,25 @@ fn ls_files_lists_tracked_with_forward_slashes() {
     assert_eq!(
         files,
         vec!["a.txt".to_string(), "b.txt".to_string(), "src/m.rs".to_string()]
+    );
+}
+
+#[test]
+fn worktree_add_is_idempotent_for_an_existing_worktree_on_the_same_branch() {
+    let (_d, root) = repo();
+    let v = GitCli;
+    let wt = root.join(".worktrees").join("asf-7");
+    let base1 = v.worktree_add(&root, &wt, "feat/asf-7", "main").unwrap();
+    commit_file(&wt, "c.txt", "c\n", "c");
+    let base2 = v.worktree_add(&root, &wt, "feat/asf-7", "main").unwrap();
+    assert_eq!(base1, base2, "same merge-base, nothing recreated");
+    assert!(wt.join("c.txt").exists());
+    // but a directory that is a worktree of another branch is refused
+    let other = root.join(".worktrees").join("asf-8");
+    v.worktree_add(&root, &other, "feat/asf-8", "main").unwrap();
+    let e = v.worktree_add(&root, &other, "feat/asf-9", "main").unwrap_err();
+    assert!(
+        matches!(e, VcsError::Git(ref m) if m.contains("feat/asf-8")),
+        "{e}"
     );
 }

@@ -46,7 +46,9 @@ const AGENT_NOT_READY: &str = r#"{"error":{"code":"agent_not_ready","message":"a
 const AGENT_INFO_BLOCKED: &str = r#"{"id":"cli:agent:get","result":{"agent":{"agent":"claude","agent_status":"blocked","cwd":"D:\\x\\repo","focused":false,"launch_pending":true,"name":"spike1","pane_id":"w3D:p1","revision":1,"state_change_seq":482,"tab_id":"w3D:t1","terminal_id":"term_1","workspace_id":"w3D"},"type":"agent_info"}}"#;
 const AGENT_STARTED: &str = r#"{"id":"cli:agent:start","result":{"agent":{"agent":"claude","agent_status":"idle","interactive_ready":true,"name":"spike1","pane_id":"w3D:p1","revision":2,"state_change_seq":483,"tab_id":"w3D:t1","terminal_id":"term_1","workspace_id":"w3D"},"argv":["claude","--permission-mode","acceptEdits"],"type":"agent_started"}}"#;
 const AGENT_PROMPTED_DONE: &str = r#"{"id":"cli:agent:prompt","result":{"agent":{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"72ca581f-9bb5-48f8-be1a-4e742a53afa2"},"agent_status":"done","completion_seq":485,"name":"spike1","pane_id":"w3D:p1","revision":3,"state_change_seq":485,"tab_id":"w3D:t1","terminal_id":"term_1","workspace_id":"w3D"},"type":"agent_prompted"}}"#;
-const PANE_READ: &str = r#"{"id":"cli:agent:read","result":{"read":{"format":"text","pane_id":"w3D:p1","revision":3,"source":"recent_unwrapped","tab_id":"w3D:t1","text":"line one\nYes, I trust this folder\n","truncated":false,"workspace_id":"w3D"},"type":"pane_read"}}"#;
+const PANE_READ: &str =
+    "PS D:\\x\\repo> claude\n Quick safety check: ...\n > No, exit\n   Yes, I trust this folder\n";
+const PANE_READ_JSON: &str = r#"{"id":"cli:agent:read","result":{"read":{"format":"text","pane_id":"w3D:p1","revision":3,"source":"recent_unwrapped","tab_id":"w3D:t1","text":"json text\n","truncated":false,"workspace_id":"w3D"},"type":"pane_read"}}"#;
 const OK: &str = r#"{"id":"cli:agent:send-keys","result":{"type":"ok"}}"#;
 const STATUS: &str = "client:\n  version: 0.9.5\n  channel: stable\n  protocol: 22\n\nserver:\n  status: running\n  version: 0.9.5\n  private_protocol: 22\n";
 
@@ -281,5 +283,22 @@ fn health_parses_status_text_and_requires_protocol_22() {
     assert!(matches!(
         rt.health().unwrap_err(),
         RuntimeError::Io(_) | RuntimeError::Protocol(_)
+    ));
+}
+
+#[test]
+fn read_accepts_json_envelope_too_and_fails_on_error_exit() {
+    let rec = Recording::new(vec![(0, PANE_READ_JSON, "")]);
+    let rt = HerdrRuntime::with_exec("herdr", &rec);
+    assert_eq!(rt.read(&handle(), 10).unwrap(), "json text\n");
+    let rec = Recording::new(vec![(
+        1,
+        "",
+        r#"{"error":{"code":"agent_not_found","message":"x"},"id":"cli:agent:read"}"#,
+    )]);
+    let rt = HerdrRuntime::with_exec("herdr", &rec);
+    assert!(matches!(
+        rt.read(&handle(), 10).unwrap_err(),
+        RuntimeError::NotFound(_)
     ));
 }

@@ -255,8 +255,10 @@ impl<E: Exec> AgentRuntime for HerdrRuntime<E> {
         self.agent_result(&[s("agent"), s("get"), h.name.clone()])
     }
 
+    /// `herdr agent read` prints the screen as plain text (verified live); a JSON envelope with
+    /// `result.read.text` is accepted too in case a future version switches.
     fn read(&self, h: &AgentHandle, lines: u32) -> Result<String, RuntimeError> {
-        let res = self.call(&[
+        let args = vec![
             s("agent"),
             s("read"),
             h.name.clone(),
@@ -264,11 +266,35 @@ impl<E: Exec> AgentRuntime for HerdrRuntime<E> {
             s("recent-unwrapped"),
             s("--lines"),
             lines.to_string(),
-        ])?;
-        res.pointer("/read/text")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| RuntimeError::Protocol(format!("agent read: no text in {res}")))
+        ];
+        let out = self.exec.run(&self.bin, &args)?;
+        if out.status == 0 {
+            if let Ok(v) = serde_json::from_str::<Value>(out.stdout.trim()) {
+                if let Some(t) = v.pointer("/result/read/text").and_then(Value::as_str) {
+                    return Ok(t.to_string());
+                }
+                if v.get("error").is_none() {
+                    return Ok(out.stdout);
+                }
+            } else {
+                return Ok(out.stdout);
+            }
+        }
+        // non-zero exit or an error envelope: map the error code from what we already have
+        for text in [&out.stdout, &out.stderr] {
+            if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+                if let Some(err) = v.get("error") {
+                    let code = err.get("code").and_then(Value::as_str).unwrap_or("unknown");
+                    let msg = err.get("message").and_then(Value::as_str).unwrap_or("");
+                    return Err(map_error(code, msg));
+                }
+            }
+        }
+        Err(RuntimeError::Protocol(format!(
+            "herdr agent read exited {}: {}",
+            out.status,
+            out.stderr.trim()
+        )))
     }
 
     fn send_keys(&self, h: &AgentHandle, keys: &[&str]) -> Result<(), RuntimeError> {

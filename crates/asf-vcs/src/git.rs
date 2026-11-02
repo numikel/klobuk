@@ -59,7 +59,22 @@ impl Vcs for GitCli {
 
     fn worktree_add(&self, root: &Path, path: &Path, branch: &str, base: &str) -> Result<String, VcsError> {
         if path.exists() {
-            return Err(VcsError::Git(format!("{} already exists", path.display())));
+            // Reuse a worktree that is already checked out on the requested branch (restart after abort).
+            match self.current_branch(path) {
+                Ok(b) if b == branch => return run(root, &["merge-base", branch, base]),
+                Ok(b) => {
+                    return Err(VcsError::Git(format!(
+                        "{} already exists and is on branch {b}, not {branch}",
+                        path.display()
+                    )))
+                }
+                Err(_) => {
+                    return Err(VcsError::Git(format!(
+                        "{} already exists and is not a worktree",
+                        path.display()
+                    )))
+                }
+            }
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| VcsError::Io(e.to_string()))?;
