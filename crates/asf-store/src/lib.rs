@@ -4,6 +4,7 @@
 //! Every write runs in an `IMMEDIATE` transaction so concurrent CLI processes queue on the
 //! database lock (WAL + `busy_timeout`) instead of failing with a deferred-lock upgrade.
 
+mod jsonl;
 mod row;
 
 use std::io::{BufRead, Write};
@@ -166,7 +167,7 @@ fn require_issue(tx: &Transaction<'_>, id: &IssueId) -> Result<Issue, StoreError
     row::issue_by_id(tx, id)?.ok_or_else(|| StoreError::NotFound(format!("issue {id}")))
 }
 
-fn append_event_tx(tx: &Transaction<'_>, e: &NewEvent) -> Result<u64, StoreError> {
+pub(crate) fn append_event_tx(tx: &Transaction<'_>, e: &NewEvent) -> Result<u64, StoreError> {
     tx.execute(
         "INSERT INTO events (ts, kind, issue_id, run_id, actor, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -594,11 +595,11 @@ impl IssueStore for SqliteStore {
         self.read(|c| row::events_since(c, seq, limit))
     }
 
-    fn export_jsonl(&self, _w: &mut dyn Write, _o: &ExportOpts) -> Result<(), StoreError> {
-        Err(StoreError::Backend("export_jsonl: not implemented".into()))
+    fn export_jsonl(&self, w: &mut dyn Write, o: &ExportOpts) -> Result<(), StoreError> {
+        jsonl::export(self, w, o)
     }
 
-    fn import_jsonl(&self, _r: &mut dyn BufRead, _m: ImportMode) -> Result<ImportReport, StoreError> {
-        Err(StoreError::Backend("import_jsonl: not implemented".into()))
+    fn import_jsonl(&self, r: &mut dyn BufRead, m: ImportMode) -> Result<ImportReport, StoreError> {
+        jsonl::import(self, r, m)
     }
 }

@@ -12,6 +12,7 @@
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod jsonl;
 pub mod lane;
 pub mod model;
 pub mod ports;
@@ -20,5 +21,6 @@ pub mod scheduler;
 pub use config::{Config, ConfigError};
 pub use error::{ClaimError, StoreError};
 pub use ids::{is_valid_prefix, IssueId};
+pub use jsonl::{CommentRecord, IssueRecord, Record, FORMAT};
 pub use model::*;
 pub use ports::{ExportOpts, ImportMode, ImportReport, IssueStore};
