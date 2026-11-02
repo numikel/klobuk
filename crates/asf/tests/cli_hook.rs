@@ -11,13 +11,23 @@ use common::Repo;
 /// Runs `asf hook <event>` with stdin JSON and env, from `cwd`. Returns (exit code, stdout, stderr).
 fn hook(cwd: &Path, event: &str, env: &[(&str, &str)], stdin: &serde_json::Value) -> (i32, String, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_asf"));
-    c.args(["hook", event]).current_dir(cwd).env_remove("ASF_RUN").env_remove("ASF_ISSUE");
+    c.args(["hook", event])
+        .current_dir(cwd)
+        .env_remove("ASF_RUN")
+        .env_remove("ASF_ISSUE");
     for (k, v) in env {
         c.env(k, v);
     }
-    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    c.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(stdin.to_string().as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.to_string().as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),
@@ -34,14 +44,13 @@ struct Fixture {
 }
 
 /// Issue `asf-1` with scope `src/**`, claimed, with a worktree and a `starting` run.
-fn fixture(extra_config: &str) -> Fixture {
+fn fixture(config_replace: Option<(&str, &str)>) -> Fixture {
     let repo = Repo::initialised();
-    if !extra_config.is_empty() {
+    if let Some((from, to)) = config_replace {
         let cfg = repo.path().join(".factory/config.toml");
-        let mut s = std::fs::read_to_string(&cfg).unwrap();
-        s.push('\n');
-        s.push_str(extra_config);
-        std::fs::write(&cfg, s).unwrap();
+        let s = std::fs::read_to_string(&cfg).unwrap();
+        assert!(s.contains(from), "config template lacks {from}");
+        std::fs::write(&cfg, s.replace(from, to)).unwrap();
     }
     let id = repo.create_issue("scoped", &["--ready", "--scope", "src/**"]);
     repo.ok(&["--lane", &id, "issue", "claim", &id]);
@@ -58,8 +67,21 @@ fn fixture(extra_config: &str) -> Fixture {
             budget_usd: Some(1.0),
         })
         .unwrap();
-    store.update_run(&run.id, &RunPatch { state: Some(RunState::Working), ..RunPatch::default() }).unwrap();
-    Fixture { repo, issue: id.parse().unwrap(), run_id: run.id, wt }
+    store
+        .update_run(
+            &run.id,
+            &RunPatch {
+                state: Some(RunState::Working),
+                ..RunPatch::default()
+            },
+        )
+        .unwrap();
+    Fixture {
+        repo,
+        issue: id.parse().unwrap(),
+        run_id: run.id,
+        wt,
+    }
 }
 
 fn store(f: &Fixture) -> SqliteStore {
@@ -81,57 +103,99 @@ fn pre_tool(file: &Path, tool: &str) -> serde_json::Value {
 
 #[test]
 fn pre_tool_denies_outside_scope_with_json_decision() {
-    let f = fixture("");
+    let f = fixture(None);
     let env = [("ASF_RUN", f.run_id.as_str())];
-    let (code, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&f.wt.join("Cargo.toml"), "Write"));
+    let (code, out, _) = hook(
+        &f.wt,
+        "pre-tool",
+        &env,
+        &pre_tool(&f.wt.join("Cargo.toml"), "Write"),
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&out).expect("json decision");
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
-    assert!(reason.contains("Cargo.toml") && reason.contains("src/**"), "{reason}");
-    let kinds: Vec<String> = store(&f).events_since(0, 100).unwrap().into_iter().map(|e| e.kind).collect();
+    let reason = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reason.contains("Cargo.toml") && reason.contains("src/**"),
+        "{reason}"
+    );
+    let kinds: Vec<String> = store(&f)
+        .events_since(0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
     assert!(kinds.contains(&"hook.denied".to_string()), "{kinds:?}");
 }
 
 #[test]
 fn pre_tool_allows_in_scope_and_ignores_other_tools() {
-    let f = fixture("");
+    let f = fixture(None);
     let env = [("ASF_RUN", f.run_id.as_str())];
-    let (code, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&f.wt.join("src").join("x.rs"), "Edit"));
+    let (code, out, _) = hook(
+        &f.wt,
+        "pre-tool",
+        &env,
+        &pre_tool(&f.wt.join("src").join("x.rs"), "Edit"),
+    );
     assert_eq!((code, out.as_str()), (0, ""));
     // Read is not scope-checked
-    let (code, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&f.wt.join("Cargo.toml"), "Read"));
+    let (code, out, _) = hook(
+        &f.wt,
+        "pre-tool",
+        &env,
+        &pre_tool(&f.wt.join("Cargo.toml"), "Read"),
+    );
     assert_eq!((code, out.as_str()), (0, ""));
 }
 
 #[test]
 fn pre_tool_denies_outside_worktree_even_if_glob_matches() {
-    let f = fixture("");
+    let f = fixture(None);
     let env = [("ASF_RUN", f.run_id.as_str())];
     let outside = f.repo.path().join("src").join("x.rs");
     let (code, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&outside, "Write"));
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
-    assert!(v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("worktree"));
+    assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains("worktree"));
 }
 
 #[test]
 fn pre_tool_resolves_run_from_issue_env_and_is_noop_without_context() {
-    let f = fixture("");
+    let f = fixture(None);
     let env = [("ASF_ISSUE", f.issue.as_str())];
-    let (code, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&f.wt.join("Cargo.toml"), "Write"));
+    let (code, out, _) = hook(
+        &f.wt,
+        "pre-tool",
+        &env,
+        &pre_tool(&f.wt.join("Cargo.toml"), "Write"),
+    );
     assert_eq!(code, 0);
     assert!(out.contains("deny"));
-    let (code, out, err) = hook(&f.wt, "pre-tool", &[], &pre_tool(&f.wt.join("Cargo.toml"), "Write"));
-    assert_eq!((code, out.as_str()), (0, ""), "no run context: never block Claude");
+    let (code, out, err) = hook(
+        &f.wt,
+        "pre-tool",
+        &[],
+        &pre_tool(&f.wt.join("Cargo.toml"), "Write"),
+    );
+    assert_eq!(
+        (code, out.as_str()),
+        (0, ""),
+        "no run context: never block Claude"
+    );
     assert!(err.is_empty() || err.contains("no run"), "{err}");
 }
 
 #[test]
 fn post_tool_counts_calls_records_session_and_trips_max_tool_calls() {
-    let f = fixture("[worker]\nmax_tool_calls = 2\n");
+    let f = fixture(Some(("max_tool_calls = 400", "max_tool_calls = 2")));
     let env = [("ASF_RUN", f.run_id.as_str())];
     let payload = serde_json::json!({
         "session_id": "sess-9", "transcript_path": "C:/t/sess-9.jsonl", "hook_event_name": "PostToolUse",
@@ -156,12 +220,17 @@ fn post_tool_counts_calls_records_session_and_trips_max_tool_calls() {
     assert_eq!(run.tool_calls, 3);
     assert_eq!(run.state, RunState::OverBudget);
     let blockers = store(&f).comments(&f.issue).unwrap();
-    assert!(blockers.iter().any(|c| c.kind == CommentType::Blocker && c.to_lane == "human"), "{blockers:?}");
+    assert!(
+        blockers
+            .iter()
+            .any(|c| c.kind == CommentType::Blocker && c.to_lane == "human"),
+        "{blockers:?}"
+    );
 }
 
 #[test]
 fn stop_blocks_once_until_finish_then_allows() {
-    let f = fixture("");
+    let f = fixture(None);
     let env = [("ASF_RUN", f.run_id.as_str())];
     let stop = |active: bool, msg: &str| {
         serde_json::json!({
@@ -173,17 +242,30 @@ fn stop_blocks_once_until_finish_then_allows() {
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&out).expect("block json");
     assert_eq!(v["decision"], "block");
-    assert!(v["reason"].as_str().unwrap().contains("asf issue finish asf-1"), "{v}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("asf issue finish asf-1"),
+        "{v}"
+    );
     // second stop while the hook is already active: let Claude stop (no loop)
     let (code, out, _) = hook(&f.wt, "stop", &env, &stop(true, "really done"));
     assert_eq!((code, out.as_str()), (0, ""));
     let ev = store(&f).events_since(0, 100).unwrap();
-    assert!(ev.iter().any(|e| e.kind == "run.stop" && e.payload["last_assistant_message"] == "I think I am done"));
+    assert!(ev
+        .iter()
+        .any(|e| e.kind == "run.stop" && e.payload["last_assistant_message"] == "I think I am done"));
 
     // after the finish ritual the stop hook is silent
     let report = f.wt.join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
-    f.repo.ok(&["--lane", "asf-1", "issue", "finish", "asf-1", "--report", report.to_str().unwrap()]);
+    f.repo.ok(&[
+        "--lane",
+        "asf-1",
+        "issue",
+        "finish",
+        "asf-1",
+        "--report",
+        report.to_str().unwrap(),
+    ]);
     let (code, out, _) = hook(&f.wt, "stop", &env, &stop(false, "done"));
     assert_eq!((code, out.as_str()), (0, ""));
     let run = store(&f).get_run(&f.run_id).unwrap().unwrap();
@@ -193,7 +275,7 @@ fn stop_blocks_once_until_finish_then_allows() {
 
 #[test]
 fn status_updates_cost_and_trips_budget_once() {
-    let f = fixture("");
+    let f = fixture(None);
     let env = [("ASF_RUN", f.run_id.as_str())];
     let status = |cost: f64| {
         serde_json::json!({
@@ -215,12 +297,27 @@ fn status_updates_cost_and_trips_budget_once() {
     assert!(out.contains("OVER BUDGET"), "{out}");
     let run = store(&f).get_run(&f.run_id).unwrap().unwrap();
     assert_eq!(run.state, RunState::OverBudget);
-    let n = store(&f).comments(&f.issue).unwrap().iter().filter(|c| c.kind == CommentType::Blocker).count();
+    let n = store(&f)
+        .comments(&f.issue)
+        .unwrap()
+        .iter()
+        .filter(|c| c.kind == CommentType::Blocker)
+        .count();
     assert_eq!(n, 1);
     hook(&f.wt, "status", &env, &status(1.6));
-    let n = store(&f).comments(&f.issue).unwrap().iter().filter(|c| c.kind == CommentType::Blocker).count();
+    let n = store(&f)
+        .comments(&f.issue)
+        .unwrap()
+        .iter()
+        .filter(|c| c.kind == CommentType::Blocker)
+        .count();
     assert_eq!(n, 1, "BLOCKER posted once");
     // once over budget, pre-tool denies everything
-    let (_, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&f.wt.join("src").join("ok.rs"), "Edit"));
+    let (_, out, _) = hook(
+        &f.wt,
+        "pre-tool",
+        &env,
+        &pre_tool(&f.wt.join("src").join("ok.rs"), "Edit"),
+    );
     assert!(out.contains("deny") && out.contains("budget"), "{out}");
 }

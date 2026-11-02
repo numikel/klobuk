@@ -109,7 +109,9 @@ fn canonical(p: &Path) -> PathBuf {
 fn relative_to_worktree(root: &Path, worktree_rel: &str, file: &Path) -> Option<String> {
     let wt = canonical(&root.join(worktree_rel));
     let f = canonical(file);
-    f.strip_prefix(&wt).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
+    f.strip_prefix(&wt)
+        .ok()
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
 }
 
 fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
@@ -126,9 +128,15 @@ fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
             run.id, run.state
         )));
     }
-    let issue = ctx.store.get_issue(&run.issue_id)?.ok_or_else(|| AppError::not_found("issue of run"))?;
+    let issue = ctx
+        .store
+        .get_issue(&run.issue_id)?
+        .ok_or_else(|| AppError::not_found("issue of run"))?;
     let Some(rel) = relative_to_worktree(&ctx.root, &run.worktree, Path::new(file)) else {
-        let reason = format!("asf: `{file}` is outside the worktree `{}`; only edit files inside it", run.worktree);
+        let reason = format!(
+            "asf: `{file}` is outside the worktree `{}`; only edit files inside it",
+            run.worktree
+        );
         ctx.store.append_event(&NewEvent {
             kind: "hook.denied".into(),
             issue_id: Some(run.issue_id.clone()),
@@ -179,8 +187,14 @@ fn blocker(ctx: &Ctx, run: &Run, body: String) -> Result<(), AppError> {
 }
 
 fn post_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
-    let session = input.get("session_id").and_then(Value::as_str).map(str::to_string);
-    let transcript = input.get("transcript_path").and_then(Value::as_str).map(str::to_string);
+    let session = input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let transcript = input
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let tool_calls = run.tool_calls + 1;
     let mut patch = RunPatch {
         tool_calls: Some(tool_calls),
@@ -213,8 +227,14 @@ fn post_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
 }
 
 fn stop(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
-    let active = input.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
-    let last = input.get("last_assistant_message").and_then(Value::as_str).unwrap_or("");
+    let active = input
+        .get("stop_hook_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let last = input
+        .get("last_assistant_message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     ctx.store.append_event(&NewEvent {
         kind: "run.stop".into(),
         issue_id: Some(run.issue_id.clone()),
@@ -222,9 +242,21 @@ fn stop(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
         actor: Some("hook".into()),
         payload: json!({ "stop_hook_active": active, "last_assistant_message": last }),
     })?;
-    ctx.store.update_run(&run.id, &RunPatch { last_seen_at: Some(now_rfc3339()), ..RunPatch::default() })?;
-    let issue = ctx.store.get_issue(&run.issue_id)?.ok_or_else(|| AppError::not_found("issue of run"))?;
-    if issue.status == Status::InReview || active || matches!(run.state, RunState::OverBudget | RunState::Aborted) {
+    ctx.store.update_run(
+        &run.id,
+        &RunPatch {
+            last_seen_at: Some(now_rfc3339()),
+            ..RunPatch::default()
+        },
+    )?;
+    let issue = ctx
+        .store
+        .get_issue(&run.issue_id)?
+        .ok_or_else(|| AppError::not_found("issue of run"))?;
+    if issue.status == Status::InReview
+        || active
+        || matches!(run.state, RunState::OverBudget | RunState::Aborted)
+    {
         return Ok(String::new());
     }
     let report = format!(".factory/runs/{}/report.md", run.issue_id);
@@ -239,8 +271,12 @@ fn stop(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
 
 fn status(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
     let cost = input.pointer("/cost/total_cost_usd").and_then(Value::as_f64);
-    let inp = input.pointer("/context_window/total_input_tokens").and_then(Value::as_i64);
-    let outp = input.pointer("/context_window/total_output_tokens").and_then(Value::as_i64);
+    let inp = input
+        .pointer("/context_window/total_input_tokens")
+        .and_then(Value::as_i64);
+    let outp = input
+        .pointer("/context_window/total_output_tokens")
+        .and_then(Value::as_i64);
     let mut patch = RunPatch {
         cost_usd: cost,
         input_tokens: inp,
@@ -253,7 +289,10 @@ fn status(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
     let trip = over && run.state != RunState::OverBudget;
     if trip {
         patch.state = Some(RunState::OverBudget);
-        patch.exit_reason = Some(format!("budget ${:.2} exceeded (${cost_now:.2})", run.budget_usd.unwrap_or(0.0)));
+        patch.exit_reason = Some(format!(
+            "budget ${:.2} exceeded (${cost_now:.2})",
+            run.budget_usd.unwrap_or(0.0)
+        ));
     }
     ctx.store.update_run(&run.id, &patch)?;
     if trip {
@@ -271,11 +310,17 @@ fn status(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
             ),
         )?;
     }
-    let flag = if over || run.state == RunState::OverBudget { " OVER BUDGET" } else { "" };
+    let flag = if over || run.state == RunState::OverBudget {
+        " OVER BUDGET"
+    } else {
+        ""
+    };
     Ok(format!(
         "asf {} ${cost_now:.2}/{} tool_calls {}{flag}",
         run.issue_id,
-        run.budget_usd.map(|b| format!("${b:.2}")).unwrap_or_else(|| "-".into()),
+        run.budget_usd
+            .map(|b| format!("${b:.2}"))
+            .unwrap_or_else(|| "-".into()),
         run.tool_calls
     ))
 }
