@@ -226,3 +226,33 @@ fn parallel_claims_exactly_one_winner() {
     assert_eq!(wins, 1, "{results:?}");
     assert_eq!(conflicts, 7, "{results:?}");
 }
+
+#[test]
+fn export_refuses_symlink_destination() {
+    let r = Repo::initialised();
+    r.create_issue("a", &[]);
+    let victim = r.path().join("victim.txt");
+    std::fs::write(&victim, "precious").unwrap();
+    let link = r.path().join("out.jsonl");
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(&victim, &link).is_ok();
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&victim, &link).is_ok();
+    if !made {
+        eprintln!("skipping: cannot create symlinks on this machine");
+        return;
+    }
+    let (code, ecode, msg) = r.err(&["export", "--out", link.to_str().unwrap()]);
+    assert_eq!((code, ecode.as_str()), (1, "validation"));
+    assert!(msg.contains("symlink"), "{msg}");
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "precious",
+        "symlink target must be untouched"
+    );
+    // a stale temp file from a crashed run is replaced, a symlinked temp file is refused
+    let out = r.path().join("fresh.jsonl");
+    std::fs::write(out.with_extension("jsonl.tmp"), "stale").unwrap();
+    r.ok(&["export", "--out", out.to_str().unwrap()]);
+    assert!(out.exists() && !out.with_extension("jsonl.tmp").exists());
+}
