@@ -15,6 +15,7 @@ pub mod ids;
 pub mod lane;
 pub mod model;
 pub mod ports;
+pub mod scheduler;
 
 pub use config::{Config, ConfigError};
 pub use error::{ClaimError, StoreError};
