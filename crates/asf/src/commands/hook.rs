@@ -146,6 +146,12 @@ fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
         })?;
         return Ok(deny(&reason));
     };
+    // The finish ritual writes the report under .factory/runs/<issue>/ inside the worktree; that
+    // directory is gitignored and never part of the verified diff, so it is exempt from the scope.
+    let report_dir = format!(".factory/runs/{}/", run.issue_id);
+    if rel.starts_with(&report_dir) {
+        return Ok(String::new());
+    }
     if issue.file_scope.is_empty() {
         return Ok(String::new());
     }
@@ -159,9 +165,10 @@ fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
     }
     let reason = format!(
         "asf: `{rel}` is outside the file scope of {} ({}). Edit only files matching the scope; if the scope is \
-         wrong, post `asf issue comment {} --type BLOCKER --to human --body \"...\"` and stop.",
+         wrong, post `{} issue comment {} --type BLOCKER --to human --body \"...\"` and stop.",
         issue.id,
         issue.file_scope.join(", "),
+        crate::ctx::asf_bin(),
         issue.id
     );
     ctx.store.append_event(&NewEvent {

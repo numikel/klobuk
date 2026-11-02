@@ -321,3 +321,21 @@ fn status_updates_cost_and_trips_budget_once() {
     );
     assert!(out.contains("deny") && out.contains("budget"), "{out}");
 }
+
+#[test]
+fn pre_tool_always_allows_the_run_report_path() {
+    let f = fixture(None);
+    let env = [("ASF_RUN", f.run_id.as_str())];
+    // the brief tells the worker to write .factory/runs/<id>/report.md relative to the worktree
+    let report = f.wt.join(".factory").join("runs").join("asf-1").join("report.md");
+    let (code, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&report, "Write"));
+    assert_eq!(
+        (code, out.as_str()),
+        (0, ""),
+        "report path must not be scope-checked"
+    );
+    // but not arbitrary files under .factory
+    let other = f.wt.join(".factory").join("config.toml");
+    let (_, out, _) = hook(&f.wt, "pre-tool", &env, &pre_tool(&other, "Write"));
+    assert!(out.contains("deny"), "{out}");
+}
