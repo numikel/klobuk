@@ -31,16 +31,52 @@ fn init_creates_factory_config_db_and_ignore_lines() {
 }
 
 #[test]
-fn init_is_idempotent_on_gitignore_and_conflicts_on_second_run() {
+fn init_is_idempotent_on_gitignore_and_on_a_second_run() {
     let r = Repo::new();
     std::fs::write(r.path().join(".gitignore"), "target/\n.worktrees/\n").unwrap();
     r.ok(&["repo", "init"]);
     let s = std::fs::read_to_string(r.path().join(".gitignore")).unwrap();
     assert_eq!(s.lines().filter(|l| *l == ".worktrees/").count(), 1);
     assert!(s.starts_with("target/\n"));
-    let (code, ecode, _) = r.err(&["repo", "init"]);
-    assert_eq!(code, 3);
-    assert_eq!(ecode, "conflict");
+    let res = r.ok(&["repo", "init"]);
+    assert_eq!(res["created"], false, "{res}");
+    assert_eq!(res["prefix"], "asf", "{res}");
+}
+
+/// A clone brings the committed `.factory/config.toml` but no database: init adopts the config.
+#[test]
+fn init_adopts_a_committed_config_and_creates_the_database() {
+    let r = Repo::new();
+    r.ok(&["repo", "init", "--prefix", "law"]);
+    let cfg_path = r.path().join(".factory/config.toml");
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+    for f in ["factory.db", "factory.db-wal", "factory.db-shm"] {
+        let _ = std::fs::remove_file(r.path().join(".factory").join(f));
+    }
+    let (code, ecode, _) = r.err(&["repo", "doctor"]);
+    assert_eq!(
+        (code, ecode.as_str()),
+        (1, "validation"),
+        "doctor must flag the missing database"
+    );
+
+    let res = r.ok(&["repo", "init"]);
+    assert_eq!(res["created"], true, "{res}");
+    assert_eq!(
+        res["prefix"], "law",
+        "prefix comes from the committed config: {res}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        before,
+        "config untouched"
+    );
+    assert_eq!(r.ok(&["issue", "create", "--title", "x"])["id"], "law-1");
+    r.ok(&["repo", "doctor"]);
+
+    let (code, ecode, msg) = r.err(&["repo", "init", "--prefix", "other"]);
+    assert_eq!((code, ecode.as_str()), (1, "validation"), "{msg}");
+    assert!(msg.contains("law"), "{msg}");
 }
 
 #[test]

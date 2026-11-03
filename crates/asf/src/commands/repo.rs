@@ -41,13 +41,9 @@ struct InitResult {
     created: bool,
 }
 
+/// Creates `.factory/` or adopts an existing (committed) `config.toml`, registers the repository
+/// in the database when that has not happened yet, and guarantees the ignore lines. Idempotent.
 fn init(cli: &Cli, args: &InitArgs) -> Result<Rendered, AppError> {
-    let prefix = args.prefix.as_deref().unwrap_or("asf");
-    if !is_valid_prefix(prefix) {
-        return Err(AppError::validation(format!(
-            "prefix `{prefix}` must match ^[a-z][a-z0-9]{{0,15}}$"
-        )));
-    }
     let root = git::locate_root(&ctx::start_dir(cli)?)?;
     if root.to_string_lossy().contains(' ') {
         return Err(AppError::validation(format!(
@@ -57,17 +53,42 @@ fn init(cli: &Cli, args: &InitArgs) -> Result<Rendered, AppError> {
     }
     let factory_dir = root.join(FACTORY_DIR);
     let config_path = factory_dir.join(CONFIG_FILE);
-    if config_path.exists() {
-        return Err(AppError::conflict(format!(
-            "{} already exists",
-            config_path.display()
-        )));
-    }
-    fs::create_dir_all(&factory_dir)?;
-    write_utf8(&config_path, &Config::default_toml_with_prefix(prefix))?;
+    let (prefix, default_branch) = if config_path.exists() {
+        let raw = fs::read_to_string(&config_path)?;
+        let cfg = Config::from_toml(raw.trim_start_matches('\u{feff}'))?;
+        if let Some(wanted) = args.prefix.as_deref() {
+            if wanted != cfg.repo.prefix {
+                return Err(AppError::validation(format!(
+                    "{FACTORY_DIR}/{CONFIG_FILE} already sets prefix `{}`; drop --prefix or edit the file",
+                    cfg.repo.prefix
+                )));
+            }
+        }
+        (cfg.repo.prefix, cfg.repo.default_branch)
+    } else {
+        let prefix = args.prefix.as_deref().unwrap_or("asf");
+        if !is_valid_prefix(prefix) {
+            return Err(AppError::validation(format!(
+                "prefix `{prefix}` must match ^[a-z][a-z0-9]{{0,15}}$"
+            )));
+        }
+        fs::create_dir_all(&factory_dir)?;
+        write_utf8(&config_path, &Config::default_toml_with_prefix(prefix))?;
+        (prefix.to_string(), "main".to_string())
+    };
     let db_path = factory_dir.join(DB_FILE);
     let store = SqliteStore::open(&db_path)?;
-    store.init_repo(&root.to_string_lossy().replace('\\', "/"), prefix, "main")?;
+    let created = match store.repo() {
+        Ok(_) => false,
+        Err(_) => {
+            store.init_repo(
+                &root.to_string_lossy().replace('\\', "/"),
+                &prefix,
+                &default_branch,
+            )?;
+            true
+        }
+    };
     ensure_lines(&root.join(".gitignore"), IGNORE_LINES)?;
     ensure_lines(
         &git::common_dir(&root)?.join("info").join("exclude"),
@@ -75,11 +96,15 @@ fn init(cli: &Cli, args: &InitArgs) -> Result<Rendered, AppError> {
     )?;
     let res = InitResult {
         root: root.to_string_lossy().replace('\\', "/"),
-        prefix: prefix.to_string(),
+        prefix,
         db: db_path.to_string_lossy().replace('\\', "/"),
-        created: true,
+        created,
     };
-    let text = format!("initialised {} (prefix {})", res.root, res.prefix);
+    let text = if created {
+        format!("initialised {} (prefix {})", res.root, res.prefix)
+    } else {
+        format!("already initialised {} (prefix {})", res.root, res.prefix)
+    };
     Rendered::new(&res, text)
 }
 
