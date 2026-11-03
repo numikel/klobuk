@@ -40,6 +40,17 @@ fn lines(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Modified or staged tracked files that block integrating into `dir`, ignoring the factory's own
+/// state under `.factory/` (the issue export changes with every status update).
+fn blocking_dirty(dir: &Path) -> Result<Vec<String>, VcsError> {
+    Ok(
+        lines(&run(dir, &["status", "--porcelain", "--untracked-files=no"])?)
+            .into_iter()
+            .filter(|l| !l.get(3..).unwrap_or("").starts_with(".factory/"))
+            .collect(),
+    )
+}
+
 fn ref_exists(dir: &Path, r: &str) -> bool {
     run(dir, &["rev-parse", "--verify", "--quiet", r]).is_ok()
 }
@@ -126,8 +137,9 @@ impl Vcs for GitCli {
     }
 
     fn ff_merge(&self, root: &Path, branch: &str) -> Result<String, VcsError> {
-        // Untracked files do not block a fast-forward; modified or staged tracked files do.
-        let dirty = lines(&run(root, &["status", "--porcelain", "--untracked-files=no"])?);
+        // Untracked files do not block a fast-forward; modified or staged tracked files do,
+        // except the factory's own state files.
+        let dirty = blocking_dirty(root)?;
         if !dirty.is_empty() {
             return Err(VcsError::Dirty(dirty));
         }
@@ -155,7 +167,7 @@ impl Vcs for GitCli {
     }
 
     fn pull_ff(&self, dir: &Path, remote: &str, branch: &str) -> Result<String, VcsError> {
-        let dirty = lines(&run(dir, &["status", "--porcelain", "--untracked-files=no"])?);
+        let dirty = blocking_dirty(dir)?;
         if !dirty.is_empty() {
             return Err(VcsError::Dirty(dirty));
         }

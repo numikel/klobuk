@@ -185,6 +185,36 @@ fn ff_merge_fast_forwards_and_refuses_non_ff_or_dirty() {
     ));
 }
 
+/// The factory rewrites `.factory/issues.jsonl` (a committed file) on every status change; its
+/// own state must never block integrating a branch.
+#[test]
+fn ff_merge_ignores_modified_factory_state_but_not_other_files() {
+    let (_d, root) = repo();
+    let v = GitCli;
+    std::fs::create_dir_all(root.join(".factory")).unwrap();
+    commit_file(&root, ".factory/issues.jsonl", "{\"kind\":\"meta\"}\n", "export");
+    let wt = root.join(".worktrees").join("asf-7");
+    v.worktree_add(&root, &wt, "feat/asf-7", "main").unwrap();
+    commit_file(&wt, "f.txt", "f\n", "feature");
+    std::fs::write(root.join(".factory/issues.jsonl"), "{\"kind\":\"issue\"}\n").unwrap();
+    let head = v.ff_merge(&root, "feat/asf-7").unwrap();
+    assert_eq!(head, v.head(&wt).unwrap());
+    assert!(root.join("f.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join(".factory/issues.jsonl")).unwrap(),
+        "{\"kind\":\"issue\"}\n",
+        "the merge leaves the live export alone"
+    );
+
+    commit_file(&wt, "g.txt", "g\n", "more");
+    std::fs::write(root.join("a.txt"), "dirty\n").unwrap();
+    let e = v.ff_merge(&root, "feat/asf-7").unwrap_err();
+    match e {
+        VcsError::Dirty(files) => assert_eq!(files, vec![" M a.txt".to_string()], "{files:?}"),
+        other => panic!("{other}"),
+    }
+}
+
 #[test]
 fn ls_files_lists_tracked_with_forward_slashes() {
     let (_d, root) = repo();
