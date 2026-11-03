@@ -1,0 +1,61 @@
+# auto-software-factory configuration (committed). Unknown sections are ignored.
+# Dogfooding: asf builds asf. Local merges; workers on sonnet with a 5 USD cap per issue.
+
+[repo]
+prefix = "asf"
+default_branch = "main"
+worktrees_dir = ".worktrees"
+
+[scheduler]
+max_parallel = 2
+hotspots = ["Cargo.toml", "Cargo.lock", "crates/asf-core/src/ports.rs"]
+
+[store]
+auto_export = true
+export_comments = true
+
+[ui]
+language = "en"
+
+[methodology]
+name = "asf-default"
+
+[worker]
+runtime = "herdr"
+model = "sonnet"
+budget_usd = 5.0
+stall_minutes = 15
+max_wall_minutes = 90
+max_tool_calls = 400
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)", "Bash(asf *)", "Bash(cargo *)", "Bash(ls *)", "Bash(rtk *)", "Bash(dir *)", "Bash(cat *)", "Bash(gh *)"]
+deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)"]
+auto_trust = true
+pre_trust = false
+
+[[gate]]
+name = "fmt"
+cmd = ["cargo", "fmt", "--all", "--", "--check"]
+timeout_s = 120
+
+[[gate]]
+name = "clippy"
+cmd = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+timeout_s = 900
+
+[[gate]]
+name = "test"
+cmd = ["cargo", "test", "--workspace"]
+timeout_s = 1200
+
+[merge]
+target = "local"
+require_clean_main = true
+
+[review]
+required = false
+on_labels = []
+
+[planner]
+runner = "claude"
+model = "claude-haiku-5-5"
+budget_usd = 1.0
