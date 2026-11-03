@@ -31,6 +31,7 @@ max_tool_calls = 400
 # cargo limited to build/check/fmt/clippy/test, rtk only for the ls rewrite the user's hook applies.
 allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)", "Bash(asf *)", "Bash(cargo build *)", "Bash(cargo check *)", "Bash(cargo fmt *)", "Bash(cargo clippy *)", "Bash(cargo test *)", "Bash(ls *)", "Bash(rtk ls *)"]
 deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)", "Bash(git push *)", "Bash(git remote *)", "Bash(rtk proxy *)", "Bash(cargo install *)", "Bash(cargo run *)", "Bash(* .env*)", "Bash(*secrets*)"]
+permission_mode = "auto"  # no permission prompts: the classifier decides, deny rules still win
 auto_trust = true
 pre_trust = false
 

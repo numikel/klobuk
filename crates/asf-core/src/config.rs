@@ -92,6 +92,9 @@ pub struct WorkerCfg {
     pub max_tool_calls: u64,
     pub allowed_tools: Vec<String>,
     pub deny: Vec<String>,
+    /// Claude Code `--permission-mode` for workers: `auto` (classifier approves what the allowlist
+    /// does not; deny rules still win), `acceptEdits`, `dontAsk` or `bypassPermissions`.
+    pub permission_mode: String,
     pub nudges: u32,
     /// Answer Claude's "trust this folder" dialog for worktrees under the repo root.
     pub auto_trust: bool,
@@ -119,6 +122,7 @@ impl Default for WorkerCfg {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            permission_mode: "auto".into(),
             nudges: 1,
             auto_trust: true,
             pre_trust: false,
@@ -285,6 +289,7 @@ max_wall_minutes = 90
 max_tool_calls = 400
 allowed_tools = ["Read", "Edit", "Glob", "Grep", "Bash(git *)", "Bash(asf *)"]
 deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)"]
+permission_mode = "auto"  # auto | acceptEdits | dontAsk | bypassPermissions (deny rules always win)
 auto_trust = true         # answer Claude's trust dialog for worktrees of this repo
 pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json before launch
 
@@ -354,6 +359,15 @@ impl Config {
         }
         if self.worker.budget_usd < 0.0 {
             return Err(ConfigError::Invalid("worker.budget_usd must be >= 0".into()));
+        }
+        if !matches!(
+            self.worker.permission_mode.as_str(),
+            "auto" | "acceptEdits" | "dontAsk" | "bypassPermissions"
+        ) {
+            return Err(ConfigError::Invalid(format!(
+                "worker.permission_mode `{}` must be auto, acceptEdits, dontAsk or bypassPermissions",
+                self.worker.permission_mode
+            )));
         }
         for g in &self.gates {
             if g.name.trim().is_empty() || g.cmd.is_empty() {
@@ -481,6 +495,10 @@ mod tests {
             "PR merges keep worker commits intact"
         );
         assert_eq!(c.merge.github.runner, "gh");
+        assert_eq!(
+            c.worker.permission_mode, "auto",
+            "workers must not stop on permission prompts"
+        );
         assert!(c.merge.require_clean_main);
         assert!(!c.review.required);
     }
@@ -499,6 +517,17 @@ mod tests {
 
     #[test]
     fn worker_validation() {
+        assert!(matches!(
+            Config::from_toml("[worker]\npermission_mode = \"yolo\"\n").unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
+        assert_eq!(
+            Config::from_toml("[worker]\npermission_mode = \"acceptEdits\"\n")
+                .unwrap()
+                .worker
+                .permission_mode,
+            "acceptEdits"
+        );
         assert!(matches!(
             Config::from_toml("[worker]\nruntime = \"tmux\"\n").unwrap_err(),
             ConfigError::Invalid(_)

@@ -339,7 +339,7 @@ impl<'a> Worker<'a> {
         );
         let mut args = vec![
             "--permission-mode".to_string(),
-            "acceptEdits".to_string(),
+            self.ctx.config.worker.permission_mode.clone(),
             "--settings".to_string(),
             fwd(&settings_path),
             "--session-id".to_string(),

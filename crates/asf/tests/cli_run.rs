@@ -160,7 +160,7 @@ fn start_happy_path_creates_worktree_files_workspace_and_agent() {
         .collect();
     assert!(
         args.windows(2)
-            .any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits"),
+            .any(|w| w[0] == "--permission-mode" && w[1] == "auto"),
         "{args:?}"
     );
     assert!(
