@@ -354,7 +354,7 @@ fn gh_sync_is_refused_inside_a_worker_run() {
 }
 
 #[test]
-fn gh_sync_ignores_forged_markers_and_rejects_duplicate_mirrors() {
+fn gh_sync_ignores_forged_markers_and_reports_duplicate_mirrors() {
     let f = setup();
     // a remote issue claiming to mirror asf-1 with the wrong uid is not trusted
     gh(&f)
@@ -381,7 +381,8 @@ fn gh_sync_ignores_forged_markers_and_rejects_duplicate_mirrors() {
     );
     assert_eq!(f.repo.ok(&["gh", "sync"])["unchanged"], 2);
 
-    // two genuine mirrors of one issue: refuse rather than pick one
+    // a second issue with a valid marker (markers are public): the number recorded locally wins,
+    // the extra one is reported, and the run is not aborted
     let uid = store(&f)
         .get_issue(&f.issue.parse().unwrap())
         .unwrap()
@@ -394,7 +395,47 @@ fn gh_sync_ignores_forged_markers_and_rejects_duplicate_mirrors() {
             &format!("<!-- asf:{} uid:{uid} -->", f.issue),
         )
         .unwrap();
-    let (code, ecode, msg) = f.repo.err(&["gh", "sync"]);
-    assert_eq!((code, ecode.as_str()), (3, "conflict"), "{msg}");
-    assert!(msg.contains("#2") && msg.contains("#4"), "{msg}");
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["unchanged"], 2, "{res}");
+    assert_eq!(res["duplicates"][0]["id"], f.issue, "{res}");
+    assert_eq!(res["duplicates"][0]["used"], 2, "{res}");
+    assert_eq!(res["duplicates"][0]["ignored"], serde_json::json!([4]), "{res}");
+    // closing asf-1 closes the recorded mirror only
+    f.repo.ok(&["issue", "status", &f.issue, "cancelled"]);
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["closed"][0]["number"], 2, "{res}");
+    let remote = gh(&f).issue_list(f.repo.path()).unwrap();
+    assert_eq!(remote[1].state, "CLOSED");
+    assert_eq!(remote[3].state, "OPEN");
+
+    // without a recorded label the lowest number wins
+    let lowest = f.repo.create_issue("lowest", &[]);
+    let uid = store(&f)
+        .get_issue(&lowest.parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .uid;
+    for _ in 0..2 {
+        gh(&f)
+            .issue_create(f.repo.path(), "pre", &format!("<!-- asf:{lowest} uid:{uid} -->"))
+            .unwrap();
+    }
+    let res = f.repo.ok(&["gh", "sync"]);
+    let d = res["duplicates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == lowest)
+        .unwrap_or_else(|| panic!("{res}"));
+    assert_eq!(d["used"], 5, "{res}");
+    assert_eq!(d["ignored"], serde_json::json!([6]), "{res}");
+    let shown = f.repo.ok(&["issue", "show", &lowest]);
+    assert!(
+        shown["issue"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "gh:#5"),
+        "{shown}"
+    );
 }

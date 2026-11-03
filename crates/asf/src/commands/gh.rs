@@ -29,6 +29,15 @@ pub struct SyncReport {
     pub unchanged: usize,
     /// Local terminal issues that never reached GitHub (not created retroactively).
     pub skipped: Vec<IssueId>,
+    /// Extra GitHub issues carrying a valid marker for an issue that already has a mirror.
+    pub duplicates: Vec<Duplicate>,
+}
+
+#[derive(Serialize)]
+pub struct Duplicate {
+    pub id: IssueId,
+    pub used: u64,
+    pub ignored: Vec<u64>,
 }
 
 pub fn run(cli: &Cli, cmd: &GhCmd) -> Result<Rendered, AppError> {
@@ -77,9 +86,10 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
     let local = ctx.store.list_issues(&IssueFilter::default())?;
     // A remote issue mirrors a local one only when both id and uid of its marker match; anything
-    // else (a forged or stale marker) is ignored. Two genuine mirrors of one issue is an error.
-    let uids: BTreeMap<&str, &str> = local.iter().map(|i| (i.id.as_str(), i.uid.as_str())).collect();
-    let mut remote: BTreeMap<String, GhIssue> = BTreeMap::new();
+    // else (a forged or stale marker) is ignored. Markers are public, so several candidates can
+    // still claim one issue: the number recorded locally as `gh:#<n>` wins (the tool wrote it),
+    // then the lowest number; the rest is reported, never fatal.
+    let mut candidates: BTreeMap<&str, Vec<GhIssue>> = BTreeMap::new();
     for g in gh
         .issue_list(&ctx.root)
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?
@@ -87,16 +97,33 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
         let Some((id, uid)) = parse_marker(&g.body) else {
             continue;
         };
-        if uids.get(id.as_str()) != Some(&uid.as_str()) {
+        if let Some(i) = local.iter().find(|i| i.id.as_str() == id && i.uid == uid) {
+            candidates.entry(i.id.as_str()).or_default().push(g);
+        }
+    }
+    let mut remote: BTreeMap<&str, GhIssue> = BTreeMap::new();
+    let mut duplicates: Vec<Duplicate> = Vec::new();
+    for i in &local {
+        let Some(mut found) = candidates.remove(i.id.as_str()) else {
             continue;
+        };
+        found.sort_by_key(|g| g.number);
+        let recorded = i
+            .labels
+            .iter()
+            .find_map(|l| l.strip_prefix("gh:#").and_then(|n| n.parse::<u64>().ok()));
+        let pick = recorded
+            .and_then(|n| found.iter().position(|g| g.number == n))
+            .unwrap_or(0);
+        let chosen = found.remove(pick);
+        if !found.is_empty() {
+            duplicates.push(Duplicate {
+                id: i.id.clone(),
+                used: chosen.number,
+                ignored: found.iter().map(|g| g.number).collect(),
+            });
         }
-        if let Some(prev) = remote.insert(id.clone(), g) {
-            let dup = remote.get(&id).map(|g| g.number).unwrap_or_default();
-            return Err(AppError::conflict(format!(
-                "{id} is mirrored by two GitHub issues (#{} and #{dup}); close one by hand before syncing",
-                prev.number
-            )));
-        }
+        remote.insert(i.id.as_str(), chosen);
     }
 
     let mut report = SyncReport {
@@ -105,6 +132,7 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
         closed: Vec::new(),
         unchanged: 0,
         skipped: Vec::new(),
+        duplicates,
     };
     for i in &local {
         match remote.get(i.id.as_str()) {
@@ -173,6 +201,19 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
             .map(|m| format!("\nclosed  {} -> #{}", m.id, m.number))
             .collect::<String>(),
     );
+    let text = report.duplicates.iter().fold(text, |mut t, d| {
+        t.push_str(&format!(
+            "\nduplicate mirrors of {}: using #{}, ignoring {}",
+            d.id,
+            d.used,
+            d.ignored
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        t
+    });
     Rendered::new(&report, text)
 }
 
