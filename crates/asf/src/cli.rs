@@ -51,6 +51,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: PlanCmd,
     },
+    /// GitHub integration: mirror issues (`gh sync`).
+    Gh {
+        #[command(subcommand)]
+        cmd: GhCmd,
+    },
     /// Planning methodologies: shipped manifests and `.factory/methodologies/`.
     Method {
         #[command(subcommand)]
@@ -334,6 +339,17 @@ pub enum HookCmd {
     Stop,
     /// statusLine: record cost from Claude's estimate, enforce budget.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GhCmd {
+    /// Create a GitHub issue per local issue (marker in the body, label `gh:#n` locally) and
+    /// close the ones that are done or cancelled here. One way: GitHub never changes local state.
+    Sync {
+        /// Report what would change, call nothing that writes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -4,6 +4,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use asf_core::github::GitHub;
 use asf_core::*;
 use asf_store::SqliteStore;
 use asf_vcs::FakeGitHub;
@@ -258,4 +259,96 @@ fn github_target_syncs_main_from_the_remote_before_rebasing() {
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "merged", "{res}");
     assert!(f.repo.path().join("src/greet.rs").exists());
+}
+
+#[test]
+fn gh_sync_mirrors_issues_closes_done_ones_and_is_idempotent() {
+    let f = setup();
+    let second = f.repo.create_issue("second thing", &["--body", "details here"]);
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["dry_run"], false);
+    assert_eq!(res["created"].as_array().unwrap().len(), 2, "{res}");
+    assert_eq!(res["created"][0]["id"], f.issue);
+    assert_eq!(res["created"][0]["number"], 1);
+    assert!(res["created"][0]["url"].as_str().unwrap().ends_with("/issues/1"));
+    let remote = gh(&f).issue_list(f.repo.path()).unwrap();
+    assert_eq!(remote.len(), 2);
+    assert_eq!(remote[1].title, format!("[{second}] second thing"));
+    assert!(remote[1].body.contains("details here"), "{}", remote[1].body);
+    assert!(
+        remote[1].body.contains(&format!("<!-- asf:{second} uid:")),
+        "{}",
+        remote[1].body
+    );
+    let shown = f.repo.ok(&["issue", "show", &second]);
+    assert!(
+        shown["issue"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "gh:#2"),
+        "{shown}"
+    );
+
+    // idempotent
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["created"].as_array().unwrap().len(), 0, "{res}");
+    assert_eq!(res["unchanged"], 2, "{res}");
+    assert_eq!(gh(&f).issue_list(f.repo.path()).unwrap().len(), 2);
+
+    // local terminal → remote closed with a reason
+    f.repo.ok(&["issue", "status", &second, "cancelled"]);
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["closed"][0]["id"], second, "{res}");
+    assert_eq!(res["closed"][0]["number"], 2);
+    let remote = gh(&f).issue_list(f.repo.path()).unwrap();
+    assert_eq!(remote[1].state, "CLOSED");
+    let log = gh(&f).log();
+    let close = log.iter().find(|e| e.op == "issue_close").unwrap();
+    assert_eq!(close.args["reason"], "not planned");
+    // already closed: nothing more to do
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["closed"].as_array().unwrap().len(), 0, "{res}");
+    assert_eq!(res["unchanged"], 2, "{res}");
+
+    let human = f.repo.asf().args(["gh", "sync"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&human.stdout).contains("gh sync"));
+}
+
+#[test]
+fn gh_sync_dry_run_reports_without_touching_github_or_labels() {
+    let f = setup();
+    let res = f.repo.ok(&["gh", "sync", "--dry-run"]);
+    assert_eq!(res["dry_run"], true);
+    assert_eq!(res["created"][0]["id"], f.issue, "{res}");
+    assert!(
+        gh(&f).log().iter().all(|e| e.op == "issue_list"),
+        "{:?}",
+        gh(&f).log()
+    );
+    let shown = f.repo.ok(&["issue", "show", &f.issue]);
+    assert!(shown["issue"]["labels"].as_array().unwrap().is_empty(), "{shown}");
+}
+
+#[test]
+fn gh_sync_skips_terminal_issues_that_were_never_mirrored() {
+    let f = setup();
+    f.repo.ok(&["issue", "status", &f.issue, "cancelled"]);
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["skipped"], serde_json::json!([f.issue]), "{res}");
+    assert!(gh(&f).issue_list(f.repo.path()).unwrap().is_empty());
+}
+
+#[test]
+fn gh_sync_is_refused_inside_a_worker_run() {
+    let f = setup();
+    let out = f
+        .repo
+        .asf()
+        .env("ASF_RUN", "01RUN")
+        .args(["gh", "sync", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "forbidden", "{v}");
 }

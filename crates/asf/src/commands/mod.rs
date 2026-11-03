@@ -1,5 +1,6 @@
 pub mod doctor;
 pub mod export;
+pub mod gh;
 pub mod hook;
 pub mod issue;
 pub mod lane;
@@ -31,7 +32,8 @@ fn allowed_in_worker(cmd: &Cmd) -> bool {
                 | IssueCmd::Inbox { .. }
                 | IssueCmd::Handoff { .. }
         ),
-        Cmd::Plan { .. }
+        Cmd::Gh { .. }
+        | Cmd::Plan { .. }
         | Cmd::Run { .. }
         | Cmd::Merge { .. }
         | Cmd::Tui(_)
@@ -51,6 +53,7 @@ fn top_level_name(cmd: &Cmd) -> &'static str {
         Cmd::Run { .. } => "run",
         Cmd::Merge { .. } => "merge",
         Cmd::Hook { .. } => "hook",
+        Cmd::Gh { .. } => "gh",
         Cmd::Tui(_) => "tui",
         Cmd::Serve(_) => "serve",
         Cmd::Export(_) => "export",
@@ -76,6 +79,7 @@ pub fn dispatch(cli: &Cli) -> Result<Rendered, AppError> {
         Cmd::Run { cmd } => run::run(cli, cmd),
         Cmd::Merge { cmd } => merge::run(cli, cmd),
         Cmd::Hook { cmd } => hook::run(cli, cmd),
+        Cmd::Gh { cmd } => gh::run(cli, cmd),
         Cmd::Tui(a) => tui::run(cli, a),
         Cmd::Serve(a) => serve::run(cli, a),
         Cmd::Export(a) => export::export(cli, a),
