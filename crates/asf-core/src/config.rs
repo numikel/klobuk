@@ -157,7 +157,7 @@ pub struct GitHubCfg {
     pub remote: String,
     /// PR base branch; defaults to `[repo] default_branch`.
     pub base: Option<String>,
-    /// `rebase` | `squash` | `merge`.
+    /// `merge` (default: keeps worker commits, so worktrees stay cleanable) | `rebase` | `squash`.
     pub method: String,
     /// Keep the PR open until every check passed (`false`: merge as soon as it is mergeable).
     pub wait_checks: bool,
@@ -170,7 +170,7 @@ impl Default for GitHubCfg {
             runner: "gh".into(),
             remote: "origin".into(),
             base: None,
-            method: "rebase".into(),
+            method: "merge".into(),
             wait_checks: true,
             delete_branch: false,
         }
@@ -303,7 +303,7 @@ require_clean_main = true
 # [merge.github]           # used when target = "github"
 # remote = "origin"
 # base = "main"            # default: [repo] default_branch
-# method = "rebase"        # rebase | squash | merge
+# method = "merge"         # merge | rebase | squash (rebase/squash rewrite commits: `asf lane clean` then refuses)
 # wait_checks = true       # merge only after every check passed
 # delete_branch = false
 
@@ -476,6 +476,11 @@ mod tests {
         assert!(c.worker.model.is_none());
         assert!(c.gates.is_empty());
         assert_eq!(c.merge.target, "local");
+        assert_eq!(
+            c.merge.github.method, "merge",
+            "PR merges keep worker commits intact"
+        );
+        assert_eq!(c.merge.github.runner, "gh");
         assert!(c.merge.require_clean_main);
         assert!(!c.review.required);
     }

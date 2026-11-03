@@ -164,7 +164,7 @@ fn github_target_opens_a_pr_waits_for_checks_then_merges() {
     );
     let log = gh(&f).log();
     let merge = log.iter().find(|e| e.op == "pr_merge").expect("pr_merge called");
-    assert_eq!(merge.args["method"], "rebase");
+    assert_eq!(merge.args["method"], "merge", "default keeps worker commits");
     assert_eq!(merge.args["delete_branch"], false);
     assert!(store(&f).active_claims().unwrap().is_empty());
     // nothing left
