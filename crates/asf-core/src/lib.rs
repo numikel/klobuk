@@ -12,6 +12,7 @@
 pub mod brief;
 pub mod config;
 pub mod error;
+pub mod github;
 pub mod ids;
 pub mod jsonl;
 pub mod lane;

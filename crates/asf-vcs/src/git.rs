@@ -143,4 +143,23 @@ impl Vcs for GitCli {
             .map(|s| s.replace('\\', "/"))
             .collect())
     }
+
+    fn push(&self, dir: &Path, remote: &str, branch: &str, force_with_lease: bool) -> Result<(), VcsError> {
+        let mut args = vec!["push", "-u"];
+        if force_with_lease {
+            args.push("--force-with-lease");
+        }
+        args.push(remote);
+        args.push(branch);
+        run(dir, &args).map(|_| ())
+    }
+
+    fn pull_ff(&self, dir: &Path, remote: &str, branch: &str) -> Result<String, VcsError> {
+        let dirty = lines(&run(dir, &["status", "--porcelain", "--untracked-files=no"])?);
+        if !dirty.is_empty() {
+            return Err(VcsError::Dirty(dirty));
+        }
+        run(dir, &["pull", "--ff-only", remote, branch])?;
+        self.head(dir)
+    }
 }

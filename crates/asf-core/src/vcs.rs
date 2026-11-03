@@ -54,6 +54,10 @@ pub trait Vcs {
     /// Fast-forwards the current branch of `root` to `branch`; returns the new head.
     fn ff_merge(&self, root: &Path, branch: &str) -> Result<String, VcsError>;
     fn ls_files(&self, root: &Path) -> Result<Vec<String>, VcsError>;
+    /// `git push -u <remote> <branch>`; `force_with_lease` for rebased feature branches only.
+    fn push(&self, dir: &Path, remote: &str, branch: &str, force_with_lease: bool) -> Result<(), VcsError>;
+    /// `git pull --ff-only <remote> <branch>` on `dir` (its current branch); returns the new head.
+    fn pull_ff(&self, dir: &Path, remote: &str, branch: &str) -> Result<String, VcsError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
