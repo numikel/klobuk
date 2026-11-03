@@ -27,8 +27,10 @@ budget_usd = 5.0
 stall_minutes = 15
 max_wall_minutes = 90
 max_tool_calls = 400
-allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)", "Bash(asf *)", "Bash(cargo *)", "Bash(ls *)", "Bash(rtk *)", "Bash(dir *)", "Bash(cat *)", "Bash(gh *)"]
-deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)"]
+# Workers: no gh (merges and GitHub are the orchestrator's job), no cat/dir (Read/Glob cover it),
+# cargo limited to build/check/fmt/clippy/test, rtk only for the ls rewrite the user's hook applies.
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)", "Bash(asf *)", "Bash(cargo build *)", "Bash(cargo check *)", "Bash(cargo fmt *)", "Bash(cargo clippy *)", "Bash(cargo test *)", "Bash(ls *)", "Bash(rtk ls *)"]
+deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)", "Bash(git push *)", "Bash(git remote *)", "Bash(rtk proxy *)", "Bash(cargo install *)", "Bash(cargo run *)", "Bash(* .env*)", "Bash(*secrets*)"]
 auto_trust = true
 pre_trust = false
 
