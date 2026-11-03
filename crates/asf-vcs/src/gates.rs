@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use asf_core::{GateResult, GateSpec};
 
 const TAIL_LINES: usize = 40;
+/// `link.exe` cannot open a just-written test executable while the AV scanner holds it.
+const LINKER_LOCK_MARKER: &str = "LNK1104";
+const LINKER_LOCK_ATTEMPTS: u32 = 3;
+const LINKER_LOCK_PAUSE: Duration = Duration::from_secs(3);
 
 fn tail(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
@@ -110,11 +114,32 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
     }
 }
 
+/// Runs one gate, rerunning it (up to [`LINKER_LOCK_ATTEMPTS`] times in total) when the only
+/// evidence of failure is a Windows linker lock (`LNK1104`), which is the AV scanner, not the code.
+fn run_gate_with_retry(spec: &GateSpec, cwd: &Path) -> GateResult {
+    let mut r = run_gate(spec, cwd);
+    let mut attempt = 1;
+    while !r.ok && attempt < LINKER_LOCK_ATTEMPTS && r.tail.contains(LINKER_LOCK_MARKER) {
+        attempt += 1;
+        thread::sleep(LINKER_LOCK_PAUSE);
+        let previous = r.tail;
+        r = run_gate(spec, cwd);
+        r.tail = format!(
+            "{}\n[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); attempt {attempt}/{LINKER_LOCK_ATTEMPTS}:\n{}",
+            tail(&previous),
+            spec.name,
+            r.tail
+        );
+        r.tail = tail(&r.tail);
+    }
+    r
+}
+
 /// Runs gates in order and stops at the first failure. The returned vector holds every gate that ran.
 pub fn run_gates(specs: &[GateSpec], cwd: &Path) -> Vec<GateResult> {
     let mut results = Vec::new();
     for spec in specs {
-        let r = run_gate(spec, cwd);
+        let r = run_gate_with_retry(spec, cwd);
         let ok = r.ok;
         results.push(r);
         if !ok {

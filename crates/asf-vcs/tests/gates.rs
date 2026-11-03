@@ -87,3 +87,51 @@ fn shell_pwsh_runs_through_powershell() {
     assert!(results[0].ok, "{}", results[0].tail);
     assert!(results[0].tail.contains("hello-from-pwsh"));
 }
+
+/// Windows: the AV scanner holds a freshly linked test executable for a moment and `link.exe`
+/// reports LNK1104. That is not a code failure, so the gate is rerun a couple of times.
+#[test]
+fn retries_a_gate_that_failed_on_a_linker_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "import os, sys; e = os.path.exists('locked.once'); open('locked.once', 'w').close(); \
+print('tests ok' if e else 'LINK : fatal error LNK1104: cannot open file foo.exe'); sys.exit(0 if e else 101)";
+    let start = std::time::Instant::now();
+    let results = run_gates(&[spec("test", &py(code), 30)], dir.path());
+    assert!(results[0].ok, "{}", results[0].tail);
+    assert_eq!(results[0].exit_code, Some(0));
+    assert!(results[0].tail.contains("tests ok"), "{}", results[0].tail);
+    assert!(
+        results[0].tail.contains("LNK1104"),
+        "the retry is visible: {}",
+        results[0].tail
+    );
+    assert!(results[0].tail.contains("attempt 2"), "{}", results[0].tail);
+    assert!(start.elapsed().as_secs() >= 2, "waits before the rerun");
+}
+
+#[test]
+fn gives_up_on_a_permanent_linker_lock_after_three_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "import sys\n\
+with open('runs.log', 'a') as f: f.write('x')\n\
+print('LINK : fatal error LNK1104: cannot open file foo.exe'); sys.exit(101)";
+    let results = run_gates(&[spec("test", &py(code), 30)], dir.path());
+    assert!(!results[0].ok);
+    assert_eq!(results[0].exit_code, Some(101));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("runs.log")).unwrap(),
+        "xxx"
+    );
+    assert!(results[0].tail.contains("attempt 3"), "{}", results[0].tail);
+}
+
+#[test]
+fn ordinary_failures_are_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "import sys\n\
+with open('runs.log', 'a') as f: f.write('x')\n\
+print('assertion failed'); sys.exit(101)";
+    let results = run_gates(&[spec("test", &py(code), 30)], dir.path());
+    assert!(!results[0].ok);
+    assert_eq!(std::fs::read_to_string(dir.path().join("runs.log")).unwrap(), "x");
+}
