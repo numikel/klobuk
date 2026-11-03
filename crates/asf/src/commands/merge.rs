@@ -3,6 +3,7 @@
 //! Conflicts are never resolved automatically: the rebase is aborted, the item and the issue go
 //! `blocked`, and a BLOCKER comment names the files.
 
+use asf_core::github::{ChecksState, GitHub, Mergeable, PrState};
 use asf_core::*;
 use asf_vcs::{run_gates, GitCli};
 use serde::Serialize;
@@ -115,19 +116,25 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
     }
 }
 
-/// Processes queued items in FIFO order (`once` = at most one).
+/// Processes queued items in FIFO order (`once` = at most one), then, for the GitHub target,
+/// polls every open pull request; a poll that changes nothing is not reported.
 pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
     let mut items = Vec::new();
-    while let Some(next) = ctx
-        .store
-        .merge_queue()?
-        .into_iter()
-        .find(|m| m.state == MergeState::Queued)
-    {
-        let done = process(ctx, &next)?;
-        items.push(done);
+    let queue = ctx.store.merge_queue()?;
+    for next in queue.iter().filter(|m| m.state == MergeState::Queued) {
+        items.push(process(ctx, next)?);
         if once {
             break;
+        }
+    }
+    if ctx.config.merge.target == "github" && !(once && !items.is_empty()) {
+        for open in queue.iter().filter(|m| m.state == MergeState::PrOpen) {
+            if let Some(changed) = poll_pr(ctx, open)? {
+                items.push(changed);
+                if once {
+                    break;
+                }
+            }
         }
     }
     Ok(TickResult {
@@ -229,6 +236,21 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
             ..MergePatch::default()
         },
     )?;
+
+    // 0. GitHub: the local default branch must match the remote before rebasing onto it
+    if ctx.config.merge.target == "github" {
+        let gh_cfg = &ctx.config.merge.github;
+        let base = gh_cfg.base.clone().unwrap_or_else(|| default_branch.clone());
+        if let Err(e) = vcs.pull_ff(&ctx.root, &gh_cfg.remote, &base) {
+            return fail(
+                ctx,
+                item,
+                MergeState::Failed,
+                format!("cannot sync {default_branch} from {}/{base}: {e}", gh_cfg.remote),
+                None,
+            );
+        }
+    }
 
     // 1. rebase
     let main_head = vcs
@@ -356,7 +378,10 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
         },
     )?;
 
-    // 4. fast-forward
+    // 4. integrate: push + pull request, or a local fast-forward
+    if ctx.config.merge.target == "github" {
+        return open_pr(ctx, item, &run, &wt);
+    }
     set(
         ctx,
         item.id,
@@ -390,6 +415,17 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
             )
         }
     };
+    finalize_merged(ctx, item, &run, new_head)
+}
+
+/// `merged`: issue `done`, claim released, workspace closed, FYI to all, event.
+fn finalize_merged(
+    ctx: &Ctx,
+    item: &MergeItem,
+    run: &Option<Run>,
+    new_head: String,
+) -> Result<MergeItem, AppError> {
+    let default_branch = ctx.config.repo.default_branch.clone();
     let updated = set(
         ctx,
         item.id,
@@ -403,7 +439,7 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
     ctx.store
         .set_status(&item.issue_id, Status::Done, LANE_ORCHESTRATOR)?;
     let _ = ctx.store.release(&item.issue_id);
-    if let Some(r) = &run {
+    if let Some(r) = run {
         if let Some(ws) = &r.workspace_id {
             if let Ok(rt) = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root) {
                 let _ = rt.close_workspace(ws);
@@ -434,7 +470,226 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
         issue_id: Some(item.issue_id.clone()),
         run_id: item.run_id.clone(),
         actor: Some(LANE_ORCHESTRATOR.into()),
-        payload: serde_json::json!({ "head": new_head, "branch": item.branch }),
+        payload: serde_json::json!({ "head": new_head, "branch": item.branch, "pr_url": updated.pr_url }),
     })?;
     Ok(updated)
+}
+
+fn github(ctx: &Ctx) -> Result<(Box<dyn GitHub>, String, String), AppError> {
+    let cfg = &ctx.config.merge.github;
+    let gh = asf_vcs::github_from_config(&cfg.runner, &ctx.root)
+        .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
+    let base = cfg
+        .base
+        .clone()
+        .unwrap_or_else(|| ctx.config.repo.default_branch.clone());
+    Ok((gh, cfg.remote.clone(), base))
+}
+
+/// Pushes the rebased branch and makes sure an open PR exists; the item waits in `pr_open`.
+fn open_pr(
+    ctx: &Ctx,
+    item: &MergeItem,
+    run: &Option<Run>,
+    wt: &std::path::Path,
+) -> Result<MergeItem, AppError> {
+    let (gh, remote, base) = github(ctx)?;
+    if let Err(e) = GitCli.push(wt, &remote, &item.branch, true) {
+        return fail(
+            ctx,
+            item,
+            MergeState::Failed,
+            format!("push to {remote} failed: {e}"),
+            None,
+        );
+    }
+    let existing = match gh.pr_find(&ctx.root, &item.branch) {
+        Ok(pr) => pr,
+        Err(e) => return fail(ctx, item, MergeState::Failed, e.to_string(), None),
+    };
+    let pr = match existing {
+        Some(pr) if pr.state == PrState::Open => pr,
+        Some(pr) if pr.state == PrState::Merged => {
+            // merged on GitHub while we were not looking: just integrate
+            let queued = set(
+                ctx,
+                item.id,
+                MergePatch {
+                    state: Some(MergeState::PrOpen),
+                    pr_url: Some(pr.url.clone()),
+                    ..MergePatch::default()
+                },
+            )?;
+            return integrate_remote(ctx, &queued, &remote, &base);
+        }
+        _ => {
+            let issue = ctx.store.get_issue(&item.issue_id)?;
+            let title = match &issue {
+                Some(i) => format!("{}: {}", item.issue_id, i.title),
+                None => item.issue_id.to_string(),
+            };
+            let body = format!(
+                "{}\n\n---\nasf issue `{}`{}",
+                issue.as_ref().map(|i| i.body.clone()).unwrap_or_default(),
+                item.issue_id,
+                run.as_ref()
+                    .map(|r| format!(" · run `{}`", r.id))
+                    .unwrap_or_default()
+            );
+            match gh.pr_create(&ctx.root, &base, &item.branch, &title, &body) {
+                Ok(pr) => {
+                    comment(
+                        ctx,
+                        &item.issue_id,
+                        CommentType::Fyi,
+                        LANE_ALL,
+                        format!("pull request opened for {}: {}", item.branch, pr.url),
+                    )?;
+                    ctx.store.append_event(&NewEvent {
+                        kind: "merge.pr_opened".into(),
+                        issue_id: Some(item.issue_id.clone()),
+                        run_id: item.run_id.clone(),
+                        actor: Some(LANE_ORCHESTRATOR.into()),
+                        payload: serde_json::json!({ "pr_url": pr.url, "number": pr.number }),
+                    })?;
+                    pr
+                }
+                Err(e) => {
+                    return fail(
+                        ctx,
+                        item,
+                        MergeState::Failed,
+                        format!("cannot open pull request: {e}"),
+                        None,
+                    )
+                }
+            }
+        }
+    };
+    set(
+        ctx,
+        item.id,
+        MergePatch {
+            state: Some(MergeState::PrOpen),
+            pr_url: Some(pr.url),
+            last_error: Some(None),
+            ..MergePatch::default()
+        },
+    )
+}
+
+/// One look at an open PR. `None` when nothing changed (checks still running).
+fn poll_pr(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
+    let (gh, remote, base) = github(ctx)?;
+    let cfg = &ctx.config.merge.github;
+    let pr = match gh.pr_find(&ctx.root, &item.branch) {
+        Ok(Some(pr)) => pr,
+        Ok(None) => {
+            return fail(
+                ctx,
+                item,
+                MergeState::Failed,
+                format!("no pull request for {} on GitHub any more", item.branch),
+                None,
+            )
+            .map(Some)
+        }
+        Err(e) => return fail(ctx, item, MergeState::Failed, e.to_string(), None).map(Some),
+    };
+    let url = pr.url.clone();
+    match pr.state {
+        PrState::Merged => integrate_remote(ctx, item, &remote, &base).map(Some),
+        PrState::Closed => {
+            let msg = format!("pull request {url} was closed on GitHub without merging");
+            let updated = fail(ctx, item, MergeState::Failed, msg.clone(), None)?;
+            comment(
+                ctx,
+                &item.issue_id,
+                CommentType::Blocker,
+                LANE_HUMAN,
+                format!(
+                    "{msg}\n\n`asf merge retry {}` pushes again and opens a new one.",
+                    item.issue_id
+                ),
+            )?;
+            Ok(Some(updated))
+        }
+        PrState::Open => {
+            if pr.mergeable == Mergeable::Conflicting {
+                let msg = format!("pull request {url} conflicts with {base}");
+                let updated = fail(ctx, item, MergeState::Blocked, msg.clone(), None)?;
+                let _ = ctx
+                    .store
+                    .set_status(&item.issue_id, Status::Blocked, LANE_ORCHESTRATOR);
+                comment(
+                    ctx,
+                    &item.issue_id,
+                    CommentType::Blocker,
+                    LANE_HUMAN,
+                    format!(
+                        "{msg}\n\nRebase the worktree onto {base} and resolve by hand, then `asf merge retry {}`.",
+                        item.issue_id
+                    ),
+                )?;
+                return Ok(Some(updated));
+            }
+            match pr.checks {
+                ChecksState::Failed => {
+                    let msg = format!("checks failed on pull request {url}");
+                    let updated = fail(ctx, item, MergeState::Failed, msg.clone(), None)?;
+                    comment(
+                        ctx,
+                        &item.issue_id,
+                        CommentType::Blocker,
+                        LANE_HUMAN,
+                        format!(
+                            "{msg}\n\nFix the branch, then `asf merge retry {}`.",
+                            item.issue_id
+                        ),
+                    )?;
+                    Ok(Some(updated))
+                }
+                ChecksState::Pending if cfg.wait_checks => Ok(None),
+                _ => {
+                    if let Err(e) = gh.pr_merge(&ctx.root, pr.number, &cfg.method, cfg.delete_branch) {
+                        return fail(
+                            ctx,
+                            item,
+                            MergeState::Failed,
+                            format!("merge of {url} failed: {e}"),
+                            None,
+                        )
+                        .map(Some);
+                    }
+                    integrate_remote(ctx, item, &remote, &base).map(Some)
+                }
+            }
+        }
+    }
+}
+
+/// After GitHub merged the PR: fast-forward the local default branch from the remote and close out.
+fn integrate_remote(ctx: &Ctx, item: &MergeItem, remote: &str, base: &str) -> Result<MergeItem, AppError> {
+    set(
+        ctx,
+        item.id,
+        MergePatch {
+            state: Some(MergeState::Merging),
+            ..MergePatch::default()
+        },
+    )?;
+    let run = match &item.run_id {
+        Some(r) => ctx.store.get_run(r)?,
+        None => None,
+    };
+    match GitCli.pull_ff(&ctx.root, remote, base) {
+        Ok(head) => finalize_merged(ctx, item, &run, head),
+        Err(e) => fail(
+            ctx,
+            item,
+            MergeState::Failed,
+            format!("pull request merged, but `git pull --ff-only {remote} {base}` failed: {e}"),
+            None,
+        ),
+    }
 }

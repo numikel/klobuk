@@ -151,10 +151,39 @@ impl Default for GateCfg {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct GitHubCfg {
+    /// `gh` (the GitHub CLI) or `fake` (tests).
+    pub runner: String,
+    pub remote: String,
+    /// PR base branch; defaults to `[repo] default_branch`.
+    pub base: Option<String>,
+    /// `rebase` | `squash` | `merge`.
+    pub method: String,
+    /// Keep the PR open until every check passed (`false`: merge as soon as it is mergeable).
+    pub wait_checks: bool,
+    pub delete_branch: bool,
+}
+
+impl Default for GitHubCfg {
+    fn default() -> Self {
+        GitHubCfg {
+            runner: "gh".into(),
+            remote: "origin".into(),
+            base: None,
+            method: "rebase".into(),
+            wait_checks: true,
+            delete_branch: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MergeCfg {
-    /// `local` (rebase + ff) or `github` (PR via gh, M6).
+    /// `local` (rebase + ff) or `github` (push + PR via gh).
     pub target: String,
     pub require_clean_main: bool,
+    pub github: GitHubCfg,
 }
 
 impl Default for MergeCfg {
@@ -162,6 +191,7 @@ impl Default for MergeCfg {
         MergeCfg {
             target: "local".into(),
             require_clean_main: true,
+            github: GitHubCfg::default(),
         }
     }
 }
@@ -268,8 +298,14 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 # timeout_s = 900
 
 [merge]
-target = "local"          # local (rebase + fast-forward) | github (PR via gh)
+target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
 require_clean_main = true
+# [merge.github]           # used when target = "github"
+# remote = "origin"
+# base = "main"            # default: [repo] default_branch
+# method = "rebase"        # rebase | squash | merge
+# wait_checks = true       # merge only after every check passed
+# delete_branch = false
 
 [review]
 required = false
@@ -331,6 +367,18 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "planner.runner `{}` must be claude or fake",
                 self.planner.runner
+            )));
+        }
+        if !matches!(self.merge.github.runner.as_str(), "gh" | "fake") {
+            return Err(ConfigError::Invalid(format!(
+                "merge.github.runner `{}` must be gh or fake",
+                self.merge.github.runner
+            )));
+        }
+        if !matches!(self.merge.github.method.as_str(), "rebase" | "squash" | "merge") {
+            return Err(ConfigError::Invalid(format!(
+                "merge.github.method `{}` must be rebase, squash or merge",
+                self.merge.github.method
             )));
         }
         if !matches!(self.merge.target.as_str(), "local" | "github") {

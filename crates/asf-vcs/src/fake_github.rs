@@ -4,7 +4,7 @@
 //! (`git push <remote> <head>:<base>` from `dir`), so a following `pull_ff` observes the merge
 //! exactly as it would after GitHub merged the PR. A `script` seeds what `pr_find` reports:
 //! `{"checks": "none|pending|passed|failed", "mergeable": "mergeable|conflicting|unknown",
-//! "remote": "origin"}`.
+//! "remote": "origin", "close_pr": <number>}` (`close_pr` simulates a human closing the PR).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -109,6 +109,11 @@ impl FakeGitHub {
         }
         if let Some(r) = v.get("remote").and_then(Value::as_str) {
             st.script.remote = r.to_string();
+        }
+        if let Some(n) = v.get("close_pr").and_then(Value::as_u64) {
+            if let Some(pr) = st.prs.iter_mut().find(|p| p.number == n) {
+                pr.state = PrState::Closed;
+            }
         }
         self.save(&st)
     }
