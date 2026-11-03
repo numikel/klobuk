@@ -114,23 +114,57 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
     }
 }
 
+/// Files `link.exe` could not open, taken from the quoted path on each `LNK1104` line.
+fn locked_files(output: &str) -> Vec<std::path::PathBuf> {
+    output
+        .lines()
+        .filter(|l| l.contains(LINKER_LOCK_MARKER))
+        .filter_map(|l| {
+            let start = l.find('"')? + 1;
+            let end = l[start..].find('"')? + start;
+            Some(std::path::PathBuf::from(&l[start..end]))
+        })
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))
+        .collect()
+}
+
+/// Moves a locked executable to `<name>.locked.old` so the linker can write a fresh file; the
+/// scanner lets go of the old one eventually. Returns the files actually moved.
+fn move_locked_aside(output: &str) -> Vec<String> {
+    let mut moved = Vec::new();
+    for p in locked_files(output) {
+        let mut aside = p.clone().into_os_string();
+        aside.push(".locked.old");
+        let _ = std::fs::remove_file(&aside);
+        if std::fs::rename(&p, &aside).is_ok() {
+            moved.push(p.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    moved
+}
+
 /// Runs one gate, rerunning it (up to [`LINKER_LOCK_ATTEMPTS`] times in total) when the only
-/// evidence of failure is a Windows linker lock (`LNK1104`), which is the AV scanner, not the code.
+/// evidence of failure is a Windows linker lock (`LNK1104`), which is the AV scanner holding a
+/// freshly written test executable, not the code. The locked file is moved aside before each rerun.
 fn run_gate_with_retry(spec: &GateSpec, cwd: &Path) -> GateResult {
+    let started = Instant::now();
     let mut r = run_gate(spec, cwd);
     let mut attempt = 1;
+    let mut notes: Vec<String> = Vec::new();
     while !r.ok && attempt < LINKER_LOCK_ATTEMPTS && r.tail.contains(LINKER_LOCK_MARKER) {
+        let moved = move_locked_aside(&r.tail);
         attempt += 1;
-        thread::sleep(LINKER_LOCK_PAUSE);
-        let previous = r.tail;
-        r = run_gate(spec, cwd);
-        r.tail = format!(
-            "{}\n[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); attempt {attempt}/{LINKER_LOCK_ATTEMPTS}:\n{}",
-            tail(&previous),
+        notes.push(format!(
+            "[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); moved aside [{}]; rerun attempt {attempt}/{LINKER_LOCK_ATTEMPTS}",
             spec.name,
-            r.tail
-        );
-        r.tail = tail(&r.tail);
+            moved.join(", ")
+        ));
+        thread::sleep(LINKER_LOCK_PAUSE);
+        r = run_gate(spec, cwd);
+    }
+    if !notes.is_empty() {
+        r.tail = tail(&format!("{}\n{}", r.tail, notes.join("\n")));
+        r.duration_ms = started.elapsed().as_millis() as u64;
     }
     r
 }

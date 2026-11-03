@@ -135,3 +135,37 @@ print('assertion failed'); sys.exit(101)";
     assert!(!results[0].ok);
     assert_eq!(std::fs::read_to_string(dir.path().join("runs.log")).unwrap(), "x");
 }
+
+/// Rerunning alone is not enough: cargo links to the same file name and the scanner keeps holding
+/// it. The locked file named in the message is moved aside first, so the linker writes a fresh one.
+#[test]
+fn moves_the_locked_executable_aside_before_rerunning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("deps")).unwrap();
+    let locked = dir.path().join("deps").join("cli_tui-b05e1b3ffcdc1251.exe");
+    std::fs::write(&locked, "old").unwrap();
+    // fails with LNK1104 naming the file while it exists; passes once it is gone
+    let code = format!(
+        "import os, sys; p = {:?}; e = os.path.exists(p); \
+print('tests ok' if not e else 'LINK : fatal error LNK1104: cannot open file \"' + p + '\"'); \
+sys.exit(0 if not e else 101)",
+        locked.to_string_lossy().replace('\\', "/")
+    );
+    let results = run_gates(&[spec("test", &py(&code), 30)], dir.path());
+    assert!(results[0].ok, "{}", results[0].tail);
+    assert!(!locked.exists(), "locked file moved aside");
+    assert!(
+        dir.path()
+            .join("deps")
+            .join("cli_tui-b05e1b3ffcdc1251.exe.locked.old")
+            .exists(),
+        "moved to *.locked.old"
+    );
+    assert!(results[0].tail.contains("moved aside"), "{}", results[0].tail);
+    assert!(results[0].tail.contains("attempt 2"), "{}", results[0].tail);
+    assert!(
+        results[0].duration_ms >= 3000,
+        "duration covers every attempt: {}",
+        results[0].duration_ms
+    );
+}
