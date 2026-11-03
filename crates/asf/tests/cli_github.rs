@@ -111,7 +111,7 @@ fn finished_run(f: &F, files: &[(&str, &str)]) {
 }
 
 fn blockers(f: &F) -> Vec<String> {
-    store(&f)
+    store(f)
         .comments(&f.issue.parse().unwrap())
         .unwrap()
         .into_iter()

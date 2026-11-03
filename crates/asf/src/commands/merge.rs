@@ -127,7 +127,7 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
             break;
         }
     }
-    if ctx.config.merge.target == "github" && !(once && !items.is_empty()) {
+    if ctx.config.merge.target == "github" && (!once || items.is_empty()) {
         for open in queue.iter().filter(|m| m.state == MergeState::PrOpen) {
             if let Some(changed) = poll_pr(ctx, open)? {
                 items.push(changed);
