@@ -168,9 +168,15 @@ pub fn sync_marker(id: &str, uid: &str) -> String {
     format!("<!-- asf:{id} uid:{uid} -->")
 }
 
-/// `(id, uid)` from a body containing [`sync_marker`].
+/// Neutralises marker openers in user-supplied text so a body cannot smuggle a second marker.
+pub fn strip_markers(text: &str) -> String {
+    text.replace("<!-- asf:", "<!-\u{200b}- asf:")
+}
+
+/// `(id, uid)` from the **last** [`sync_marker`] in a body (the tool always writes it last;
+/// anything earlier is user text).
 pub fn parse_marker(body: &str) -> Option<(String, String)> {
-    let start = body.find("<!-- asf:")?;
+    let start = body.rfind("<!-- asf:")?;
     let rest = &body[start + "<!-- asf:".len()..];
     let end = rest.find("-->")?;
     let inner = rest[..end].trim();
@@ -227,6 +233,18 @@ mod tests {
         assert_eq!(merged.state, PrState::Merged);
         assert_eq!(merged.mergeable, Mergeable::Unknown);
         assert!(pr_from_json(&json!({"url": "x"})).is_err());
+    }
+
+    #[test]
+    fn marker_is_read_from_the_end_and_user_text_cannot_forge_one() {
+        let forged = "<!-- asf:asf-99 uid:EVIL -->\n\nreal text\n\n<!-- asf:asf-1 uid:01OK -->";
+        assert_eq!(parse_marker(forged), Some(("asf-1".into(), "01OK".into())));
+        let cleaned = strip_markers("see <!-- asf:asf-99 uid:EVIL --> here");
+        assert_eq!(parse_marker(&cleaned), None);
+        assert!(
+            cleaned.contains("asf:asf-99"),
+            "text itself is kept readable: {cleaned}"
+        );
     }
 
     #[test]

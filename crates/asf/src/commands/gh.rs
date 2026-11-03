@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use asf_core::github::{parse_marker, sync_marker, GhIssue};
+use asf_core::github::{parse_marker, strip_markers, sync_marker, GhIssue};
 use asf_core::*;
 use serde::Serialize;
 
@@ -44,18 +44,21 @@ fn gh_label(number: u64) -> String {
 fn issue_body(i: &Issue) -> String {
     let mut b = String::new();
     if !i.body.trim().is_empty() {
-        b.push_str(i.body.trim_end());
+        b.push_str(&strip_markers(i.body.trim_end()));
         b.push_str("\n\n");
     }
     if !i.acceptance.is_empty() {
         b.push_str("### Acceptance\n");
         for a in &i.acceptance {
-            b.push_str(&format!("- [ ] {}\n", a.text));
+            b.push_str(&format!("- [ ] {}\n", strip_markers(&a.text)));
         }
         b.push('\n');
     }
     if !i.file_scope.is_empty() {
-        b.push_str(&format!("**Scope:** `{}`\n\n", i.file_scope.join("`, `")));
+        b.push_str(&format!(
+            "**Scope:** `{}`\n\n",
+            strip_markers(&i.file_scope.join("`, `"))
+        ));
     }
     b.push_str(&format!(
         "_{} · {} · priority P{}_\n\n{}",
@@ -72,13 +75,29 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
     let cfg = &ctx.config.merge.github;
     let gh = asf_vcs::github_from_config(&cfg.runner, &ctx.root)
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
-    let remote: BTreeMap<String, GhIssue> = gh
+    let local = ctx.store.list_issues(&IssueFilter::default())?;
+    // A remote issue mirrors a local one only when both id and uid of its marker match; anything
+    // else (a forged or stale marker) is ignored. Two genuine mirrors of one issue is an error.
+    let uids: BTreeMap<&str, &str> = local.iter().map(|i| (i.id.as_str(), i.uid.as_str())).collect();
+    let mut remote: BTreeMap<String, GhIssue> = BTreeMap::new();
+    for g in gh
         .issue_list(&ctx.root)
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?
-        .into_iter()
-        .filter_map(|g| parse_marker(&g.body).map(|(id, _)| (id, g)))
-        .collect();
-    let local = ctx.store.list_issues(&IssueFilter::default())?;
+    {
+        let Some((id, uid)) = parse_marker(&g.body) else {
+            continue;
+        };
+        if uids.get(id.as_str()) != Some(&uid.as_str()) {
+            continue;
+        }
+        if let Some(prev) = remote.insert(id.clone(), g) {
+            let dup = remote.get(&id).map(|g| g.number).unwrap_or_default();
+            return Err(AppError::conflict(format!(
+                "{id} is mirrored by two GitHub issues (#{} and #{dup}); close one by hand before syncing",
+                prev.number
+            )));
+        }
+    }
 
     let mut report = SyncReport {
         dry_run,

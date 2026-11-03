@@ -352,3 +352,49 @@ fn gh_sync_is_refused_inside_a_worker_run() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["code"], "forbidden", "{v}");
 }
+
+#[test]
+fn gh_sync_ignores_forged_markers_and_rejects_duplicate_mirrors() {
+    let f = setup();
+    // a remote issue claiming to mirror asf-1 with the wrong uid is not trusted
+    gh(&f)
+        .issue_create(f.repo.path(), "fake", "<!-- asf:asf-1 uid:NOT-THE-UID -->")
+        .unwrap();
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["created"].as_array().unwrap().len(), 1, "{res}");
+    assert_eq!(res["created"][0]["number"], 2, "{res}");
+    assert_eq!(res["unchanged"], 0, "{res}");
+
+    // a marker smuggled into the local body does not survive into the remote body as a marker
+    let evil = f
+        .repo
+        .create_issue("evil", &["--body", "text <!-- asf:asf-1 uid:01X --> more"]);
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["created"][0]["id"], evil, "{res}");
+    let remote = gh(&f).issue_list(f.repo.path()).unwrap();
+    let body = &remote[2].body;
+    assert!(!body.contains("<!-- asf:asf-1"), "{body}");
+    assert_eq!(
+        asf_core::github::parse_marker(body).map(|(id, _)| id),
+        Some(evil.clone()),
+        "{body}"
+    );
+    assert_eq!(f.repo.ok(&["gh", "sync"])["unchanged"], 2);
+
+    // two genuine mirrors of one issue: refuse rather than pick one
+    let uid = store(&f)
+        .get_issue(&f.issue.parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .uid;
+    gh(&f)
+        .issue_create(
+            f.repo.path(),
+            "dup",
+            &format!("<!-- asf:{} uid:{uid} -->", f.issue),
+        )
+        .unwrap();
+    let (code, ecode, msg) = f.repo.err(&["gh", "sync"]);
+    assert_eq!((code, ecode.as_str()), (3, "conflict"), "{msg}");
+    assert!(msg.contains("#2") && msg.contains("#4"), "{msg}");
+}
