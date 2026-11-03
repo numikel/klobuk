@@ -158,6 +158,7 @@ fn update_merge_patch_and_gate_results_roundtrip() {
         exit_code: Some(0),
         duration_ms: 5,
         tail: String::new(),
+        attempts: 1,
     }];
     let u = s
         .update_merge(

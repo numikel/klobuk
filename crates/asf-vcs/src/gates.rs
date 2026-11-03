@@ -50,6 +50,7 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
         exit_code: None,
         duration_ms: started.elapsed().as_millis() as u64,
         tail,
+        attempts: 1,
     };
     let Some(mut cmd) = build(spec) else {
         return fail("gate has an empty cmd".into());
@@ -111,6 +112,7 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
         exit_code,
         duration_ms: started.elapsed().as_millis() as u64,
         tail: tail(&combined),
+        attempts: 1,
     }
 }
 

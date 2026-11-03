@@ -76,11 +76,21 @@ pub struct GateResult {
     pub duration_ms: u64,
     /// Last lines of combined stdout/stderr.
     pub tail: String,
+    /// How many times the gate was run; 0 = not run / unknown (legacy records).
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_result_without_attempts_deserialises_to_zero() {
+        let json = r#"{"name":"fmt","ok":true,"exit_code":0,"duration_ms":5,"tail":""}"#;
+        let g: GateResult = serde_json::from_str(json).unwrap();
+        assert_eq!(g.attempts, 0);
+    }
 
     #[test]
     fn vcs_error_display_and_code() {

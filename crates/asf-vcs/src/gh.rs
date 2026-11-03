@@ -126,6 +126,7 @@ impl GitHub for GhCli {
             state: "OPEN".into(),
             url,
             body: body.to_string(),
+            author: String::new(),
         })
     }
 

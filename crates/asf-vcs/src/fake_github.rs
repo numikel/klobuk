@@ -234,6 +234,7 @@ impl GitHub for FakeGitHub {
                 state: "OPEN".into(),
                 url: format!("https://github.example/fake/repo/issues/{number}"),
                 body: body.into(),
+                author: String::new(),
             };
             st.issues.push(issue.clone());
             Ok(issue)

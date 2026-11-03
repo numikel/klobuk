@@ -208,6 +208,7 @@ mod tests {
             exit_code: Some(1),
             duration_ms: 12,
             tail: "x".into(),
+            attempts: 1,
         };
         let s = serde_json::to_string(&g).unwrap();
         assert!(s.contains("\"name\":\"fmt\"") && s.contains("\"ok\":false"));

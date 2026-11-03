@@ -65,6 +65,9 @@ pub struct GhIssue {
     pub url: String,
     #[serde(default)]
     pub body: String,
+    /// Login of the issue author; empty when unknown (never equals `whoami`, so it counts as foreign).
+    #[serde(default)]
+    pub author: String,
 }
 
 /// GitHub operations the factory needs. `dir` is any checkout of the repository (gh resolves
@@ -190,6 +193,14 @@ pub fn parse_marker(body: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn gh_issue_without_author_deserialises_to_empty() {
+        let v = json!({"number": 7, "title": "t", "state": "OPEN", "url": "u"});
+        let i: GhIssue = serde_json::from_value(v).unwrap();
+        assert_eq!(i.author, "");
+        assert_eq!(i.body, "");
+    }
 
     #[test]
     fn rollup_reduces_check_runs_and_status_contexts() {
