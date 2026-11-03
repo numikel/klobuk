@@ -17,6 +17,7 @@
 /.factory/factory.db-wal
 /.factory/factory.db-shm
 /.factory/runs/
+/.factory/plan/
 /.worktrees/
 
 # --- Claude Code local config ---
