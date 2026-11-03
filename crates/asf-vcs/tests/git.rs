@@ -104,6 +104,82 @@ fn worktree_remove_refuses_dirty_and_unmerged_then_succeeds() {
     );
 }
 
+/// Simulates a rebase-merge: the lane's commits land on `main` under new SHAs (same patches).
+fn rebase_merge_into_main(root: &Path, branch: &str, count: usize) {
+    let range = format!("{branch}~{count}..{branch}");
+    git(root, &["cherry-pick", &range]);
+}
+
+#[test]
+fn worktree_remove_accepts_a_rebase_merged_branch() {
+    let (_d, root) = repo();
+    let v = GitCli;
+    let wt = root.join(".worktrees").join("asf-10");
+    v.worktree_add(&root, &wt, "feat/asf-10", "main").unwrap();
+    commit_file(&wt, "c.txt", "c\n", "c");
+    commit_file(&wt, "d.txt", "d\n", "d");
+    // main moves on, then the lane is rebase-merged: same patches, different SHAs
+    commit_file(&root, "b.txt", "b2\n", "main moves");
+    rebase_merge_into_main(&root, "feat/asf-10", 2);
+    let not_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "feat/asf-10", "HEAD"])
+        .current_dir(&root)
+        .status()
+        .unwrap();
+    assert!(
+        !not_ancestor.success(),
+        "precondition: SHAs differ, so the ancestor check fails"
+    );
+    v.worktree_remove(&root, &wt).unwrap();
+    assert!(!wt.exists());
+    assert!(
+        git(&root, &["branch", "--list", "feat/asf-10"]).contains("feat/asf-10"),
+        "branch kept"
+    );
+}
+
+#[test]
+fn worktree_remove_refuses_a_branch_with_unique_commits_after_partial_rebase_merge() {
+    let (_d, root) = repo();
+    let v = GitCli;
+    let wt = root.join(".worktrees").join("asf-11");
+    v.worktree_add(&root, &wt, "feat/asf-11", "main").unwrap();
+    commit_file(&wt, "c.txt", "c\n", "c");
+    commit_file(&wt, "d.txt", "d\n", "d (never merged)");
+    commit_file(&root, "b.txt", "b2\n", "main moves");
+    // only the first lane commit reaches main
+    git(&root, &["cherry-pick", "feat/asf-11~1"]);
+    let e = v.worktree_remove(&root, &wt).unwrap_err();
+    assert!(
+        matches!(e, VcsError::Unmerged(ref b) if b == "feat/asf-11"),
+        "{e}"
+    );
+    assert!(wt.exists(), "refused removal leaves the worktree");
+}
+
+#[test]
+fn worktree_remove_refuses_a_branch_that_diverged_with_no_equivalent_commits() {
+    let (_d, root) = repo();
+    let v = GitCli;
+    let wt = root.join(".worktrees").join("asf-12");
+    v.worktree_add(&root, &wt, "feat/asf-12", "main").unwrap();
+    commit_file(&wt, "c.txt", "c\n", "c");
+    commit_file(&root, "b.txt", "b2\n", "main moves");
+    let e = v.worktree_remove(&root, &wt).unwrap_err();
+    assert!(matches!(e, VcsError::Unmerged(_)), "{e}");
+}
+
+#[test]
+fn worktree_remove_keeps_removing_a_fresh_lane_via_the_ancestor_path() {
+    // worker.rs rolls back a freshly created lane with worktree_remove; that must keep working.
+    let (_d, root) = repo();
+    let v = GitCli;
+    let wt = root.join(".worktrees").join("asf-13");
+    v.worktree_add(&root, &wt, "feat/asf-13", "main").unwrap();
+    v.worktree_remove(&root, &wt).unwrap();
+    assert!(!wt.exists());
+}
+
 #[test]
 fn status_and_changed_files() {
     let (_d, root) = repo();

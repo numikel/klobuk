@@ -59,6 +59,18 @@ fn path_str(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
+/// True when every commit of `branch` already has a patch-equivalent commit in `HEAD` (a rebase-merge or
+/// cherry-pick rewrote the SHAs). `git cherry` marks unique commits with `+`; the `rev-list` guard keeps a branch
+/// with nothing ahead of `HEAD` from being reported as merged by this path (an empty `git cherry` proves nothing).
+fn merged_by_patch(root: &Path, branch: &str) -> Result<bool, VcsError> {
+    let cherry = run(root, &["cherry", "HEAD", branch])?;
+    if cherry.lines().any(|l| l.starts_with('+')) {
+        return Ok(false);
+    }
+    let ahead = run(root, &["rev-list", "--count", &format!("HEAD..{branch}")])?;
+    Ok(ahead.trim().parse::<u64>().map(|n| n > 0).unwrap_or(false))
+}
+
 impl Vcs for GitCli {
     fn head(&self, dir: &Path) -> Result<String, VcsError> {
         run(dir, &["rev-parse", "HEAD"])
@@ -105,7 +117,9 @@ impl Vcs for GitCli {
             return Err(VcsError::Dirty(dirty));
         }
         let branch = self.current_branch(path)?;
-        if run(root, &["merge-base", "--is-ancestor", &branch, "HEAD"]).is_err() {
+        if run(root, &["merge-base", "--is-ancestor", &branch, "HEAD"]).is_err()
+            && !merged_by_patch(root, &branch)?
+        {
             return Err(VcsError::Unmerged(branch));
         }
         run(root, &["worktree", "remove", &path_str(path)])?;
@@ -173,5 +187,45 @@ impl Vcs for GitCli {
         }
         run(dir, &["pull", "--ff-only", remote, branch])?;
         self.head(dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        run(cwd, args).unwrap();
+    }
+
+    #[test]
+    fn merged_by_patch_needs_commits_ahead_and_no_unique_patches() {
+        let dir = tempfile::Builder::new()
+            .prefix("asf-vcs-unit-")
+            .tempdir()
+            .unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.email", "t@x"]);
+        git(root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "init"]);
+
+        // zero commits ahead: git cherry prints nothing, but that must not count as merged
+        git(root, &["branch", "empty", "main"]);
+        assert!(!merged_by_patch(root, "empty").unwrap());
+
+        // one unique commit: `+` line, not merged
+        git(root, &["checkout", "-q", "-b", "lane"]);
+        std::fs::write(root.join("c.txt"), "c\n").unwrap();
+        git(root, &["add", "c.txt"]);
+        git(root, &["commit", "-q", "-m", "c"]);
+        git(root, &["checkout", "-q", "main"]);
+        assert!(!merged_by_patch(root, "lane").unwrap());
+
+        // the same patch lands on main under a new SHA: merged
+        git(root, &["cherry-pick", "lane"]);
+        assert!(merged_by_patch(root, "lane").unwrap());
     }
 }
