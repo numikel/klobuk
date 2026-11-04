@@ -322,7 +322,10 @@ fn gh_sync_dry_run_reports_without_touching_github_or_labels() {
     assert_eq!(res["dry_run"], true);
     assert_eq!(res["created"][0]["id"], f.issue, "{res}");
     assert!(
-        gh(&f).log().iter().all(|e| e.op == "issue_list"),
+        gh(&f)
+            .log()
+            .iter()
+            .all(|e| e.op == "issue_list" || e.op == "whoami"),
         "{:?}",
         gh(&f).log()
     );
@@ -438,4 +441,118 @@ fn gh_sync_ignores_forged_markers_and_reports_duplicate_mirrors() {
             .any(|l| l == "gh:#5"),
         "{shown}"
     );
+}
+
+fn uid_of(f: &F, id: &str) -> String {
+    store(f).get_issue(&id.parse().unwrap()).unwrap().unwrap().uid
+}
+
+#[test]
+fn gh_sync_never_mirrors_onto_a_foreign_authored_issue_and_lists_it() {
+    let f = setup();
+    let uid = uid_of(&f, &f.issue);
+    // a stranger copied our public marker onto their own issue (#1)
+    gh(&f).seed_issue(
+        "hijack",
+        &format!("<!-- asf:{} uid:{uid} -->", f.issue),
+        "stranger",
+    );
+    // an unrelated foreign issue without a marker is not our business
+    gh(&f).seed_issue("just a human issue", "no marker here", "someone-else");
+
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(
+        res["foreign"],
+        serde_json::json!([{ "id": f.issue, "number": 1, "author": "stranger" }]),
+        "{res}"
+    );
+    assert_eq!(
+        res["created"].as_array().unwrap().len(),
+        1,
+        "own mirror created: {res}"
+    );
+    assert_eq!(res["created"][0]["number"], 3, "{res}");
+    assert_eq!(res["unchanged"], 0, "{res}");
+    assert!(res["duplicates"].as_array().unwrap().is_empty(), "{res}");
+    let shown = f.repo.ok(&["issue", "show", &f.issue]);
+    assert!(
+        shown["issue"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "gh:#3"),
+        "label points at our issue, not the stranger's: {shown}"
+    );
+
+    // idempotent: our own mirror is found again, the stranger's stays foreign
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["created"].as_array().unwrap().len(), 0, "{res}");
+    assert_eq!(res["unchanged"], 1, "{res}");
+    assert_eq!(res["foreign"][0]["number"], 1, "{res}");
+
+    // closing the local issue closes our mirror and leaves the foreign one open
+    f.repo.ok(&["issue", "status", &f.issue, "cancelled"]);
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["closed"][0]["number"], 3, "{res}");
+    let remote = gh(&f).issue_list(f.repo.path()).unwrap();
+    assert_eq!(remote[0].state, "OPEN", "foreign issue untouched");
+    assert_eq!(remote[2].state, "CLOSED");
+}
+
+#[test]
+fn gh_sync_reports_no_foreign_issues_when_all_are_mine() {
+    let f = setup();
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["foreign"], serde_json::json!([]), "{res}");
+}
+
+#[test]
+fn gh_sync_treats_an_unknown_author_as_foreign() {
+    let f = setup();
+    let uid = uid_of(&f, &f.issue);
+    gh(&f).seed_issue("anonymous", &format!("<!-- asf:{} uid:{uid} -->", f.issue), "");
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["foreign"][0]["number"], 1, "{res}");
+    assert_eq!(res["foreign"][0]["author"], "", "{res}");
+    assert_eq!(res["created"].as_array().unwrap().len(), 1, "{res}");
+}
+
+#[test]
+fn gh_sync_compares_the_author_with_the_authenticated_login() {
+    let f = setup();
+    let uid = uid_of(&f, &f.issue);
+    gh(&f)
+        .script(serde_json::json!({ "whoami": "operator" }))
+        .unwrap();
+    gh(&f).seed_issue("mine", &format!("<!-- asf:{} uid:{uid} -->", f.issue), "operator");
+    let res = f.repo.ok(&["gh", "sync"]);
+    assert_eq!(res["foreign"], serde_json::json!([]), "{res}");
+    assert_eq!(res["unchanged"], 1, "{res}");
+    assert_eq!(res["created"].as_array().unwrap().len(), 0, "{res}");
+}
+
+#[test]
+fn gh_sync_aborts_with_a_backend_error_when_whoami_fails_and_mirrors_nothing() {
+    for dry_run in [false, true] {
+        let f = setup();
+        gh(&f)
+            .script(serde_json::json!({ "whoami_error": true }))
+            .unwrap();
+        let mut args = vec!["gh", "sync"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, error_code, message) = f.repo.err(&args);
+        assert_eq!(code, 1, "{message}");
+        assert_eq!(error_code, "backend", "{message}");
+        assert!(message.contains("whoami"), "{message}");
+        let ops: Vec<String> = gh(&f).log().into_iter().map(|e| e.op).collect();
+        assert!(
+            ops.iter().all(|o| o != "issue_create" && o != "issue_close"),
+            "nothing mirrored: {ops:?}"
+        );
+        assert!(gh(&f).issue_list(f.repo.path()).unwrap().is_empty());
+        let shown = f.repo.ok(&["issue", "show", &f.issue]);
+        assert!(shown["issue"]["labels"].as_array().unwrap().is_empty(), "{shown}");
+    }
 }

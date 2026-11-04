@@ -31,6 +31,16 @@ pub struct SyncReport {
     pub skipped: Vec<IssueId>,
     /// Extra GitHub issues carrying a valid marker for an issue that already has a mirror.
     pub duplicates: Vec<Duplicate>,
+    /// Remote issues carrying a valid marker but written by someone else; never used as mirrors.
+    pub foreign: Vec<Foreign>,
+}
+
+#[derive(Serialize)]
+pub struct Foreign {
+    pub id: IssueId,
+    pub number: u64,
+    /// Empty when GitHub reports no author.
+    pub author: String,
 }
 
 #[derive(Serialize)]
@@ -84,12 +94,18 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
     let cfg = &ctx.config.merge.github;
     let gh = asf_vcs::github_from_config(&cfg.runner, &ctx.root)
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
+    // Markers are public, so only issues written by the authenticated user may act as mirrors.
+    // If we cannot tell who that is, nothing is mirrored (never treat every issue as foreign).
+    let me = gh
+        .whoami()
+        .map_err(|e| AppError::new(ErrorCode::Backend, format!("whoami: {e}")))?;
     let local = ctx.store.list_issues(&IssueFilter::default())?;
     // A remote issue mirrors a local one only when both id and uid of its marker match; anything
     // else (a forged or stale marker) is ignored. Markers are public, so several candidates can
     // still claim one issue: the number recorded locally as `gh:#<n>` wins (the tool wrote it),
     // then the lowest number; the rest is reported, never fatal.
     let mut candidates: BTreeMap<&str, Vec<GhIssue>> = BTreeMap::new();
+    let mut foreign: Vec<Foreign> = Vec::new();
     for g in gh
         .issue_list(&ctx.root)
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?
@@ -98,9 +114,18 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
             continue;
         };
         if let Some(i) = local.iter().find(|i| i.id.as_str() == id && i.uid == uid) {
-            candidates.entry(i.id.as_str()).or_default().push(g);
+            if g.author.is_empty() || g.author != me {
+                foreign.push(Foreign {
+                    id: i.id.clone(),
+                    number: g.number,
+                    author: g.author,
+                });
+            } else {
+                candidates.entry(i.id.as_str()).or_default().push(g);
+            }
         }
     }
+    foreign.sort_by_key(|f| f.number);
     let mut remote: BTreeMap<&str, GhIssue> = BTreeMap::new();
     let mut duplicates: Vec<Duplicate> = Vec::new();
     for i in &local {
@@ -133,6 +158,7 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
         unchanged: 0,
         skipped: Vec::new(),
         duplicates,
+        foreign,
     };
     for i in &local {
         match remote.get(i.id.as_str()) {
@@ -201,6 +227,19 @@ fn sync(cli: &Cli, dry_run: bool) -> Result<Rendered, AppError> {
             .map(|m| format!("\nclosed  {} -> #{}", m.id, m.number))
             .collect::<String>(),
     );
+    let text = report.foreign.iter().fold(text, |mut t, f| {
+        t.push_str(&format!(
+            "\nforeign issue #{} claims {} but is authored by {}: ignored",
+            f.number,
+            f.id,
+            if f.author.is_empty() {
+                "an unknown author"
+            } else {
+                &f.author
+            }
+        ));
+        t
+    });
     let text = report.duplicates.iter().fold(text, |mut t, d| {
         t.push_str(&format!(
             "\nduplicate mirrors of {}: using #{}, ignoring {}",

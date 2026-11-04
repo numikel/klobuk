@@ -30,10 +30,15 @@ struct Pr {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct Script {
     checks: ChecksState,
     mergeable: Mergeable,
     remote: String,
+    /// Login `whoami` reports and `issue_create` stamps as author.
+    whoami: String,
+    /// Makes `whoami` fail.
+    whoami_error: bool,
 }
 
 impl Default for Script {
@@ -42,6 +47,8 @@ impl Default for Script {
             checks: ChecksState::None,
             mergeable: Mergeable::Mergeable,
             remote: "origin".into(),
+            whoami: "me".into(),
+            whoami_error: false,
         }
     }
 }
@@ -110,12 +117,35 @@ impl FakeGitHub {
         if let Some(r) = v.get("remote").and_then(Value::as_str) {
             st.script.remote = r.to_string();
         }
+        if let Some(w) = v.get("whoami").and_then(Value::as_str) {
+            st.script.whoami = w.to_string();
+        }
+        if let Some(e) = v.get("whoami_error").and_then(Value::as_bool) {
+            st.script.whoami_error = e;
+        }
         if let Some(n) = v.get("close_pr").and_then(Value::as_u64) {
             if let Some(pr) = st.prs.iter_mut().find(|p| p.number == n) {
                 pr.state = PrState::Closed;
             }
         }
         self.save(&st)
+    }
+
+    /// Plants an issue written by `author` (not logged; simulates someone else's issue).
+    pub fn seed_issue(&self, title: &str, body: &str, author: &str) -> GhIssue {
+        let mut st = self.load().expect("load fake github state");
+        let number = st.issues.len() as u64 + 1;
+        let issue = GhIssue {
+            number,
+            title: title.into(),
+            state: "OPEN".into(),
+            url: format!("https://github.example/fake/repo/issues/{number}"),
+            body: body.into(),
+            author: author.into(),
+        };
+        st.issues.push(issue.clone());
+        self.save(&st).expect("save fake github state");
+        issue
     }
 
     pub fn log(&self) -> Vec<LogEntry> {
@@ -139,6 +169,15 @@ impl FakeGitHub {
 }
 
 impl GitHub for FakeGitHub {
+    fn whoami(&self) -> Result<String, GitHubError> {
+        self.with("whoami", json!({}), |st| {
+            if st.script.whoami_error {
+                return Err(GitHubError::Gh("gh api user: not logged in".into()));
+            }
+            Ok(st.script.whoami.clone())
+        })
+    }
+
     fn pr_find(&self, _dir: &Path, head: &str) -> Result<Option<PrInfo>, GitHubError> {
         self.with("pr_find", json!({ "head": head }), |st| {
             Ok(st
@@ -234,7 +273,7 @@ impl GitHub for FakeGitHub {
                 state: "OPEN".into(),
                 url: format!("https://github.example/fake/repo/issues/{number}"),
                 body: body.into(),
-                author: String::new(),
+                author: st.script.whoami.clone(),
             };
             st.issues.push(issue.clone());
             Ok(issue)

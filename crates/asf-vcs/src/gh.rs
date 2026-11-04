@@ -46,6 +46,16 @@ impl GhCli {
 }
 
 impl GitHub for GhCli {
+    fn whoami(&self) -> Result<String, GitHubError> {
+        // `gh api user` does not depend on a repository, so any existing directory will do.
+        let login = self.run(Path::new("."), &["api", "user", "--jq", ".login"])?;
+        let login = login.trim().to_string();
+        if login.is_empty() {
+            return Err(GitHubError::Protocol("gh api user: empty login".into()));
+        }
+        Ok(login)
+    }
+
     fn pr_find(&self, dir: &Path, head: &str) -> Result<Option<PrInfo>, GitHubError> {
         match self.json(dir, &["pr", "view", head, "--json", PR_JSON_FIELDS]) {
             Ok(v) => pr_from_json(&v).map(Some),

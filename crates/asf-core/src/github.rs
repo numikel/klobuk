@@ -66,13 +66,37 @@ pub struct GhIssue {
     #[serde(default)]
     pub body: String,
     /// Login of the issue author; empty when unknown (never equals `whoami`, so it counts as foreign).
-    #[serde(default)]
+    /// `gh --json author` yields `{"login": …}`; our own serialised form is a plain string.
+    #[serde(default, deserialize_with = "login_or_string")]
     pub author: String,
+}
+
+/// Accepts a plain string, `{"login": "…"}` (gh output) or `null` / a login-less object
+/// (a deleted account), the last two as the empty string.
+fn login_or_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    match v {
+        Value::String(s) => Ok(s),
+        Value::Null => Ok(String::new()),
+        Value::Object(o) => Ok(o
+            .get("login")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()),
+        other => Err(serde::de::Error::custom(format!(
+            "author: expected a login string or object, got {other}"
+        ))),
+    }
 }
 
 /// GitHub operations the factory needs. `dir` is any checkout of the repository (gh resolves
 /// the remote from it).
 pub trait GitHub {
+    /// Login of the authenticated user. `asf gh sync` only trusts issues authored by this login.
+    fn whoami(&self) -> Result<String, GitHubError>;
     /// The open or most recent PR whose head is `head`, if any.
     fn pr_find(&self, dir: &Path, head: &str) -> Result<Option<PrInfo>, GitHubError>;
     fn pr_create(
@@ -96,7 +120,7 @@ pub trait GitHub {
 /// Fields `pr view --json` must return for [`pr_from_json`].
 pub const PR_JSON_FIELDS: &str = "number,url,state,mergeable,statusCheckRollup,headRefOid";
 /// Fields `issue list --json` must return.
-pub const ISSUE_JSON_FIELDS: &str = "number,title,state,url,body";
+pub const ISSUE_JSON_FIELDS: &str = "number,title,state,url,body,author";
 
 /// Reduces `statusCheckRollup` (check runs and status contexts) to one state.
 pub fn checks_from_rollup(rollup: &Value) -> ChecksState {
@@ -200,6 +224,30 @@ mod tests {
         let i: GhIssue = serde_json::from_value(v).unwrap();
         assert_eq!(i.author, "");
         assert_eq!(i.body, "");
+    }
+
+    #[test]
+    fn gh_issue_author_reads_the_login_from_gh_output() {
+        // `gh issue list --json author` yields an object, not a string.
+        let v = json!({
+            "number": 7, "title": "t", "state": "OPEN", "url": "u",
+            "author": {"id": "MDQ6", "is_bot": false, "login": "numikel", "name": ""}
+        });
+        let i: GhIssue = serde_json::from_value(v).unwrap();
+        assert_eq!(i.author, "numikel");
+        // our own serialised form (a plain string) must keep working: the fake stores it
+        let again: GhIssue = serde_json::from_value(serde_json::to_value(&i).unwrap()).unwrap();
+        assert_eq!(again.author, "numikel");
+        // a deleted account is `null` in GitHub's API
+        let ghost = json!({"number": 8, "title": "t", "state": "OPEN", "url": "u", "author": null});
+        assert_eq!(serde_json::from_value::<GhIssue>(ghost).unwrap().author, "");
+        let no_login = json!({"number": 9, "title": "t", "state": "OPEN", "url": "u", "author": {}});
+        assert_eq!(serde_json::from_value::<GhIssue>(no_login).unwrap().author, "");
+    }
+
+    #[test]
+    fn issue_json_fields_request_the_author() {
+        assert!(ISSUE_JSON_FIELDS.split(',').any(|f| f == "author"));
     }
 
     #[test]

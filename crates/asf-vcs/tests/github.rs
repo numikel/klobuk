@@ -136,6 +136,46 @@ fn fake_github_opens_polls_and_merges_a_pr_into_the_remote() {
 }
 
 #[test]
+fn fake_github_whoami_defaults_to_me_and_can_be_scripted_to_fail() {
+    let (_t, _bare, root) = repo_with_remote();
+    let gh = FakeGitHub::new(root.join(".factory/fake-github.json"));
+    assert_eq!(gh.whoami().unwrap(), "me");
+
+    gh.script(serde_json::json!({ "whoami": "someone" })).unwrap();
+    assert_eq!(gh.whoami().unwrap(), "someone");
+
+    gh.script(serde_json::json!({ "whoami_error": true })).unwrap();
+    let e = gh.whoami().unwrap_err();
+    assert!(matches!(e, GitHubError::Gh(_)), "{e:?}");
+    assert!(
+        gh.log().iter().any(|e| e.op == "whoami"),
+        "whoami is logged like every other call"
+    );
+}
+
+#[test]
+fn fake_github_issues_carry_their_author() {
+    let (_t, _bare, root) = repo_with_remote();
+    let gh = FakeGitHub::new(root.join(".factory/fake-github.json"));
+    let mine = gh.issue_create(&root, "mine", "b").unwrap();
+    assert_eq!(mine.author, "me", "created as the authenticated user");
+    let theirs = gh.seed_issue("theirs", "b", "stranger");
+    assert_eq!(theirs.number, 2);
+    assert_eq!(theirs.author, "stranger");
+    let all = gh.issue_list(&root).unwrap();
+    assert_eq!(all[0].author, "me");
+    assert_eq!(all[1].author, "stranger");
+}
+
+#[test]
+fn fake_github_issue_create_uses_the_scripted_login() {
+    let (_t, _bare, root) = repo_with_remote();
+    let gh = FakeGitHub::new(root.join(".factory/fake-github.json"));
+    gh.script(serde_json::json!({ "whoami": "robot" })).unwrap();
+    assert_eq!(gh.issue_create(&root, "t", "b").unwrap().author, "robot");
+}
+
+#[test]
 fn fake_github_issues_create_list_close() {
     let (_t, _bare, root) = repo_with_remote();
     let gh = FakeGitHub::new(root.join(".factory/fake-github.json"));
