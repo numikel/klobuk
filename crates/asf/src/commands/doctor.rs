@@ -49,6 +49,78 @@ fn tool(name: &'static str, bin: &str, args: &[&str], required: bool) -> Check {
     }
 }
 
+/// Env var that replaces the `gh` binary the github check runs (tests point it at a stand-in).
+const GH_BIN_ENV: &str = "ASF_GH_BIN";
+
+/// First non-empty line of a command's output, stdout before stderr (older `gh` printed to stderr).
+fn first_line(out: &std::process::Output) -> String {
+    [&out.stdout, &out.stderr]
+        .iter()
+        .flat_map(|b| {
+            String::from_utf8_lossy(b)
+                .lines()
+                .map(str::trim)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+}
+
+/// `[merge] target = "github"` needs an authenticated `gh` and a resolvable remote; with the
+/// `local` target the check is only informational (`required: false`) and runs nothing.
+fn github_check(ctx: &Ctx) -> Check {
+    if ctx.config.merge.target != "github" {
+        return Check {
+            name: "github",
+            ok: false,
+            required: false,
+            detail: format!("skipped: [merge] target is {}", ctx.config.merge.target),
+        };
+    }
+    let gh_bin = std::env::var(GH_BIN_ENV).unwrap_or_else(|_| "gh".into());
+    let remote = &ctx.config.merge.github.remote;
+    let auth = match Command::new(&gh_bin).args(["auth", "status"]).output() {
+        Ok(out) if out.status.success() => Ok(first_line(&out)),
+        Ok(out) => {
+            let line = first_line(&out);
+            Err(format!(
+                "`{gh_bin} auth status` failed ({}){}",
+                out.status,
+                if line.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {line}")
+                }
+            ))
+        }
+        Err(_) => Err(format!("{gh_bin} not found on PATH")),
+    };
+    let url = match Command::new("git")
+        .args(["remote", "get-url", remote])
+        .current_dir(&ctx.root)
+        .output()
+    {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        Ok(out) => {
+            let line = first_line(&out);
+            Err(format!("`git remote get-url {remote}` failed: {line}"))
+        }
+        Err(e) => Err(format!("git remote get-url {remote}: {e}")),
+    };
+    let ok = auth.is_ok() && url.is_ok();
+    let part = |label: &str, r: Result<String, String>| match r {
+        Ok(v) => format!("{label}: {v}"),
+        Err(e) => e,
+    };
+    Check {
+        name: "github",
+        ok,
+        required: true,
+        detail: format!("{}; {}", part("gh", auth), part(remote, url)),
+    }
+}
+
 pub fn run(cli: &Cli) -> Result<Rendered, AppError> {
     let ctx = Ctx::load(cli)?;
     let mut checks = vec![tool("git", "git", &["--version"], true)];
@@ -87,6 +159,7 @@ pub fn run(cli: &Cli) -> Result<Rendered, AppError> {
     checks.push(db);
     checks.push(tool("herdr", "herdr", &["--version"], false));
     checks.push(tool("claude", "claude", &["--version"], false));
+    checks.push(github_check(&ctx));
     let ok = checks.iter().filter(|c| c.required).all(|c| c.ok);
     let report = Report { ok, checks };
     let mut text = String::new();
