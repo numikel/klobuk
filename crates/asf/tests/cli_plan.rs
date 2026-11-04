@@ -225,3 +225,95 @@ fn plan_new_dry_run_saves_artifacts_but_creates_no_issues_and_reports_llm_errors
     let (code, _, _) = r.err(&["plan", "new", "--from", "nope.md"]);
     assert_eq!(code, 1);
 }
+
+/// Copies the shipped `asf-default` methodology into `.factory/methodologies/<name>/`, replaces its
+/// first prompt with `prd_prompt` and makes it the active methodology.
+fn local_methodology(repo: &Repo, name: &str, prd_prompt: &str) {
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../methodologies/asf-default");
+    let dir = repo.path().join(".factory/methodologies").join(name);
+    for rel in [
+        "manifest.toml",
+        "prompts/idea-to-prd.md",
+        "prompts/prd-to-issues.md",
+        "schemas/prd.json",
+        "schemas/issues.json",
+    ] {
+        std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+        std::fs::copy(shipped.join(rel), dir.join(rel)).unwrap();
+    }
+    let manifest = std::fs::read_to_string(dir.join("manifest.toml"))
+        .unwrap()
+        .replace("name = \"asf-default\"", &format!("name = \"{name}\""));
+    std::fs::write(dir.join("manifest.toml"), manifest).unwrap();
+    std::fs::write(dir.join("prompts/idea-to-prd.md"), prd_prompt).unwrap();
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("name = \"asf-default\"", &format!("name = \"{name}\""));
+    assert!(
+        s.contains(&format!("name = \"{name}\"")),
+        "config template lacks [methodology] name"
+    );
+    std::fs::write(&cfg, s).unwrap();
+}
+
+fn planner_log(repo: &Repo) -> Vec<serde_json::Value> {
+    let log: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.path().join(".factory/fake-llm.json")).unwrap())
+            .unwrap();
+    log["log"].as_array().unwrap().clone()
+}
+
+#[test]
+fn plan_new_sends_the_prompts_of_the_active_local_methodology() {
+    let r = Repo::initialised();
+    fake_llm(&r, canned());
+    let custom = "CUSTOM PRD PROMPT: answer in haiku.\n";
+    local_methodology(&r, "custom", custom);
+    let idea = r.path().join("idea.md");
+    std::fs::write(&idea, "I want a greet function.\n").unwrap();
+    let res = r.ok(&["plan", "new", "--from", idea.to_str().unwrap()]);
+    assert_eq!(res["created"].as_array().unwrap().len(), 2, "{res}");
+    let calls = planner_log(&r);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0]["instruction"], custom,
+        "first stage must use the local prompt"
+    );
+    assert_eq!(calls[0]["schema_name"], "prd");
+    let shipped_issues = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../methodologies/asf-default/prompts/prd-to-issues.md"),
+    )
+    .unwrap();
+    assert_eq!(calls[1]["instruction"], shipped_issues.as_str());
+    assert_eq!(calls[1]["schema_name"], "issues");
+}
+
+#[test]
+fn plan_new_rejects_an_unknown_methodology_and_one_without_prompt_stages() {
+    let r = Repo::initialised();
+    fake_llm(&r, canned());
+    let idea = r.path().join("idea.md");
+    std::fs::write(&idea, "idea\n").unwrap();
+    let cfg = r.path().join(".factory/config.toml");
+    let base = std::fs::read_to_string(&cfg).unwrap();
+
+    std::fs::write(&cfg, base.replace("name = \"asf-default\"", "name = \"nope\"")).unwrap();
+    let (code, ecode, msg) = r.err(&["plan", "new", "--from", idea.to_str().unwrap()]);
+    assert_eq!((code, ecode.as_str()), (1, "not_found"), "{msg}");
+    assert!(msg.contains("nope"), "{msg}");
+
+    std::fs::write(
+        &cfg,
+        base.replace("name = \"asf-default\"", "name = \"spec-kit\""),
+    )
+    .unwrap();
+    let (code, ecode, msg) = r.err(&["plan", "new", "--from", idea.to_str().unwrap()]);
+    assert_eq!((code, ecode.as_str()), (1, "validation"), "{msg}");
+    assert!(msg.contains("prompt"), "{msg}");
+    assert!(
+        !r.path().join(".factory/plan").exists(),
+        "nothing written on error"
+    );
+}

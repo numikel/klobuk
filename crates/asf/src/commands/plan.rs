@@ -11,14 +11,10 @@ use asf_runtime::llm::{planner_from_config, StructuredRequest};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::method::{active_prompts, PromptStage};
 use crate::cli::{Cli, PlanCmd};
 use crate::ctx::{Ctx, FACTORY_DIR};
 use crate::output::{AppError, ErrorCode, Rendered};
-
-const PROMPT_PRD: &str = include_str!("../../../../methodologies/asf-default/prompts/idea-to-prd.md");
-const PROMPT_ISSUES: &str = include_str!("../../../../methodologies/asf-default/prompts/prd-to-issues.md");
-const SCHEMA_PRD: &str = include_str!("../../../../methodologies/asf-default/schemas/prd.json");
-const SCHEMA_ISSUES: &str = include_str!("../../../../methodologies/asf-default/schemas/issues.json");
 
 #[derive(Serialize)]
 struct DryRun {
@@ -287,62 +283,65 @@ fn new(
 ) -> Result<Rendered, AppError> {
     let idea = read_md(from)?;
     let ctx = Ctx::load(cli)?;
+    let method = active_prompts(&ctx)?;
     let cfg = &ctx.config.planner;
     let llm = planner_from_config(&cfg.runner, &ctx.root)
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
-    let schema_prd: Value =
-        serde_json::from_str(SCHEMA_PRD).map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
-    let schema_issues: Value =
-        serde_json::from_str(SCHEMA_ISSUES).map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
-    let request = |name: &str, instruction: &str, stdin: String, schema: &Value| StructuredRequest {
-        schema_name: name.into(),
-        instruction: instruction.into(),
+    let request = |stage: &PromptStage, stdin: String| StructuredRequest {
+        schema_name: stage.schema_name.clone(),
+        instruction: stage.prompt.clone(),
         stdin,
-        schema: schema.clone(),
+        schema: stage.schema.clone(),
         model: cfg.model.clone(),
         max_turns: cfg.max_turns,
         budget_usd: cfg.budget_usd,
         add_dirs: vec![],
     };
     let backend = |e: RuntimeError| AppError::new(ErrorCode::Backend, e.to_string());
+    let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
 
-    // step 1: idea → PRD
-    let prd = llm
-        .run(&request("prd", PROMPT_PRD, idea.clone(), &schema_prd))
-        .map_err(backend)?;
-    let title = prd
-        .output
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("plan")
-        .to_string();
-    let slug = slug.map(str::to_string).unwrap_or_else(|| slugify(&title));
-    let plan_dir: PathBuf = ctx.root.join(FACTORY_DIR).join("plan").join(&slug);
-    std::fs::create_dir_all(&plan_dir)?;
-    std::fs::write(plan_dir.join("idea.md"), &idea)?;
-    let prd_md = prd
-        .output
-        .get("prd_markdown")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    std::fs::write(plan_dir.join("prd.md"), &prd_md)?;
-    std::fs::write(
-        plan_dir.join("prd.json"),
-        serde_json::to_string_pretty(&prd.output).unwrap_or_default(),
-    )?;
-
-    // step 2: PRD → issues
-    let issues = llm
-        .run(&request("issues", PROMPT_ISSUES, prd_md.clone(), &schema_issues))
-        .map_err(backend)?;
-    std::fs::write(
-        plan_dir.join("issues.json"),
-        serde_json::to_string_pretty(&issues.output).unwrap_or_default(),
-    )?;
-    let plan = tasks_from_value(&issues.output)?;
-    let prd_path = plan_dir.join("prd.md").to_string_lossy().replace('\\', "/");
-    let cost = prd.cost_usd + issues.cost_usd;
+    // Each prompt stage reads the previous stage's output (the idea for the first one): its
+    // `prd_markdown` when it has one, the JSON otherwise. The last stage must yield the task list.
+    let mut input = idea.clone();
+    let mut cost = 0.0;
+    let mut dir: Option<(String, PathBuf)> = None;
+    let mut prd_path = String::new();
+    let mut last = Value::Null;
+    for stage in &method.stages {
+        let out = llm.run(&request(stage, input.clone())).map_err(backend)?;
+        cost += out.cost_usd;
+        let (_, plan_dir) = match &dir {
+            Some(d) => d,
+            None => {
+                let title = out.output.get("title").and_then(Value::as_str).unwrap_or("plan");
+                let slug = slug.map(str::to_string).unwrap_or_else(|| slugify(title));
+                let plan_dir: PathBuf = ctx.root.join(FACTORY_DIR).join("plan").join(&slug);
+                std::fs::create_dir_all(&plan_dir)?;
+                std::fs::write(plan_dir.join("idea.md"), &idea)?;
+                dir.insert((slug, plan_dir))
+            }
+        };
+        let json_file = plan_dir.join(format!("{}.json", stage.schema_name));
+        std::fs::write(&json_file, pretty(&out.output))?;
+        let markdown = out.output.get("prd_markdown").and_then(Value::as_str);
+        if let Some(md) = markdown {
+            std::fs::write(plan_dir.join("prd.md"), md)?;
+        }
+        if prd_path.is_empty() || markdown.is_some() {
+            let shown = if markdown.is_some() {
+                plan_dir.join("prd.md")
+            } else {
+                json_file
+            };
+            prd_path = shown.to_string_lossy().replace('\\', "/");
+        }
+        input = markdown
+            .map(str::to_string)
+            .unwrap_or_else(|| pretty(&out.output));
+        last = out.output;
+    }
+    let (slug, _) = dir.expect("active_prompts guarantees at least one prompt stage");
+    let plan = tasks_from_value(&last)?;
     if dry_run {
         return dry_run_view(&plan, Some(prd_path));
     }
