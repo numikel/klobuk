@@ -14,4 +14,5 @@ Write a concise Product Requirements Document for a single deliverable increment
   acceptance criteria, open questions). Keep it under 1500 words.
 
 Be specific to this repository. Prefer the smallest increment that delivers value end-to-end.
+Language: {{language}}
 Return only the JSON object required by the schema.

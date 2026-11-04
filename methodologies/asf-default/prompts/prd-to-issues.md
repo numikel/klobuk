@@ -16,4 +16,5 @@ runs in its own git worktree and may only touch files matching its `file_scope`,
 - Include a final task that adds or updates tests/docs only if the PRD asks for it.
 
 `epic`: title and a one-paragraph body summarising the PRD for the board.
+Language: {{language}}
 Return only the JSON object required by the schema.

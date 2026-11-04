@@ -286,8 +286,89 @@ fn plan_new_sends_the_prompts_of_the_active_local_methodology() {
             .join("../../methodologies/asf-default/prompts/prd-to-issues.md"),
     )
     .unwrap();
-    assert_eq!(calls[1]["instruction"], shipped_issues.as_str());
+    assert_eq!(
+        calls[1]["instruction"],
+        shipped_issues.replace("{{language}}", "en").as_str()
+    );
     assert_eq!(calls[1]["schema_name"], "issues");
+}
+
+fn shipped_prompt(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../methodologies/asf-default/prompts")
+            .join(name),
+    )
+    .unwrap()
+}
+
+/// Rewrites `[methodology] language` of a local methodology; `None` removes the key.
+fn set_language(repo: &Repo, name: &str, language: Option<&str>) {
+    let path = repo
+        .path()
+        .join(".factory/methodologies")
+        .join(name)
+        .join("manifest.toml");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    let line = "language = \"en\"\n";
+    assert!(manifest.contains(line), "manifest lacks the language key");
+    let replacement = language
+        .map(|l| format!("language = \"{l}\"\n"))
+        .unwrap_or_default();
+    std::fs::write(&path, manifest.replace(line, &replacement)).unwrap();
+}
+
+/// Runs `plan new` with the fake planner and returns the instructions of both planner calls.
+fn instructions_of_plan_new(repo: &Repo) -> Vec<String> {
+    let idea = repo.path().join("idea.md");
+    std::fs::write(&idea, "I want a greet function.\n").unwrap();
+    repo.ok(&["plan", "new", "--from", idea.to_str().unwrap()]);
+    planner_log(repo)
+        .iter()
+        .map(|c| c["instruction"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn shipped_prompts_differ_from_their_rendering_only_by_the_language_line() {
+    let r = Repo::initialised();
+    fake_llm(&r, canned());
+    let got = instructions_of_plan_new(&r);
+    assert_eq!(got.len(), 2);
+    for (instruction, file) in got.iter().zip(["idea-to-prd.md", "prd-to-issues.md"]) {
+        let shipped = shipped_prompt(file);
+        assert_eq!(
+            shipped.matches("Language: {{language}}\n").count(),
+            1,
+            "{file} must carry exactly one language placeholder line"
+        );
+        assert!(instruction.contains("Language: en"), "{file}: {instruction}");
+        assert!(!instruction.contains("{{language}}"), "{file}: {instruction}");
+        assert_eq!(
+            instruction,
+            &shipped.replace("Language: {{language}}\n", "Language: en\n"),
+            "{file}: the language line is the only difference"
+        );
+    }
+}
+
+#[test]
+fn plan_new_renders_the_manifest_language_and_defaults_to_en() {
+    for (language, expected) in [(Some("pl"), "Language: pl"), (None, "Language: en")] {
+        let r = Repo::initialised();
+        fake_llm(&r, canned());
+        local_methodology(&r, "custom", &shipped_prompt("idea-to-prd.md"));
+        set_language(&r, "custom", language);
+        let got = instructions_of_plan_new(&r);
+        assert_eq!(got.len(), 2);
+        for instruction in &got {
+            assert!(
+                instruction.contains(expected),
+                "{language:?}: expected `{expected}` in {instruction}"
+            );
+            assert!(!instruction.contains("{{language}}"), "{instruction}");
+        }
+    }
 }
 
 #[test]

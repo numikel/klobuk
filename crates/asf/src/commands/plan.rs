@@ -289,7 +289,7 @@ fn new(
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
     let request = |stage: &PromptStage, stdin: String| StructuredRequest {
         schema_name: stage.schema_name.clone(),
-        instruction: stage.prompt.clone(),
+        instruction: stage.prompt.replace("{{language}}", &method.language),
         stdin,
         schema: stage.schema.clone(),
         model: cfg.model.clone(),
