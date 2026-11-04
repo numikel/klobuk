@@ -397,6 +397,13 @@ pub enum LaneCmd {
     List,
     /// Report claims whose worktree directory is missing (`stale`).
     Check,
+    /// Remove the worktree of a finished lane (branch kept; refuses claimed, dirty or unmerged lanes).
+    Clean {
+        id: IssueId,
+        /// Run every check but remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
