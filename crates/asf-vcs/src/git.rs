@@ -224,6 +224,14 @@ mod tests {
         git(root, &["checkout", "-q", "main"]);
         assert!(!merged_by_patch(root, "lane").unwrap());
 
+        // main moves on first, so the cherry-pick below cannot reproduce the lane commit byte for
+        // byte (same parent, tree, message and second-resolution timestamps would give the same SHA
+        // and make `lane` an ancestor again)
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        git(root, &["add", "b.txt"]);
+        git(root, &["commit", "-q", "-m", "main moves"]);
+        assert!(!merged_by_patch(root, "lane").unwrap());
+
         // the same patch lands on main under a new SHA: merged
         git(root, &["cherry-pick", "lane"]);
         assert!(merged_by_patch(root, "lane").unwrap());
