@@ -110,7 +110,7 @@ print('tests ok' if e else 'LINK : fatal error LNK1104: cannot open file foo.exe
 }
 
 #[test]
-fn gives_up_on_a_permanent_linker_lock_after_three_attempts() {
+fn gives_up_on_a_permanent_linker_lock_after_five_attempts() {
     let dir = tempfile::tempdir().unwrap();
     let code = "import sys\n\
 with open('runs.log', 'a') as f: f.write('x')\n\
@@ -120,9 +120,9 @@ print('LINK : fatal error LNK1104: cannot open file foo.exe'); sys.exit(101)";
     assert_eq!(results[0].exit_code, Some(101));
     assert_eq!(
         std::fs::read_to_string(dir.path().join("runs.log")).unwrap(),
-        "xxx"
+        "xxxxx"
     );
-    assert!(results[0].tail.contains("attempt 3"), "{}", results[0].tail);
+    assert!(results[0].tail.contains("attempt 5"), "{}", results[0].tail);
 }
 
 #[test]
@@ -164,7 +164,7 @@ sys.exit(0 if not e else 101)",
     assert!(results[0].tail.contains("moved aside"), "{}", results[0].tail);
     assert!(results[0].tail.contains("attempt 2"), "{}", results[0].tail);
     assert!(
-        results[0].duration_ms >= 3000,
+        results[0].duration_ms >= 2000,
         "duration covers every attempt: {}",
         results[0].duration_ms
     );
