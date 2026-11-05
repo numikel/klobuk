@@ -20,6 +20,7 @@ pub const IGNORE_LINES: &[&str] = &[
     ".factory/factory.db-wal",
     ".factory/factory.db-shm",
     ".factory/runs/",
+    ".factory/plan/",
     ".worktrees/",
     "CLAUDE.local.md",
     ".claude/settings.local.json",

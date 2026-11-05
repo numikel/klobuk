@@ -1,12 +1,16 @@
 //! `asf repo doctor` — environment and store health.
 
+use std::collections::HashSet;
+use std::fs;
 use std::process::Command;
 
 use asf_core::IssueStore;
 use serde::Serialize;
 
+use super::repo::IGNORE_LINES;
 use crate::cli::Cli;
 use crate::ctx::{Ctx, CONFIG_FILE, FACTORY_DIR};
+use crate::git;
 use crate::output::{AppError, Rendered};
 
 #[derive(Serialize)]
@@ -121,6 +125,50 @@ fn github_check(ctx: &Ctx) -> Check {
     }
 }
 
+/// Every `IGNORE_LINES` entry must be ignored through `.gitignore` or `.git/info/exclude` (either
+/// one is enough, as the lines are effective from both). Advisory only: a gap is a `warn`
+/// (`required: false`), never a failure, because the repository still works without the lines.
+fn gitignore_check(ctx: &Ctx) -> Check {
+    let sources = [
+        ctx.root.join(".gitignore"),
+        git::common_dir(&ctx.root)
+            .map(|d| d.join("info").join("exclude"))
+            .unwrap_or_else(|_| ctx.root.join(".git").join("info").join("exclude")),
+    ];
+    // An unreadable or missing file counts as empty; if neither exists every line is missing.
+    let contents: Vec<Option<String>> = sources.iter().map(|p| fs::read_to_string(p).ok()).collect();
+    let present: HashSet<&str> = contents
+        .iter()
+        .flatten()
+        .flat_map(|s| s.lines().map(str::trim))
+        .collect();
+    let missing: Vec<&str> = IGNORE_LINES
+        .iter()
+        .copied()
+        .filter(|l| !present.contains(l))
+        .collect();
+    let detail = if missing.is_empty() {
+        "all asf paths are ignored".to_string()
+    } else {
+        let none_exist = contents.iter().all(Option::is_none);
+        format!(
+            "{}missing: {}; run `asf repo init` to add them",
+            if none_exist {
+                "neither .gitignore nor .git/info/exclude exists; "
+            } else {
+                ""
+            },
+            missing.join(", ")
+        )
+    };
+    Check {
+        name: "gitignore",
+        ok: missing.is_empty(),
+        required: false,
+        detail,
+    }
+}
+
 pub fn run(cli: &Cli) -> Result<Rendered, AppError> {
     let ctx = Ctx::load(cli)?;
     let mut checks = vec![tool("git", "git", &["--version"], true)];
@@ -160,6 +208,7 @@ pub fn run(cli: &Cli) -> Result<Rendered, AppError> {
     checks.push(tool("herdr", "herdr", &["--version"], false));
     checks.push(tool("claude", "claude", &["--version"], false));
     checks.push(github_check(&ctx));
+    checks.push(gitignore_check(&ctx));
     let ok = checks.iter().filter(|c| c.required).all(|c| c.ok);
     let report = Report { ok, checks };
     let mut text = String::new();

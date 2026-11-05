@@ -22,6 +22,7 @@ fn init_creates_factory_config_db_and_ignore_lines() {
             ".factory/factory.db",
             ".factory/factory.db-wal",
             ".factory/runs/",
+            ".factory/plan/",
             ".worktrees/",
             "CLAUDE.local.md",
         ] {
@@ -41,6 +42,27 @@ fn init_is_idempotent_on_gitignore_and_on_a_second_run() {
     let res = r.ok(&["repo", "init"]);
     assert_eq!(res["created"], false, "{res}");
     assert_eq!(res["prefix"], "asf", "{res}");
+}
+
+/// An existing repo (older `init`, no plan line) gets `.factory/plan/` exactly once per file,
+/// and a second run leaves both files byte-for-byte unchanged.
+#[test]
+fn init_adds_the_plan_dir_once_and_a_second_run_changes_nothing() {
+    let r = Repo::new();
+    std::fs::write(r.path().join(".gitignore"), "target/\n.factory/runs/\n").unwrap();
+    r.ok(&["repo", "init"]);
+    let read = |f: &str| std::fs::read_to_string(r.path().join(f)).unwrap();
+    let (gi, ex) = (read(".gitignore"), read(".git/info/exclude"));
+    for (f, s) in [(".gitignore", &gi), (".git/info/exclude", &ex)] {
+        assert_eq!(
+            s.lines().filter(|l| *l == ".factory/plan/").count(),
+            1,
+            "{f}:\n{s}"
+        );
+    }
+    r.ok(&["repo", "init"]);
+    assert_eq!(read(".gitignore"), gi, ".gitignore changed on a second run");
+    assert_eq!(read(".git/info/exclude"), ex, "exclude changed on a second run");
 }
 
 /// A clone brings the committed `.factory/config.toml` but no database: init adopts the config.
@@ -280,6 +302,66 @@ fn doctor_local_target_skips_the_github_check_and_never_fails() {
     assert_eq!(gh["ok"], false, "{gh}");
     assert_eq!(gh["required"], false, "{gh}");
     assert!(gh["detail"].as_str().unwrap().contains("local"), "{gh}");
+}
+
+/// `repo doctor --json` result for a local-target repo; asserts the exit code is 0 (never `fail`).
+fn doctor_gitignore(r: &Repo) -> serde_json::Value {
+    let out = r.asf().args(["repo", "doctor", "--json"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["result"]["ok"], true, "{v}");
+    check(&v["result"], "gitignore").clone()
+}
+
+#[test]
+fn doctor_gitignore_is_ok_after_init() {
+    let r = Repo::initialised();
+    let c = doctor_gitignore(&r);
+    assert_eq!(c["ok"], true, "{c}");
+    assert_eq!(c["required"], false, "{c}");
+}
+
+#[test]
+fn doctor_gitignore_accepts_lines_split_across_gitignore_and_exclude() {
+    let r = Repo::initialised();
+    let drop_plan = |f: &str| {
+        let p = r.path().join(f);
+        let s = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, s.replace(".factory/plan/\n", "")).unwrap();
+    };
+    // gone from .gitignore only: still ignored through .git/info/exclude
+    drop_plan(".gitignore");
+    assert_eq!(doctor_gitignore(&r)["ok"], true);
+    // gone from both: warn, never fail
+    drop_plan(".git/info/exclude");
+    let c = doctor_gitignore(&r);
+    assert_eq!(c["ok"], false, "{c}");
+    assert_eq!(c["required"], false, "{c}");
+    let d = c["detail"].as_str().unwrap();
+    assert!(d.contains(".factory/plan/"), "{d}");
+    assert!(d.contains("run `asf repo init` to add them"), "{d}");
+    assert!(!d.contains(".worktrees/"), "only missing lines are listed: {d}");
+    // init repairs it
+    r.ok(&["repo", "init"]);
+    assert_eq!(doctor_gitignore(&r)["ok"], true);
+}
+
+#[test]
+fn doctor_gitignore_warns_when_neither_file_exists() {
+    let r = Repo::initialised();
+    std::fs::remove_file(r.path().join(".gitignore")).unwrap();
+    std::fs::remove_file(r.path().join(".git/info/exclude")).unwrap();
+    let c = doctor_gitignore(&r);
+    assert_eq!(c["ok"], false, "{c}");
+    assert_eq!(c["required"], false, "{c}");
+    let d = c["detail"].as_str().unwrap();
+    assert!(d.contains("neither"), "{d}");
+    assert!(d.contains(".factory/plan/") && d.contains(".worktrees/"), "{d}");
 }
 
 #[test]
