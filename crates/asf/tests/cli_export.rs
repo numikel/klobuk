@@ -187,6 +187,9 @@ fn parallel_comments_no_lock_errors() {
     let root = r.path().to_path_buf();
     let results = parallel(8, move |i| {
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_asf"));
+        c.env_remove("ASF_RUN")
+            .env_remove("ASF_ISSUE")
+            .env_remove("ASF_LANE");
         c.current_dir(&root).args([
             "--lane", "human", "issue", "comment", "asf-1", "--type", "FYI", "--body",
         ]);
@@ -212,6 +215,9 @@ fn parallel_claims_exactly_one_winner() {
     let root = r.path().to_path_buf();
     let results = parallel(8, move |i| {
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_asf"));
+        c.env_remove("ASF_RUN")
+            .env_remove("ASF_ISSUE")
+            .env_remove("ASF_LANE");
         c.current_dir(&root)
             .args(["issue", "claim", "asf-1", "--worker"])
             .arg(format!("w{i}"))

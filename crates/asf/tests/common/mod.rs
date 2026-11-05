@@ -45,6 +45,7 @@ impl Repo {
         c.current_dir(cwd);
         c.env_remove("ASF_ISSUE");
         c.env_remove("ASF_RUN");
+        c.env_remove("ASF_LANE");
         c
     }
 
