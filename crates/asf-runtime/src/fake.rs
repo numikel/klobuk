@@ -1,8 +1,13 @@
 //! File-backed fake runtime: lets several `asf` processes (CLI tests) share one simulated Herdr.
 //!
 //! State lives in a JSON file. A `script` can pre-seed responses: `start_agent` and `info` are
-//! queues consumed in order (`{"error":"not_ready"}` or `{"state":"idle","session_id":"…"}`);
-//! `screen` seeds what `read` returns. Every call is appended to `log`.
+//! queues consumed in order (`{"error":"not_ready"}`, `{"error":"timeout"}` or
+//! `{"state":"idle","session_id":"…"}`); `screen` seeds what `read` returns. Every call is appended
+//! to `log`.
+//!
+//! A scripted `{"error":"timeout"}` start leaves the agent registered in state `unknown`: a re-read
+//! sees `unknown` unless an `info` entry (`{"state":"idle"}`) says the agent came up after all, and
+//! closing the workspace drops it, so the next `start_agent` on a fresh workspace starts clean.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};

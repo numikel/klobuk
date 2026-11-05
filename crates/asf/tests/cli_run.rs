@@ -477,7 +477,171 @@ fn start_tolerates_a_startup_detection_timeout_when_the_agent_comes_up() {
     );
 }
 
-// ---- `asf run verify` -------------------------------------------------------------------------
+// ---- start retry after a startup-detection timeout --------------------------------------------
+
+/// Shrinks the startup window, so a timed-out start is judged after one `info` read instead of 90 s.
+fn short_start_window(f: &F) {
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("auto_trust = true"), "config template changed");
+    std::fs::write(
+        &cfg,
+        s.replace("auto_trust = true", "start_timeout_ms = 1\nauto_trust = true"),
+    )
+    .unwrap();
+}
+
+fn count_op(f: &F, op: &str) -> usize {
+    fake(f).log().iter().filter(|e| e.op == op).count()
+}
+
+fn start_retries(f: &F) -> Vec<Event> {
+    store(f)
+        .events_since(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "run.start_retry")
+        .collect()
+}
+
+#[test]
+fn start_timeout_with_an_idle_or_done_agent_continues_without_a_retry() {
+    for state in ["idle", "done"] {
+        let f = setup();
+        short_start_window(&f);
+        fake(&f)
+            .script(serde_json::json!({ "start_agent": [{"error": "timeout"}], "info": [{"state": state}] }))
+            .unwrap();
+        let res = f.repo.ok(&["run", "start", &f.issue]);
+        assert_eq!(res["run"]["state"], "working", "{state}: {res}");
+        assert_eq!(count_op(&f, "start_agent"), 1, "{state}: never restarted");
+        assert_eq!(count_op(&f, "open_workspace"), 1, "{state}: one workspace");
+        assert_eq!(count_op(&f, "close_workspace"), 0, "{state}: nothing closed");
+        assert!(start_retries(&f).is_empty(), "{state}: no retry recorded");
+    }
+}
+
+#[test]
+fn start_timeout_with_a_dead_pane_retries_once_on_a_fresh_workspace() {
+    let f = setup();
+    short_start_window(&f);
+    // the first start times out and the agent never leaves `unknown`; the second start is unscripted (idle)
+    fake(&f)
+        .script(serde_json::json!({ "start_agent": [{"error": "timeout"}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(
+        res["workspace_id"], "f:w2",
+        "the run now lives in the new workspace"
+    );
+    assert_eq!(res["pane_id"], "f:p2");
+    assert_eq!(res["run"]["workspace_id"], "f:w2");
+    assert_eq!(res["run"]["pane_id"], "f:p2");
+
+    let log = fake(&f).log();
+    let pos = |op: &str, nth: usize| {
+        log.iter()
+            .enumerate()
+            .filter(|(_, e)| e.op == op)
+            .nth(nth)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| panic!("no {op} #{nth} in {:?}", ops(&f)))
+    };
+    assert_eq!(count_op(&f, "start_agent"), 2, "exactly one retry");
+    assert_eq!(count_op(&f, "open_workspace"), 2);
+    assert_eq!(count_op(&f, "close_workspace"), 1);
+    assert_eq!(log[pos("close_workspace", 0)].args["workspace_id"], "f:w1");
+    assert!(
+        pos("start_agent", 0) < pos("close_workspace", 0)
+            && pos("close_workspace", 0) < pos("open_workspace", 1)
+            && pos("open_workspace", 1) < pos("start_agent", 1),
+        "{:?}",
+        ops(&f)
+    );
+    assert_eq!(log[pos("start_agent", 1)].args["pane_id"], "f:p2");
+    let session = |i: usize| {
+        let a = log[i].args["args"].as_array().unwrap();
+        let k = a.iter().position(|x| x == "--session-id").unwrap();
+        a[k + 1].as_str().unwrap().to_string()
+    };
+    assert_ne!(
+        session(pos("start_agent", 0)),
+        session(pos("start_agent", 1)),
+        "a retry must not reuse the session id of the abandoned launch"
+    );
+    assert_eq!(
+        res["run"]["claude_session_id"].as_str().unwrap(),
+        session(pos("start_agent", 1))
+    );
+
+    let ev = start_retries(&f);
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(
+        ev[0].issue_id.as_ref().map(|i| i.as_str()),
+        Some(f.issue.as_str())
+    );
+    assert_eq!(ev[0].run_id.as_deref(), Some(active_run(&f).id.as_str()));
+    let reason = ev[0].payload["reason"].as_str().expect("reason");
+    assert!(
+        reason.contains("timed out") && reason.contains("unknown"),
+        "{reason}"
+    );
+    assert_eq!(store(&f).active_claims().unwrap().len(), 1);
+}
+
+#[test]
+fn start_blocks_with_a_blocker_after_a_second_startup_failure() {
+    let f = setup();
+    short_start_window(&f);
+    fake(&f)
+        .script(serde_json::json!({ "start_agent": [{"error": "timeout"}, {"error": "timeout"}] }))
+        .unwrap();
+    let (code, ecode, msg) = f.repo.err(&["run", "start", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (1, "blocked"), "{msg}");
+    assert!(msg.contains("asf-1") && msg.contains("timed out"), "{msg}");
+
+    assert_eq!(count_op(&f, "start_agent"), 2, "one retry, not more");
+    assert_eq!(start_retries(&f).len(), 1);
+    let run = active_run(&f);
+    assert_eq!(run.state, RunState::Blocked);
+    assert_eq!(
+        run.workspace_id.as_deref(),
+        Some("f:w2"),
+        "the second pane is kept for inspection"
+    );
+    assert_eq!(
+        count_op(&f, "close_workspace"),
+        1,
+        "only the abandoned first workspace is closed"
+    );
+    assert_eq!(store(&f).active_claims().unwrap().len(), 1, "claim kept");
+    let cs = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
+    let blockers: Vec<_> = cs.iter().filter(|c| c.kind == CommentType::Blocker).collect();
+    assert_eq!(blockers.len(), 1, "{cs:?}");
+    assert_eq!(blockers[0].to_lane, "human");
+    assert!(
+        blockers[0].body.contains("could not start"),
+        "{}",
+        blockers[0].body
+    );
+}
+
+#[test]
+fn a_start_that_fails_for_another_reason_is_not_retried() {
+    let f = setup();
+    short_start_window(&f);
+    fake(&f)
+        .script(serde_json::json!({ "start_agent": [{"error": "not_ready"}], "screen": "Please log in: run /login" }))
+        .unwrap();
+    let (code, ecode, _) = f.repo.err(&["run", "start", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (1, "blocked"));
+    assert_eq!(count_op(&f, "start_agent"), 1);
+    assert_eq!(count_op(&f, "close_workspace"), 0);
+    assert!(start_retries(&f).is_empty());
+}
+
+// ---- `asf run verify`-------------------------------------------------------------------------
 
 /// Adds a gate that passes only once `src/fixed.rs` exists in the worktree.
 fn add_fixed_file_gate(f: &F) {

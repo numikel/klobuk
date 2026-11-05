@@ -204,3 +204,64 @@ fn script_start_timeout_registers_the_agent_anyway() {
     assert!(matches!(e, RuntimeError::Timeout(_)), "{e:?}");
     assert_eq!(rt.info(&handle("a")).unwrap().state, AgentState::Unknown);
 }
+
+/// The two behaviours `Worker::start`'s retry relies on, in one place: after a scripted start timeout
+/// the agent can come up on its own (`info` script), or the dead workspace is closed and a fresh one
+/// starts cleanly on the next, unscripted `start_agent`.
+#[test]
+fn start_timeout_then_idle_by_script_or_a_clean_restart_on_a_fresh_workspace() {
+    let open = |rt: &FakeRuntime| {
+        rt.open_workspace(&OpenWorkspace {
+            cwd: std::env::temp_dir(),
+            label: "x".into(),
+            env: vec![],
+        })
+        .unwrap()
+    };
+    let start = |rt: &FakeRuntime, pane: &str| {
+        rt.start_agent(&StartAgent {
+            name: "a".into(),
+            pane_id: pane.into(),
+            args: vec![],
+            timeout_ms: 1,
+        })
+    };
+
+    // 1. state idle after the timeout: the scripted `info` is what a re-read sees
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "start_agent": [{"error": "timeout"}], "info": [{"state": "idle"}] }))
+        .unwrap();
+    let ws = open(&rt);
+    assert!(matches!(
+        start(&rt, &ws.pane_id).unwrap_err(),
+        RuntimeError::Timeout(_)
+    ));
+    assert_eq!(rt.info(&handle("a")).unwrap().state, AgentState::Idle);
+
+    // 2. first start times out, the workspace is closed and a second one starts cleanly
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "start_agent": [{"error": "timeout"}] }))
+        .unwrap();
+    let first = open(&rt);
+    assert!(matches!(
+        start(&rt, &first.pane_id).unwrap_err(),
+        RuntimeError::Timeout(_)
+    ));
+    assert_eq!(rt.info(&handle("a")).unwrap().state, AgentState::Unknown);
+    rt.close_workspace(&first.workspace_id).unwrap();
+    assert!(
+        matches!(rt.info(&handle("a")).unwrap_err(), RuntimeError::NotFound(_)),
+        "closing the workspace drops the half-started agent"
+    );
+    let second = open(&rt);
+    assert_ne!(second.workspace_id, first.workspace_id);
+    assert_eq!(second.pane_id, "f:p2");
+    let up = start(&rt, &second.pane_id).unwrap();
+    assert_eq!(up.state, AgentState::Idle);
+    assert!(up.interactive_ready);
+    let starts: Vec<_> = rt.log().into_iter().filter(|e| e.op == "start_agent").collect();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1].args["pane_id"], "f:p2");
+}

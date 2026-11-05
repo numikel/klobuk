@@ -41,6 +41,18 @@ struct Launch<'a> {
     settings_path: PathBuf,
     model: Option<String>,
     kick: String,
+    /// After a startup-detection timeout whose agent never came up, start once more in a fresh
+    /// workspace. Workers do; reviewers keep the single attempt.
+    retry_start: bool,
+}
+
+/// A runtime workspace whose agent is about to be started: the run (patched with the workspace, the
+/// pane and a fresh Claude session id) and everything `start_agent` and the later calls need.
+struct Pane {
+    run: Run,
+    ws: WorkspaceRef,
+    start: StartAgent,
+    handle: AgentHandle,
 }
 
 #[derive(Serialize)]
@@ -390,6 +402,7 @@ impl<'a> Worker<'a> {
                 settings_path,
                 model: self.ctx.config.worker.model.clone(),
                 kick: format!("Start {id}: read {FACTORY_DIR}/{RUNS_DIR}/{id}/brief.md and follow it."),
+                retry_start: true,
             },
             &fail_run,
         )
@@ -404,70 +417,12 @@ impl<'a> Worker<'a> {
         fail_run: &dyn Fn(AppError) -> AppError,
     ) -> Result<StartResult, AppError> {
         let store = &self.ctx.store;
-        let run = l.run.clone();
-        let id = &run.issue_id;
-        let wt_abs = l.wt_abs;
-        let settings_path = &l.settings_path;
-        let ws = self
-            .rt
-            .open_workspace(&OpenWorkspace {
-                cwd: wt_abs.to_path_buf(),
-                label: l.label.clone(),
-                env: vec![
-                    (ENV_ISSUE.into(), id.to_string()),
-                    (crate::commands::hook::ENV_RUN.into(), run.id.clone()),
-                ],
-            })
-            .map_err(rt_err)
-            .map_err(fail_run)?;
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let run = store.update_run(
-            &run.id,
-            &RunPatch {
-                workspace_id: Some(ws.workspace_id.clone()),
-                pane_id: Some(ws.pane_id.clone()),
-                agent_name: Some(id.to_string()),
-                claude_session_id: Some(session_id.clone()),
-                ..RunPatch::default()
-            },
-        )?;
-        let _ = self.rt.report(
-            &ws.pane_id,
-            Some(id.as_str()),
-            &[
-                ("issue".into(), id.to_string()),
-                (
-                    "budget".into(),
-                    format!(
-                        "{:.2}",
-                        run.budget_usd.unwrap_or(self.ctx.config.worker.budget_usd)
-                    ),
-                ),
-            ],
-        );
-        let mut args = vec![
-            "--permission-mode".to_string(),
-            self.ctx.config.worker.permission_mode.clone(),
-            "--settings".to_string(),
-            fwd(settings_path),
-            "--session-id".to_string(),
-            session_id,
-        ];
-        if let Some(m) = &l.model {
-            args.push("--model".into());
-            args.push(m.clone());
-        }
-        let start = StartAgent {
-            name: id.to_string(),
-            pane_id: ws.pane_id.clone(),
-            args,
-            timeout_ms: self.ctx.config.worker.start_timeout_ms,
-        };
-        let handle = AgentHandle {
-            name: id.to_string(),
-            pane_id: ws.pane_id.clone(),
-            workspace_id: ws.workspace_id.clone(),
-        };
+        let Pane {
+            mut run,
+            mut ws,
+            mut start,
+            mut handle,
+        } = self.open_pane(l, l.run).map_err(fail_run)?;
         let mut trusted = false;
         let agent = match self.rt.start_agent(&start) {
             Ok(a) => a,
@@ -494,22 +449,31 @@ impl<'a> Worker<'a> {
                     return Err(self.block_start(&run, &handle, RuntimeError::NotReady(msg)));
                 }
             }
-            Err(RuntimeError::Timeout(msg)) => {
-                // Herdr's startup detection gave up; the agent may still be coming up. Poll instead of blocking.
-                let deadline = std::time::Instant::now()
-                    + Duration::from_millis(self.ctx.config.worker.start_timeout_ms);
-                loop {
-                    if let Ok(info) = self.rt.info(&handle) {
-                        if info.state.is_settled() || info.state == AgentState::Working {
-                            break info;
-                        }
+            Err(RuntimeError::Timeout(msg)) => match self.await_started(&handle, msg) {
+                Ok(a) => a,
+                Err(first) if l.retry_start => {
+                    // The pane never came up: record why, drop the dead workspace and try exactly once more
+                    // in a fresh one (new pane, new session id). A second failure blocks as before.
+                    store.append_event(&NewEvent {
+                        kind: "run.start_retry".into(),
+                        issue_id: Some(run.issue_id.clone()),
+                        run_id: Some(run.id.clone()),
+                        actor: Some(LANE_ORCHESTRATOR.into()),
+                        payload: json!({ "reason": first.to_string(), "workspace_id": ws.workspace_id }),
+                    })?;
+                    let _ = self.rt.close_workspace(&ws.workspace_id);
+                    let pane = self.open_pane(l, &run).map_err(fail_run)?;
+                    (run, ws, start, handle) = (pane.run, pane.ws, pane.start, pane.handle);
+                    match self.rt.start_agent(&start) {
+                        Ok(a) => a,
+                        Err(RuntimeError::Timeout(msg)) => self
+                            .await_started(&handle, msg)
+                            .map_err(|e| self.block_start(&run, &handle, e))?,
+                        Err(e) => return Err(self.block_start(&run, &handle, e)),
                     }
-                    if std::time::Instant::now() >= deadline {
-                        return Err(self.block_start(&run, &handle, RuntimeError::Timeout(msg)));
-                    }
-                    std::thread::sleep(Duration::from_millis(2000));
                 }
-            }
+                Err(e) => return Err(self.block_start(&run, &handle, e)),
+            },
             Err(e) => return Err(self.block_start(&run, &handle, e)),
         };
         let agent = match self.rt.prompt(
@@ -554,6 +518,106 @@ impl<'a> Worker<'a> {
             agent,
             trusted,
         })
+    }
+
+    /// Open a runtime workspace for `run` and prepare the `start_agent` call: record workspace, pane
+    /// and a new Claude session id on the run, label the pane and build the `claude` arguments.
+    /// A retry calls this again, so nothing from an abandoned launch (notably the session id) is reused.
+    fn open_pane(&self, l: &Launch<'_>, run: &Run) -> Result<Pane, AppError> {
+        let id = &run.issue_id;
+        let ws = self
+            .rt
+            .open_workspace(&OpenWorkspace {
+                cwd: l.wt_abs.to_path_buf(),
+                label: l.label.clone(),
+                env: vec![
+                    (ENV_ISSUE.into(), id.to_string()),
+                    (crate::commands::hook::ENV_RUN.into(), run.id.clone()),
+                ],
+            })
+            .map_err(rt_err)?;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let run = self.ctx.store.update_run(
+            &run.id,
+            &RunPatch {
+                workspace_id: Some(ws.workspace_id.clone()),
+                pane_id: Some(ws.pane_id.clone()),
+                agent_name: Some(id.to_string()),
+                claude_session_id: Some(session_id.clone()),
+                ..RunPatch::default()
+            },
+        )?;
+        let _ = self.rt.report(
+            &ws.pane_id,
+            Some(id.as_str()),
+            &[
+                ("issue".into(), id.to_string()),
+                (
+                    "budget".into(),
+                    format!(
+                        "{:.2}",
+                        run.budget_usd.unwrap_or(self.ctx.config.worker.budget_usd)
+                    ),
+                ),
+            ],
+        );
+        let mut args = vec![
+            "--permission-mode".to_string(),
+            self.ctx.config.worker.permission_mode.clone(),
+            "--settings".to_string(),
+            fwd(&l.settings_path),
+            "--session-id".to_string(),
+            session_id,
+        ];
+        if let Some(m) = &l.model {
+            args.push("--model".into());
+            args.push(m.clone());
+        }
+        let start = StartAgent {
+            name: id.to_string(),
+            pane_id: ws.pane_id.clone(),
+            args,
+            timeout_ms: self.ctx.config.worker.start_timeout_ms,
+        };
+        let handle = AgentHandle {
+            name: id.to_string(),
+            pane_id: ws.pane_id.clone(),
+            workspace_id: ws.workspace_id.clone(),
+        };
+        Ok(Pane {
+            run,
+            ws,
+            start,
+            handle,
+        })
+    }
+
+    /// `start_agent` timed out: Herdr's startup detection gave up, but the agent may still be coming
+    /// up. Re-read its state for up to `start_timeout_ms` and accept `idle`, `done` or `working`
+    /// (it is up). Anything else (`unknown`, `blocked`) ends in a timeout error that names the last
+    /// state seen, which becomes the reason of a retry or of the BLOCKER.
+    fn await_started(&self, handle: &AgentHandle, msg: String) -> Result<AgentInfo, RuntimeError> {
+        let deadline =
+            std::time::Instant::now() + Duration::from_millis(self.ctx.config.worker.start_timeout_ms);
+        let mut last = AgentState::Unknown;
+        loop {
+            if let Ok(info) = self.rt.info(handle) {
+                if matches!(
+                    info.state,
+                    AgentState::Idle | AgentState::Done | AgentState::Working
+                ) {
+                    return Ok(info);
+                }
+                last = info.state;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(RuntimeError::Timeout(format!(
+                    "{msg}; agent state after re-read: {last}"
+                )));
+            }
+            std::thread::sleep(left.min(Duration::from_millis(2000)));
+        }
     }
 
     /// The review child of `issue`: reuse the open one, else create it `ready` (the claim moves it to
@@ -757,6 +821,7 @@ impl<'a> Worker<'a> {
                 settings_path,
                 model: Some(self.ctx.config.review.model.clone()),
                 kick: format!("Start {rid}: read {FACTORY_DIR}/{RUNS_DIR}/{rid}/brief.md and follow it."),
+                retry_start: false,
             },
             &fail_run,
         )
