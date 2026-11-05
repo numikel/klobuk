@@ -27,6 +27,7 @@ budget_usd = 5.0
 stall_minutes = 15
 max_wall_minutes = 90
 max_tool_calls = 400
+start_timeout_ms = 180000  # Herdr reports the Claude pane idle later than 90 s on this machine (asf-8/12/20/21)
 # Workers: no gh (merges and GitHub are the orchestrator's job), no cat/dir (Read/Glob cover it),
 # cargo limited to build/check/fmt/clippy/test, rtk only for the ls rewrite the user's hook applies.
 allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)", "Bash(asf *)", "Bash(cargo build *)", "Bash(cargo check *)", "Bash(cargo fmt *)", "Bash(cargo clippy *)", "Bash(cargo test *)", "Bash(ls *)", "Bash(rtk ls *)"]
@@ -56,7 +57,7 @@ require_clean_main = true
 verify_main_after = true  # gates on main after every merge (dogfooding round 2)
 
 [review]
-required = false
+required = true
 on_labels = []
 
 [planner]
