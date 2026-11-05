@@ -187,6 +187,8 @@ pub struct MergeCfg {
     /// `local` (rebase + ff) or `github` (push + PR via gh).
     pub target: String,
     pub require_clean_main: bool,
+    /// Run the `[[gate]]`s in the repository root right after every merge to detect a red default branch.
+    pub verify_main_after: bool,
     pub github: GitHubCfg,
 }
 
@@ -195,6 +197,7 @@ impl Default for MergeCfg {
         MergeCfg {
             target: "local".into(),
             require_clean_main: true,
+            verify_main_after: false,
             github: GitHubCfg::default(),
         }
     }
@@ -305,7 +308,8 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 [merge]
 target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
 require_clean_main = true
-# [merge.github]           # used when target = "github"
+verify_main_after = false # run the gates in the repo root after each merge; a red main keeps the item `merged`, posts a BLOCKER and halts the tick
+# [merge.github]          # used when target = "github"
 # remote = "origin"
 # base = "main"            # default: [repo] default_branch
 # method = "merge"         # merge | rebase | squash (rebase/squash rewrite commits: `asf lane clean` then refuses)
@@ -500,7 +504,17 @@ mod tests {
             "workers must not stop on permission prompts"
         );
         assert!(c.merge.require_clean_main);
+        assert!(!c.merge.verify_main_after, "off unless asked for");
         assert!(!c.review.required);
+    }
+
+    #[test]
+    fn verify_main_after_parses_and_template_keeps_it_off() {
+        let c = Config::from_toml("[merge]\nverify_main_after = true\n").unwrap();
+        assert!(c.merge.verify_main_after);
+        assert!(c.merge.require_clean_main, "other merge defaults survive");
+        let t = Config::from_toml(Config::default_toml()).unwrap();
+        assert!(!t.merge.verify_main_after);
     }
 
     #[test]

@@ -121,17 +121,22 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
 pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
     let mut items = Vec::new();
     let queue = ctx.store.merge_queue()?;
+    let mut main_red = false;
     for next in queue.iter().filter(|m| m.state == MergeState::Queued) {
-        items.push(process(ctx, next)?);
-        if once {
+        let done = process(ctx, next)?;
+        main_red = is_main_red(&done);
+        items.push(done);
+        if once || main_red {
             break;
         }
     }
-    if ctx.config.merge.target == "github" && (!once || items.is_empty()) {
+    // a red default branch halts the whole tick: nothing else may be merged or integrated on top of it
+    if !main_red && ctx.config.merge.target == "github" && (!once || items.is_empty()) {
         for open in queue.iter().filter(|m| m.state == MergeState::PrOpen) {
             if let Some(changed) = poll_pr(ctx, open)? {
+                main_red = is_main_red(&changed);
                 items.push(changed);
-                if once {
+                if once || main_red {
                     break;
                 }
             }
@@ -187,6 +192,30 @@ fn fail(
             ..MergePatch::default()
         },
     )
+}
+
+fn gate_specs(ctx: &Ctx) -> Vec<GateSpec> {
+    ctx.config
+        .gates
+        .iter()
+        .map(|g| GateSpec {
+            name: g.name.clone(),
+            cmd: g.cmd.clone(),
+            timeout_s: g.timeout_s,
+            shell: g.shell.clone(),
+        })
+        .collect()
+}
+
+/// The last `n` lines of `text`, in their original order.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// A merged item whose post-merge gate run on the repo root failed: still `merged`, but carrying the error.
+fn is_main_red(item: &MergeItem) -> bool {
+    item.state == MergeState::Merged && item.last_error.is_some()
 }
 
 fn comment(ctx: &Ctx, issue: &IssueId, kind: CommentType, to: &str, body: String) -> Result<(), AppError> {
@@ -332,32 +361,13 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
             ..MergePatch::default()
         },
     )?;
-    let specs: Vec<GateSpec> = ctx
-        .config
-        .gates
-        .iter()
-        .map(|g| GateSpec {
-            name: g.name.clone(),
-            cmd: g.cmd.clone(),
-            timeout_s: g.timeout_s,
-            shell: g.shell.clone(),
-        })
-        .collect();
-    let results = run_gates(&specs, &wt);
+    let results = run_gates(&gate_specs(ctx), &wt);
     if let Some(bad) = results.iter().find(|r| !r.ok) {
         let msg = format!(
             "gate `{}` failed (exit {:?}) after rebase:\n{}",
             bad.name,
             bad.exit_code,
-            bad.tail
-                .lines()
-                .rev()
-                .take(15)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n")
+            last_lines(&bad.tail, 15)
         );
         let updated = fail(ctx, item, MergeState::Failed, msg.clone(), Some(results.clone()))?;
         comment(
@@ -471,6 +481,56 @@ fn finalize_merged(
         run_id: item.run_id.clone(),
         actor: Some(LANE_ORCHESTRATOR.into()),
         payload: serde_json::json!({ "head": new_head, "branch": item.branch, "pr_url": updated.pr_url }),
+    })?;
+    if ctx.config.merge.verify_main_after {
+        return verify_main(ctx, updated, &new_head);
+    }
+    Ok(updated)
+}
+
+/// Runs the gates in the repository root once the merge landed (local fast-forward or `pull_ff` after
+/// a merged PR), regardless of `require_clean_main`. A red gate leaves the item `merged` (no automatic
+/// revert) but records `last_error`, a BLOCKER comment and a `merge.main_red` event; the caller stops the tick.
+fn verify_main(ctx: &Ctx, merged: MergeItem, head: &str) -> Result<MergeItem, AppError> {
+    let results = run_gates(&gate_specs(ctx), &ctx.root);
+    let Some(bad) = results.iter().find(|r| !r.ok) else {
+        return Ok(merged);
+    };
+    let exit = bad
+        .exit_code
+        .map_or_else(|| "none".to_string(), |c| c.to_string());
+    let msg = format!("main red after merge: gate `{}` failed (exit {exit})", bad.name);
+    let updated = set(
+        ctx,
+        merged.id,
+        MergePatch {
+            last_error: Some(Some(msg.clone())),
+            ..MergePatch::default()
+        },
+    )?;
+    comment(
+        ctx,
+        &merged.issue_id,
+        CommentType::Blocker,
+        LANE_HUMAN,
+        format!(
+            "{msg} at {head}:\n{}\n\n{} is merged and stays merged (no automatic revert); the merge queue is halted for \
+             this tick. Fix or revert by hand.",
+            last_lines(&bad.tail, 15),
+            merged.branch
+        ),
+    )?;
+    ctx.store.append_event(&NewEvent {
+        kind: "merge.main_red".into(),
+        issue_id: Some(merged.issue_id.clone()),
+        run_id: merged.run_id.clone(),
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload: serde_json::json!({
+            "head": head,
+            "branch": merged.branch,
+            "gate": bad.name,
+            "exit_code": bad.exit_code,
+        }),
     })?;
     Ok(updated)
 }

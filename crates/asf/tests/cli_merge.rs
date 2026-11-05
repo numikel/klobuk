@@ -208,6 +208,179 @@ fn tick_fails_on_gate_and_retry_requeues() {
     assert_eq!((code, ecode.as_str()), (3, "conflict"));
 }
 
+/// Two verified items in the queue and one gate that passes only where a `PASS` file exists: every
+/// worktree has it, the repo root does not. The gate logs its working directory to a file outside the repo.
+struct Red {
+    f: F,
+    second: String,
+    log: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn red_setup(verify_main_after: bool) -> Red {
+    let f = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\n\
+         open(sys.argv[1], 'a').write(os.getcwd() + '\\n')\n\
+         if os.path.exists('PASS'):\n    sys.exit(0)\n\
+         print('PASS marker missing in', os.getcwd())\n\
+         sys.exit(7)\n",
+    )
+    .unwrap();
+    let log = dir.path().join("gate.log");
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    if verify_main_after {
+        assert!(
+            s.contains("verify_main_after = false"),
+            "template carries the flag"
+        );
+        s = s.replace("verify_main_after = false", "verify_main_after = true");
+    }
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"rootonly\"\ncmd = ['python', '{}', '{}']\n",
+        fwd(&script),
+        fwd(&log)
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "gate"]);
+    let exclude = f.repo.path().join(".git/info/exclude");
+    let mut ex = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ex.push_str("PASS\n");
+    std::fs::write(&exclude, ex).unwrap();
+
+    let second = f.repo.create_issue("second", &["--ready", "--scope", "docs/**"]);
+    for (id, rel) in [(f.issue.clone(), "src/greet.rs"), (second.clone(), "docs/b.md")] {
+        f.repo.ok(&["run", "start", &id]);
+        let wt = f.repo.path().join(".worktrees").join(&id);
+        commit_in(&wt, rel, "x\n");
+        std::fs::write(wt.join("PASS"), "").unwrap();
+        let report = wt.join(".factory").join("runs").join(&id).join("report.md");
+        std::fs::write(&report, "# done\n").unwrap();
+        f.repo.ok(&[
+            "--lane",
+            &id,
+            "issue",
+            "finish",
+            &id,
+            "--report",
+            report.to_str().unwrap(),
+        ]);
+        let res = f.repo.ok(&["run", "watch", "--once"]);
+        assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    }
+    let q = store(&f).merge_queue().unwrap();
+    assert_eq!(q.len(), 2, "both verified items are queued: {q:?}");
+    Red {
+        f,
+        second,
+        log,
+        _dir: dir,
+    }
+}
+
+fn gate_dirs(r: &Red) -> Vec<String> {
+    std::fs::read_to_string(&r.log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn verify_main_after_marks_a_red_main_and_halts_the_tick() {
+    let r = red_setup(true);
+    let f = &r.f;
+    let before = gate_dirs(&r).len();
+    let res = f.repo.ok(&["merge", "tick"]);
+    assert_eq!(res["processed"], 1, "tick stops after the red main: {res}");
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(
+        res["items"][0]["last_error"], "main red after merge: gate `rootonly` failed (exit 7)",
+        "{res}"
+    );
+    assert!(main_has(f, "src/greet.rs"), "no automatic revert");
+
+    let q = store(f).merge_queue().unwrap();
+    assert_eq!(q[0].state, MergeState::Merged);
+    assert!(q[0].last_error.is_some());
+    assert_eq!(q[1].state, MergeState::Queued, "the other item is left alone");
+    assert_eq!(q[1].last_error, None);
+    assert_eq!(f.repo.ok(&["issue", "show", &f.issue])["issue"]["status"], "done");
+    assert_eq!(
+        f.repo.ok(&["issue", "show", &r.second])["issue"]["status"],
+        "in-review"
+    );
+
+    let events = store(f).events_since(0, 10_000).unwrap();
+    let red: Vec<_> = events.iter().filter(|e| e.kind == "merge.main_red").collect();
+    assert_eq!(red.len(), 1, "{events:?}");
+    assert_eq!(
+        red[0].issue_id.as_ref().map(|i| i.to_string()),
+        Some(f.issue.clone())
+    );
+    assert_eq!(red[0].payload["gate"], "rootonly");
+    assert_eq!(red[0].payload["exit_code"], 7);
+
+    let head = git_head(f);
+    assert_eq!(red[0].payload["head"], head.as_str());
+    let blockers: Vec<String> = store(f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind == CommentType::Blocker)
+        .map(|c| c.body)
+        .collect();
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(blockers[0].contains(&head), "commit SHA: {}", blockers[0]);
+    assert!(
+        blockers[0].contains("PASS marker missing"),
+        "gate output: {}",
+        blockers[0]
+    );
+
+    // this tick ran the first item's gate in its worktree, then once in the repo root; the second item never started
+    let dirs = gate_dirs(&r);
+    assert_eq!(dirs.len(), before + 2, "{dirs:?}");
+    assert!(dirs[before].contains(".worktrees"), "{dirs:?}");
+    assert!(!dirs[before + 1].contains(".worktrees"), "root run: {dirs:?}");
+}
+
+#[test]
+fn verify_main_after_is_off_by_default_and_runs_no_root_gate() {
+    let r = red_setup(false);
+    let f = &r.f;
+    let before = gate_dirs(&r).len();
+    let res = f.repo.ok(&["merge", "tick"]);
+    assert_eq!(res["processed"], 2, "{res}");
+    for item in res["items"].as_array().unwrap() {
+        assert_eq!(item["state"], "merged", "{res}");
+        assert!(item["last_error"].is_null(), "{res}");
+    }
+    let events = store(f).events_since(0, 10_000).unwrap();
+    assert!(events.iter().all(|e| e.kind != "merge.main_red"), "{events:?}");
+    let dirs = gate_dirs(&r);
+    assert_eq!(dirs.len(), before + 2, "one worktree gate run per item: {dirs:?}");
+    assert!(
+        dirs[before..].iter().all(|d| d.contains(".worktrees")),
+        "no gate ran in the repo root: {dirs:?}"
+    );
+}
+
+fn git_head(f: &F) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "main"])
+        .current_dir(f.repo.path())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 #[test]
 fn tick_refuses_dirty_main_and_skip_removes_from_queue() {
     let f = setup();

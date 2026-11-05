@@ -172,6 +172,109 @@ fn github_target_opens_a_pr_waits_for_checks_then_merges() {
 }
 
 #[test]
+fn verify_main_after_runs_the_gates_in_the_root_after_pull_ff_and_halts_the_tick() {
+    let f = setup();
+    // a gate that passes only where a `PASS` file exists: every worktree has it, the repo root does not
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\n\
+         if os.path.exists('PASS'):\n    sys.exit(0)\n\
+         print('PASS marker missing in', os.getcwd())\n\
+         sys.exit(7)\n",
+    )
+    .unwrap();
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(
+        s.contains("verify_main_after = false"),
+        "template carries the flag"
+    );
+    s = s.replace("verify_main_after = false", "verify_main_after = true");
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"rootonly\"\ncmd = ['python', '{}']\n",
+        script.to_str().unwrap().replace('\\', "/")
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "gate"]);
+    git(f.repo.path(), &["push", "-q", "origin", "main"]);
+    let exclude = f.repo.path().join(".git/info/exclude");
+    let mut ex = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ex.push_str("PASS\n");
+    std::fs::write(&exclude, ex).unwrap();
+
+    let second = f.repo.create_issue("second", &["--ready", "--scope", "docs/**"]);
+    for (id, rel) in [(f.issue.clone(), "src/greet.rs"), (second.clone(), "docs/b.md")] {
+        f.repo.ok(&["run", "start", &id]);
+        let wt = f.repo.path().join(".worktrees").join(&id);
+        commit_in(&wt, rel, "x\n");
+        std::fs::write(wt.join("PASS"), "").unwrap();
+        let report = wt.join(".factory").join("runs").join(&id).join("report.md");
+        std::fs::write(&report, "# done\n").unwrap();
+        f.repo.ok(&[
+            "--lane",
+            &id,
+            "issue",
+            "finish",
+            &id,
+            "--report",
+            report.to_str().unwrap(),
+        ]);
+        let res = f.repo.ok(&["run", "watch", "--once"]);
+        assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    }
+
+    // ticks 1 and 2 (once): each queued item gets its PR
+    for _ in 0..2 {
+        let res = f.repo.ok(&["merge", "tick", "--once"]);
+        assert_eq!(res["items"][0]["state"], "pr_open", "{res}");
+    }
+    assert!(store(&f)
+        .merge_queue()
+        .unwrap()
+        .iter()
+        .all(|m| m.state == MergeState::PrOpen));
+
+    // tick 3: both PRs have passing checks; the first is merged, pulled and verified in the root, which is red
+    gh(&f).script(serde_json::json!({ "checks": "passed" })).unwrap();
+    let res = f.repo.ok(&["merge", "tick"]);
+    assert_eq!(res["processed"], 1, "the tick stops at the red main: {res}");
+    assert_eq!(res["items"][0]["issue_id"], f.issue, "{res}");
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(
+        res["items"][0]["last_error"], "main red after merge: gate `rootonly` failed (exit 7)",
+        "{res}"
+    );
+    assert!(
+        f.repo.path().join("src/greet.rs").exists(),
+        "pull_ff landed; no automatic revert"
+    );
+
+    // the red main halted the tick: the other PR was neither polled nor merged
+    let merges = gh(&f).log().into_iter().filter(|e| e.op == "pr_merge").count();
+    assert_eq!(merges, 1, "only the first PR was merged");
+    let q = store(&f).merge_queue().unwrap();
+    assert_eq!(q[1].state, MergeState::PrOpen);
+    assert_eq!(q[1].last_error, None);
+
+    let events = store(&f).events_since(0, 10_000).unwrap();
+    let red: Vec<_> = events.iter().filter(|e| e.kind == "merge.main_red").collect();
+    assert_eq!(red.len(), 1, "{events:?}");
+    assert_eq!(red[0].payload["gate"], "rootonly");
+    let head = git_out(f.repo.path(), &["rev-parse", "main"]);
+    assert_eq!(red[0].payload["head"], head.as_str());
+    let b = blockers(&f);
+    assert_eq!(b.len(), 1, "{b:?}");
+    assert!(
+        b[0].contains(&head) && b[0].contains("PASS marker missing"),
+        "{b:?}"
+    );
+    assert_eq!(f.repo.ok(&["issue", "show", &f.issue])["issue"]["status"], "done");
+}
+
+#[test]
 fn github_target_fails_on_failed_checks_and_retry_reuses_the_open_pr() {
     let f = setup();
     finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
