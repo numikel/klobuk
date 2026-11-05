@@ -26,12 +26,12 @@ fn open_creates_file_wal_and_schema_version() {
     let path = dir.path().join(".factory").join("factory.db");
     let store = SqliteStore::open(&path).unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
     assert_eq!(store.journal_mode().unwrap(), "wal");
     // reopening an existing database must not re-run the migration
     drop(store);
     let again = SqliteStore::open(&path).unwrap();
-    assert_eq!(again.schema_version().unwrap(), 1);
+    assert_eq!(again.schema_version().unwrap(), 2);
 }
 
 #[test]

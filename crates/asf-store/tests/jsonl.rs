@@ -135,6 +135,34 @@ fn import_roundtrip_equal_export() {
 }
 
 #[test]
+fn validating_status_survives_export_and_import() {
+    let (_d, s) = open();
+    let issue = s
+        .create_issue(&NewIssue {
+            title: "under validation".into(),
+            status: Status::Ready,
+            ..NewIssue::default()
+        })
+        .unwrap();
+    s.set_status(&issue.id, Status::Validating, "human").unwrap();
+    let dump = export(&s);
+    assert!(dump.contains(r#""status":"validating""#), "{dump}");
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let t = SqliteStore::open(&dir2.path().join("f.db")).unwrap();
+    t.init_repo("D:/other", "asf", "main").unwrap();
+    let report = t
+        .import_jsonl(&mut Cursor::new(dump.as_bytes()), ImportMode::Upsert)
+        .unwrap();
+    assert_eq!(report.issues_created, 1);
+    assert_eq!(
+        t.get_issue(&issue.id).unwrap().unwrap().status,
+        Status::Validating
+    );
+    assert_eq!(body(&export(&t)), body(&dump));
+}
+
+#[test]
 fn import_is_idempotent_and_upsert_keeps_newer() {
     let (_d, s) = open();
     seed(&s);

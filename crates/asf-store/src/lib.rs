@@ -18,6 +18,8 @@ use asf_core::*;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
+/// Schema version written by `schema.sql` and produced by the migration; `asf doctor` expects it.
+pub const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct SqliteStore {
@@ -91,21 +93,23 @@ impl SqliteStore {
                 |r| r.get::<_, i64>(0).map(|n| n > 0),
             )
             .map_err(backend)?;
-        if has_meta {
-            return Ok(());
+        if !has_meta {
+            return conn
+                .execute_batch(&format!("BEGIN IMMEDIATE;\n{SCHEMA_SQL}\nCOMMIT;"))
+                .map_err(backend);
         }
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{SCHEMA_SQL}\nCOMMIT;"))
-            .map_err(backend)
+        match read_schema_version(&conn)? {
+            SCHEMA_VERSION => Ok(()),
+            1 => migrate_v1_to_v2(&conn),
+            v => Err(StoreError::Backend(format!(
+                "unsupported schema version {v} (this build supports 1..={SCHEMA_VERSION})"
+            ))),
+        }
     }
 
     pub fn schema_version(&self) -> Result<i64, StoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .map_err(backend)?
-        .parse()
-        .map_err(|e| StoreError::Backend(format!("schema_version: {e}")))
+        read_schema_version(&conn)
     }
 
     pub fn journal_mode(&self) -> Result<String, StoreError> {
@@ -158,6 +162,75 @@ impl SqliteStore {
         let conn = self.conn.lock().expect("store mutex poisoned");
         f(&conn)
     }
+}
+
+fn read_schema_version(conn: &Connection) -> Result<i64, StoreError> {
+    conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .map_err(backend)?
+    .parse()
+    .map_err(|e| StoreError::Backend(format!("schema_version: {e}")))
+}
+
+/// v1 -> v2 rebuilds `issues` because SQLite cannot alter a CHECK constraint in place. `issues_new`
+/// carries the widened `status` CHECK; every other column is copied verbatim. `issues` has no indexes
+/// of its own (only the inline PRIMARY KEY / UNIQUE constraints, which the new table declares too).
+const MIGRATE_V1_TO_V2_SQL: &str = "
+CREATE TABLE issues_new (
+  id         TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL UNIQUE,
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL DEFAULT '',
+  type       TEXT NOT NULL CHECK (type IN ('task','review','epic')),
+  status     TEXT NOT NULL CHECK (status IN ('backlog','ready','in-progress','blocked','in-review','validating','done','cancelled')),
+  priority   INTEGER NOT NULL DEFAULT 2,
+  parent_id  TEXT REFERENCES issues(id),
+  file_scope TEXT NOT NULL DEFAULT '[]',
+  acceptance TEXT NOT NULL DEFAULT '[]',
+  estimate   TEXT,
+  labels     TEXT NOT NULL DEFAULT '[]',
+  source     TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  closed_at  TEXT
+);
+INSERT INTO issues_new (id, uid, title, body, type, status, priority, parent_id, file_scope, acceptance,
+                        estimate, labels, source, created_at, updated_at, closed_at)
+  SELECT id, uid, title, body, type, status, priority, parent_id, file_scope, acceptance,
+         estimate, labels, source, created_at, updated_at, closed_at FROM issues;
+DROP TABLE issues;
+ALTER TABLE issues_new RENAME TO issues;
+UPDATE meta SET value = '2' WHERE key = 'schema_version';
+";
+
+/// Foreign keys stay OFF for the whole rebuild window: `PRAGMA foreign_keys` is a no-op inside a
+/// transaction, and with them ON `DROP TABLE issues` would run an implicit `DELETE` that trips every
+/// child table (`comments`, `runs`, `claims`, ...). They are switched back ON even when the rebuild fails.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StoreError> {
+    conn.pragma_update(None, "foreign_keys", "OFF").map_err(backend)?;
+    let rebuilt = rebuild_issues_v2(conn);
+    let restored = conn.pragma_update(None, "foreign_keys", "ON").map_err(backend);
+    rebuilt.and(restored)
+}
+
+fn rebuild_issues_v2(conn: &Connection) -> Result<(), StoreError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(backend)?;
+    // Another process may have finished the migration while this one waited for the write lock.
+    if read_schema_version(&tx)? != 1 {
+        return Ok(());
+    }
+    tx.execute_batch(MIGRATE_V1_TO_V2_SQL).map_err(backend)?;
+    // Dropping `tx` on this error path rolls the whole rebuild back.
+    let dangling: i64 = tx
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+        .map_err(backend)?;
+    if dangling > 0 {
+        return Err(StoreError::Backend(format!(
+            "schema migration 1 -> 2 would leave {dangling} dangling foreign key reference(s)"
+        )));
+    }
+    tx.commit().map_err(backend)
 }
 
 fn validate_globs(scope: &[String]) -> Result<(), StoreError> {
@@ -681,5 +754,31 @@ impl IssueStore for SqliteStore {
 
     fn update_merge(&self, id: i64, p: &MergePatch) -> Result<MergeItem, StoreError> {
         runs::update_merge(self, id, p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rebuild switches `foreign_keys` OFF on the shared connection; it must come back ON, or every
+    /// later write on this store would silently skip referential checks.
+    #[test]
+    fn foreign_keys_are_on_again_after_migrating_a_v1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(include_str!("../tests/fixtures/schema_v1.sql"))
+            .unwrap();
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let on: i64 = store
+            .read(|c| {
+                c.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                    .map_err(backend)
+            })
+            .unwrap();
+        assert_eq!(on, 1);
     }
 }

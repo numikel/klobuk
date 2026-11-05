@@ -82,12 +82,13 @@ pub enum Status {
     InProgress,
     Blocked,
     InReview,
+    Validating,
     Done,
     Cancelled,
 }
 str_enum!(Status, "status", {
     Backlog => "backlog", Ready => "ready", InProgress => "in-progress", Blocked => "blocked",
-    InReview => "in-review", Done => "done", Cancelled => "cancelled",
+    InReview => "in-review", Validating => "validating", Done => "done", Cancelled => "cancelled",
 });
 
 impl Status {
@@ -294,6 +295,20 @@ mod tests {
         assert!(Status::Done.is_terminal());
         assert!(Status::Cancelled.is_terminal());
         assert!(!Status::Ready.is_terminal());
+    }
+
+    #[test]
+    fn validating_sits_between_in_review_and_done() {
+        assert_eq!(Status::Validating.to_string(), "validating");
+        assert_eq!("validating".parse::<Status>().unwrap(), Status::Validating);
+        assert_eq!(
+            serde_json::to_string(&Status::Validating).unwrap(),
+            "\"validating\""
+        );
+        assert!(!Status::Validating.is_terminal());
+        let pos = |s: Status| Status::ALL.iter().position(|x| *x == s).unwrap();
+        assert_eq!(pos(Status::Validating), pos(Status::InReview) + 1);
+        assert_eq!(pos(Status::Done), pos(Status::Validating) + 1);
     }
 
     #[test]

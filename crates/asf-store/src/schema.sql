@@ -1,4 +1,5 @@
--- asf store schema v1. Applied inside one transaction by SqliteStore::migrate.
+-- asf store schema v2. Applied inside one transaction by SqliteStore::migrate on a fresh database.
+-- v1 -> v2 (adds 'validating' to issues.status) is the in-place rebuild in SqliteStore::migrate.
 
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
@@ -20,7 +21,7 @@ CREATE TABLE issues (
   title      TEXT NOT NULL,
   body       TEXT NOT NULL DEFAULT '',
   type       TEXT NOT NULL CHECK (type IN ('task','review','epic')),
-  status     TEXT NOT NULL CHECK (status IN ('backlog','ready','in-progress','blocked','in-review','done','cancelled')),
+  status     TEXT NOT NULL CHECK (status IN ('backlog','ready','in-progress','blocked','in-review','validating','done','cancelled')),
   priority   INTEGER NOT NULL DEFAULT 2,
   parent_id  TEXT REFERENCES issues(id),
   file_scope TEXT NOT NULL DEFAULT '[]',
@@ -123,4 +124,4 @@ CREATE TABLE events (
   payload  TEXT NOT NULL DEFAULT '{}'
 );
 
-INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+INSERT INTO meta (key, value) VALUES ('schema_version', '2');

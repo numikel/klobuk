@@ -190,7 +190,7 @@ pub fn run(cli: &Cli) -> Result<Rendered, AppError> {
     let db = match (ctx.store.schema_version(), ctx.store.repo()) {
         (Ok(v), Ok(repo)) => Check {
             name: "database",
-            ok: v == 1,
+            ok: v == asf_store::SCHEMA_VERSION,
             required: true,
             detail: format!(
                 "schema {v}, prefix {}, next_seq {}",
