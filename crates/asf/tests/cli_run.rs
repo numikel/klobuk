@@ -637,3 +637,102 @@ fn verify_is_refused_inside_a_worker_run() {
     assert_eq!(v["error"]["code"], "forbidden", "{v}");
     assert_eq!(active_run(&f).state, RunState::Finishing, "nothing was verified");
 }
+
+// ---- report verification ----------------------------------------------------------------------
+
+/// Like `worker_finishes`, but with the given report text.
+fn worker_finishes_with(f: &F, report_text: &str) {
+    commit_in(&wt(f), "src/greet.rs", "pub fn hello() {}\n");
+    let report = wt(f)
+        .join(".factory")
+        .join("runs")
+        .join(&f.issue)
+        .join("report.md");
+    std::fs::write(&report, report_text).unwrap();
+    f.repo.ok(&[
+        "--lane",
+        &f.issue,
+        "issue",
+        "finish",
+        &f.issue,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+}
+
+fn issue_status(f: &F) -> String {
+    f.repo.ok(&["issue", "show", &f.issue])["issue"]["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn archived_report(f: &F) -> PathBuf {
+    f.repo
+        .path()
+        .join(".factory")
+        .join("runs")
+        .join(active_run(f).id)
+        .join("report.md")
+}
+
+#[test]
+fn clean_report_sets_validating_and_archives_report_under_the_run_id() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes_with(&f, "# done\n\n## Open questions\n\nNone.\n");
+    let res = f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(res["to"], "succeeded", "{res}");
+    assert_eq!(issue_status(&f), "validating");
+    assert_eq!(
+        std::fs::read_to_string(archived_report(&f)).unwrap(),
+        "# done\n\n## Open questions\n\nNone.\n",
+        "report.md is copied to <root>/.factory/runs/<run-id>/"
+    );
+    assert_eq!(blockers(&f), 0);
+}
+
+#[test]
+fn report_with_open_questions_fails_verification_and_blocks_the_issue() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes_with(&f, "# done\n\n## OPEN QUESTIONS\n\n- should hello() print?\n");
+    let res = f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(res["to"], "failed", "{res}");
+    assert_eq!(issue_status(&f), "blocked");
+    assert_eq!(active_run(&f).state, RunState::Failed);
+    let cs = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
+    let b = cs
+        .iter()
+        .find(|c| c.kind == CommentType::Blocker && c.body.to_lowercase().contains("open questions"))
+        .expect("BLOCKER naming the open questions");
+    assert_eq!(b.to_lane, "human");
+    assert!(store(&f).merge_queue().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(archived_report(&f)).unwrap(),
+        "# done\n\n## OPEN QUESTIONS\n\n- should hello() print?\n",
+        "the report is archived first, even when verification fails"
+    );
+}
+
+#[test]
+fn empty_open_questions_heading_is_not_a_problem() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes_with(&f, "# done\n\n## Open questions\n\n## Notes\n\nfine\n");
+    let res = f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(res["to"], "succeeded", "{res}");
+    assert_eq!(issue_status(&f), "validating");
+}
+
+#[test]
+fn failed_gate_also_blocks_the_issue_and_archives_the_report() {
+    let f = setup();
+    add_fixed_file_gate(&f);
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "failed", "{res}");
+    assert_eq!(issue_status(&f), "blocked");
+    assert!(archived_report(&f).is_file());
+}

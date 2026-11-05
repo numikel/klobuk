@@ -33,6 +33,16 @@ pub struct StartResult {
     pub trusted: bool,
 }
 
+/// Everything `launch` needs beyond the run itself.
+struct Launch<'a> {
+    run: &'a Run,
+    wt_abs: &'a Path,
+    label: String,
+    settings_path: PathBuf,
+    model: Option<String>,
+    kick: String,
+}
+
 #[derive(Serialize)]
 pub struct Transition {
     pub run_id: String,
@@ -95,6 +105,76 @@ fn vcs_err(e: VcsError) -> AppError {
         VcsError::Git(m) => AppError::new(ErrorCode::Backend, m),
         VcsError::Io(m) => AppError::io(m),
     }
+}
+
+/// Tools a reviewer may use (gate commands are appended): reading, the two read-only git views, and `asf`.
+#[allow(dead_code)] // wired into the merge flow by asf-21
+const REVIEW_TOOLS: [&str; 6] = [
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(git diff *)",
+    "Bash(git log *)",
+    "Bash(asf *)",
+];
+/// Denied outright, so `permission_mode = auto` can never approve an edit for a reviewer.
+#[allow(dead_code)] // wired into the merge flow by asf-21
+const REVIEW_DENY: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Run `git` in `dir` and return trimmed stdout (for what `asf_vcs::GitCli` does not offer).
+#[allow(dead_code)] // wired into the merge flow by asf-21
+fn git_out(dir: &Path, args: &[&str]) -> Result<String, AppError> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| AppError::io(format!("cannot run git: {e}")))?;
+    if !out.status.success() {
+        return Err(AppError::new(
+            ErrorCode::Backend,
+            format!(
+                "git {} (in {}): {}",
+                args.join(" "),
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Body lines of every `Open questions` heading (any level, case-insensitive, optional trailing colon)
+/// that hold real content. A section that only says "None" (or `n/a`, `-`, ...) counts as empty.
+pub(crate) fn open_questions(report: &str) -> Vec<String> {
+    fn heading(line: &str) -> Option<&str> {
+        let t = line.trim_start();
+        let rest = t.trim_start_matches('#');
+        let level = t.len() - rest.len();
+        ((1..=6).contains(&level) && rest.starts_with(char::is_whitespace))
+            .then(|| rest.trim().trim_end_matches(':').trim())
+    }
+    fn is_none(line: &str) -> bool {
+        let t = line
+            .trim()
+            .trim_start_matches(['-', '*', '+'])
+            .trim()
+            .trim_end_matches(['.', '!'])
+            .to_lowercase();
+        matches!(
+            t.as_str(),
+            "" | "none" | "n/a" | "na" | "nothing" | "no" | "no open questions" | "brak"
+        )
+    }
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in report.lines() {
+        if let Some(h) = heading(line) {
+            inside = h.eq_ignore_ascii_case("open questions");
+        } else if inside && !is_none(line) {
+            out.push(line.trim_end().to_string());
+        }
+    }
+    out
 }
 
 fn tail(s: &str, n: usize) -> String {
@@ -302,12 +382,37 @@ impl<'a> Worker<'a> {
             rollback(e)
         };
         let settings_path = self.write_brief_files(&issue, &run, &wt_abs).map_err(fail_run)?;
+        self.launch(
+            &Launch {
+                run: &run,
+                wt_abs: &wt_abs,
+                label: format!("{id} {}", issue.title),
+                settings_path,
+                model: self.ctx.config.worker.model.clone(),
+                kick: format!("Start {id}: read {FACTORY_DIR}/{RUNS_DIR}/{id}/brief.md and follow it."),
+            },
+            &fail_run,
+        )
+    }
 
+    /// Open the runtime workspace, start Claude with the prepared settings, send the kick-off prompt
+    /// and mark the run `working`. Shared by workers and reviewers; `fail_run` undoes whatever the
+    /// caller set up when a step before the agent exists fails.
+    fn launch(
+        &self,
+        l: &Launch<'_>,
+        fail_run: &dyn Fn(AppError) -> AppError,
+    ) -> Result<StartResult, AppError> {
+        let store = &self.ctx.store;
+        let run = l.run.clone();
+        let id = &run.issue_id;
+        let wt_abs = l.wt_abs;
+        let settings_path = &l.settings_path;
         let ws = self
             .rt
             .open_workspace(&OpenWorkspace {
-                cwd: wt_abs.clone(),
-                label: format!("{id} {}", issue.title),
+                cwd: wt_abs.to_path_buf(),
+                label: l.label.clone(),
                 env: vec![
                     (ENV_ISSUE.into(), id.to_string()),
                     (crate::commands::hook::ENV_RUN.into(), run.id.clone()),
@@ -333,7 +438,10 @@ impl<'a> Worker<'a> {
                 ("issue".into(), id.to_string()),
                 (
                     "budget".into(),
-                    format!("{:.2}", self.ctx.config.worker.budget_usd),
+                    format!(
+                        "{:.2}",
+                        run.budget_usd.unwrap_or(self.ctx.config.worker.budget_usd)
+                    ),
                 ),
             ],
         );
@@ -341,11 +449,11 @@ impl<'a> Worker<'a> {
             "--permission-mode".to_string(),
             self.ctx.config.worker.permission_mode.clone(),
             "--settings".to_string(),
-            fwd(&settings_path),
+            fwd(settings_path),
             "--session-id".to_string(),
             session_id,
         ];
-        if let Some(m) = &self.ctx.config.worker.model {
+        if let Some(m) = &l.model {
             args.push("--model".into());
             args.push(m.clone());
         }
@@ -404,10 +512,9 @@ impl<'a> Worker<'a> {
             }
             Err(e) => return Err(self.block_start(&run, &handle, e)),
         };
-        let kick = format!("Start {id}: read {FACTORY_DIR}/{RUNS_DIR}/{id}/brief.md and follow it.");
         let agent = match self.rt.prompt(
             &handle,
-            &kick,
+            &l.kick,
             &[AgentState::Working],
             self.ctx.config.worker.prompt_timeout_ms,
         ) {
@@ -447,6 +554,212 @@ impl<'a> Worker<'a> {
             agent,
             trusted,
         })
+    }
+
+    /// The review child of `issue`: reuse the open one, else create it `ready` (the claim moves it to
+    /// `in-progress`). It carries the worker's file scope so the scheduler sees the same footprint.
+    #[allow(dead_code)] // wired into the merge flow by asf-21
+    fn review_issue(&self, issue: &Issue) -> Result<Issue, AppError> {
+        let title = format!("Review {}: {}", issue.id, issue.title);
+        let store = &self.ctx.store;
+        let open = store
+            .list_issues(&IssueFilter {
+                kind: Some(IssueType::Review),
+                parent: Some(issue.id.clone()),
+                ..IssueFilter::default()
+            })?
+            .into_iter()
+            .rfind(|i| i.title == title && !i.status.is_terminal());
+        if let Some(i) = open {
+            return Ok(i);
+        }
+        Ok(store.create_issue(&NewIssue {
+            title,
+            body: format!(
+                "Read-only review of {} on branch feat/{}. The verdict is the DECISION comment the reviewer posts on {}.",
+                issue.id, issue.id, issue.id
+            ),
+            kind: IssueType::Review,
+            status: Status::Ready,
+            priority: issue.priority,
+            parent_id: Some(issue.id.clone()),
+            file_scope: issue.file_scope.clone(),
+            acceptance: issue.acceptance.clone(),
+            ..NewIssue::default()
+        })?)
+    }
+
+    /// A worktree at `sha` with a detached HEAD, so the branch itself stays checked out where it is
+    /// (git refuses to check one branch out twice). An existing one is moved to `sha`.
+    #[allow(dead_code)] // wired into the merge flow by asf-21
+    fn detached_worktree(&self, wt_abs: &Path, sha: &str) -> Result<(), AppError> {
+        if wt_abs.exists() {
+            if !wt_abs.join(".git").exists() {
+                return Err(AppError::conflict(format!(
+                    "{} already exists and is not a worktree",
+                    wt_abs.display()
+                )));
+            }
+            if git_out(wt_abs, &["rev-parse", "HEAD"])? != sha {
+                git_out(wt_abs, &["checkout", "--detach", sha])?;
+            }
+            return Ok(());
+        }
+        if let Some(parent) = wt_abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        git_out(
+            &self.ctx.root,
+            &["worktree", "add", "--detach", &fwd(wt_abs), sha],
+        )?;
+        Ok(())
+    }
+
+    /// Brief, settings and `CLAUDE.local.md` of a reviewer. Edit and Write are neither allowed nor
+    /// reachable: they are denied outright, and the `Stop` hook is dropped because it would push a
+    /// reviewer (who never runs `issue finish`) through the worker's finish ritual.
+    #[allow(dead_code)] // wired into the merge flow by asf-21
+    fn write_review_files(
+        &self,
+        issue: &Issue,
+        run: &Run,
+        review: &Run,
+        wt_abs: &Path,
+    ) -> Result<PathBuf, AppError> {
+        let asf_bin = crate::ctx::asf_bin();
+        let gates: Vec<String> = self.ctx.config.gates.iter().map(|g| g.cmd.join(" ")).collect();
+        let runs_dir = Self::runs_dir(wt_abs, &review.issue_id);
+        std::fs::create_dir_all(&runs_dir)?;
+        let brief = asf_core::brief::render_review_brief(&asf_core::brief::ReviewInput {
+            issue,
+            base_sha: &run.base_sha,
+            worktree: &review.worktree,
+            branch: &run.branch,
+            gates: &gates,
+            asf_bin: &asf_bin,
+        });
+        std::fs::write(runs_dir.join("brief.md"), brief)?;
+
+        let mut allowed: Vec<String> = REVIEW_TOOLS.iter().map(|t| t.to_string()).collect();
+        allowed.extend(gates.iter().map(|g| format!("Bash({g})")));
+        let mut deny = self.ctx.config.worker.deny.clone();
+        for t in REVIEW_DENY {
+            if !deny.iter().any(|d| d == t) {
+                deny.push(t.to_string());
+            }
+        }
+        let mut settings = render_settings(&SettingsInput {
+            asf_bin: &asf_bin,
+            allowed_tools: &allowed,
+            deny: &deny,
+            scope: &[],
+            hook_timeout_s: HOOK_TIMEOUT_S,
+        });
+        if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+            hooks.remove("Stop");
+        }
+        let settings_path = runs_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).map_err(|e| AppError::io(e.to_string()))?,
+        )?;
+        let brief_rel = format!("{FACTORY_DIR}/{RUNS_DIR}/{}/brief.md", review.issue_id);
+        std::fs::write(
+            wt_abs.join("CLAUDE.local.md"),
+            format!(
+                "# Reviewer {rid}\n\nYou are the read-only reviewer of `{issue}`. Your full brief is in `{brief_rel}` — read it \
+                 first and follow its Review steps and Verdict. Never edit, create or delete files.\n",
+                rid = review.issue_id,
+                issue = issue.id
+            ),
+        )?;
+        Ok(settings_path)
+    }
+
+    /// Start the read-only reviewer for `issue`, whose worker ran as `run`: a child `review` issue
+    /// (`Review <id>: <title>`, same file scope, `in-progress`), a detached worktree at
+    /// `.worktrees/<review-id>` on the branch tip, and Claude on `[review] model` with read-only tools.
+    ///
+    /// Idempotent: the review issue and its worktree are reused, and a review run that is still
+    /// active is returned as it is instead of starting a second agent. The review issue's id is the
+    /// reviewer's lane, so its comments are authored `agent:<review-id>`.
+    #[allow(dead_code)] // wired into the merge flow by asf-21
+    pub fn start_review(&self, issue: &Issue, run: &Run) -> Result<StartResult, AppError> {
+        let store = &self.ctx.store;
+        let review = self.review_issue(issue)?;
+        let rid = review.id.clone();
+
+        if let Some(active) = store.runs(Some(&rid), true)?.into_iter().last() {
+            let agent = self.rt.info(&Self::handle(&active)?).map_err(rt_err)?;
+            return Ok(StartResult {
+                workspace_id: active.workspace_id.clone().unwrap_or_default(),
+                pane_id: active.pane_id.clone().unwrap_or_default(),
+                run: active,
+                agent,
+                trusted: false,
+            });
+        }
+
+        let sha = git_out(
+            &self.ctx.root,
+            &["rev-parse", "--verify", &format!("refs/heads/{}", run.branch)],
+        )?;
+        let wt_rel = self.worktree_rel(&rid);
+        let wt_abs = self.ctx.root.join(&wt_rel);
+        self.detached_worktree(&wt_abs, &sha)?;
+
+        // A claim left over from a crashed review is dropped; the claim itself moves the issue to in-progress.
+        if store.active_claims()?.iter().any(|c| c.issue_id == rid) {
+            store.release(&rid)?;
+        }
+        if store.get_issue(&rid)?.map(|i| i.status) != Some(Status::Ready) {
+            store.set_status(&rid, Status::Ready, LANE_ORCHESTRATOR)?;
+        }
+        store.claim(
+            &rid,
+            &NewClaim {
+                worker: rid.to_string(),
+                run_id: None,
+                worktree: Some(wt_rel.clone()),
+                branch: Some(run.branch.clone()),
+                note: Some("asf review".into()),
+            },
+        )?;
+        let release = |e: AppError| -> AppError {
+            let _ = store.release(&rid);
+            e
+        };
+        self.rt.health().map_err(rt_err).map_err(release)?;
+        let rrun = store
+            .create_run(&NewRun {
+                issue_id: rid.clone(),
+                runtime: self.ctx.config.worker.runtime.clone(),
+                worktree: wt_rel,
+                branch: run.branch.clone(),
+                base_sha: run.base_sha.clone(),
+                budget_usd: Some(self.ctx.config.worker.budget_usd),
+            })
+            .map_err(AppError::from)
+            .map_err(release)?;
+        store.set_claim_run(&rid, &rrun.id)?;
+        let fail_run = |e: AppError| -> AppError {
+            let _ = self.set_state(&rrun, RunState::Failed, Some(e.message.clone()));
+            release(e)
+        };
+        let settings_path = self
+            .write_review_files(issue, run, &rrun, &wt_abs)
+            .map_err(fail_run)?;
+        self.launch(
+            &Launch {
+                run: &rrun,
+                wt_abs: &wt_abs,
+                label: format!("{rid} {}", review.title),
+                settings_path,
+                model: Some(self.ctx.config.review.model.clone()),
+                kick: format!("Start {rid}: read {FACTORY_DIR}/{RUNS_DIR}/{rid}/brief.md and follow it."),
+            },
+            &fail_run,
+        )
     }
 
     /// Startup could not reach a working agent: keep the claim and workspace for inspection, tell the human.
@@ -645,11 +958,40 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Copy the worker's report to `<root>/.factory/runs/<run-id>/report.md` (the worktree copy dies
+    /// with `lane clean`) and return its text. The error string becomes a verification problem.
+    fn archive_report(&self, run: &Run, wt_abs: &Path) -> Result<String, String> {
+        let src = match &run.report_path {
+            Some(p) if Path::new(p).is_absolute() => PathBuf::from(p),
+            Some(p) => wt_abs.join(p),
+            None => Self::runs_dir(wt_abs, &run.issue_id).join("report.md"),
+        };
+        let text = std::fs::read(&src).map_err(|e| format!("report {} is unreadable: {e}", src.display()))?;
+        let dest_dir = self.ctx.root.join(FACTORY_DIR).join(RUNS_DIR).join(&run.id);
+        std::fs::create_dir_all(&dest_dir)
+            .and_then(|_| std::fs::write(dest_dir.join("report.md"), &text))
+            .map_err(|e| format!("cannot archive the report to {}: {e}", dest_dir.display()))?;
+        Ok(String::from_utf8_lossy(&text).into_owned())
+    }
+
     /// Independent verification after the worker's finish ritual.
     fn verify(&self, run: &Run, issue: &Issue) -> Result<Transition, AppError> {
         let wt_abs = self.ctx.root.join(&run.worktree);
         let mut problems: Vec<String> = Vec::new();
         self.set_state(run, RunState::Verifying, None)?;
+        // The report first: whatever else fails, the human gets the worker's own account of the run.
+        match self.archive_report(run, &wt_abs) {
+            Ok(text) => {
+                let open = open_questions(&text);
+                if !open.is_empty() {
+                    problems.push(format!(
+                        "report has unresolved open questions (ask them as QUESTION comments and finish again):\n{}",
+                        open.join("\n")
+                    ));
+                }
+            }
+            Err(e) => problems.push(e),
+        }
         let dirty = self.vcs.status_porcelain(&wt_abs).map_err(vcs_err)?;
         if !dirty.is_empty() {
             problems.push(format!("uncommitted changes in worktree: {}", dirty.join(", ")));
@@ -691,6 +1033,9 @@ impl<'a> Worker<'a> {
             let r = self.set_state(run, RunState::Succeeded, Some("verified".into()))?;
             self.ctx
                 .store
+                .set_status(&run.issue_id, Status::Validating, LANE_ORCHESTRATOR)?;
+            self.ctx
+                .store
                 .enqueue_merge(&run.issue_id, Some(&run.id), &run.branch)?;
             let _ = self.rt.notify(
                 &format!("asf {} verified", run.issue_id),
@@ -707,6 +1052,9 @@ impl<'a> Worker<'a> {
         } else {
             let reason = problems.join("\n");
             self.set_state(run, RunState::Failed, Some(reason.clone()))?;
+            self.ctx
+                .store
+                .set_status(&run.issue_id, Status::Blocked, LANE_ORCHESTRATOR)?;
             self.blocker(
                 run,
                 format!(
@@ -762,4 +1110,247 @@ pub fn run_line(r: &Run) -> String {
 
 pub fn start_json(s: &StartResult) -> serde_json::Value {
     json!({ "run": s.run, "workspace_id": s.workspace_id, "pane_id": s.pane_id, "agent": s.agent, "trusted": s.trusted })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asf_runtime::FakeRuntime;
+    use asf_store::SqliteStore;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn open_questions_reads_only_real_content_under_the_heading() {
+        assert!(open_questions("# done\n\n## Open questions\n\nNone.\n").is_empty());
+        assert!(open_questions("## Open questions:\n- n/a\n\n## Notes\nfine\n").is_empty());
+        assert!(
+            open_questions("## Notes\n- should we?\n").is_empty(),
+            "other sections are ignored"
+        );
+        assert_eq!(
+            open_questions("# r\n### OPEN QUESTIONS\n- one?\n- two?\n## Next\nx\n"),
+            ["- one?", "- two?"]
+        );
+        assert_eq!(
+            open_questions("## Open Questions\nWhich crate?"),
+            ["Which crate?"]
+        );
+        assert!(
+            open_questions("#hashtag open questions\nx").is_empty(),
+            "a heading needs a space after #"
+        );
+    }
+
+    struct Fx {
+        dir: tempfile::TempDir,
+        ctx: Ctx,
+        issue: Issue,
+        run: Run,
+    }
+
+    /// A repo with a worker branch `feat/asf-1` (one commit ahead of `main`) in its own worktree.
+    fn fixture() -> Fx {
+        let dir = tempfile::Builder::new().prefix("asf-wk-").tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&root, &["add", "a.txt"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        std::fs::create_dir_all(root.join(FACTORY_DIR)).unwrap();
+        let store = SqliteStore::open(&root.join(FACTORY_DIR).join("factory.db")).unwrap();
+        store.init_repo(&fwd(&root), "asf", "main").unwrap();
+        let mut config = Config::default();
+        config.gates = vec![asf_core::config::GateCfg {
+            name: "fmt".into(),
+            cmd: vec!["cargo".into(), "fmt".into(), "--check".into()],
+            ..asf_core::config::GateCfg::default()
+        }];
+        let ctx = Ctx {
+            root: root.clone(),
+            config,
+            store,
+            lane: LANE_ORCHESTRATOR.into(),
+        };
+        let issue = ctx
+            .store
+            .create_issue(&NewIssue {
+                title: "add greeting".into(),
+                status: Status::Ready,
+                file_scope: vec!["src/**".into()],
+                acceptance: vec![Acceptance {
+                    text: "prints hello".into(),
+                    verify: None,
+                }],
+                ..NewIssue::default()
+            })
+            .unwrap();
+        let wt = root.join(".worktrees").join("asf-1");
+        let base = GitCli.worktree_add(&root, &wt, "feat/asf-1", "main").unwrap();
+        std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+        git(&wt, &["add", "b.txt"]);
+        git(&wt, &["commit", "-q", "-m", "work"]);
+        let run = ctx
+            .store
+            .create_run(&NewRun {
+                issue_id: issue.id.clone(),
+                runtime: "fake".into(),
+                worktree: ".worktrees/asf-1".into(),
+                branch: "feat/asf-1".into(),
+                base_sha: base,
+                budget_usd: Some(5.0),
+            })
+            .unwrap();
+        Fx { dir, ctx, issue, run }
+    }
+
+    fn fake_path(fx: &Fx) -> PathBuf {
+        fx.dir.path().join(FACTORY_DIR).join("fake-runtime.json")
+    }
+
+    fn worker(fx: &Fx) -> Worker<'_> {
+        Worker {
+            ctx: &fx.ctx,
+            rt: Box::new(FakeRuntime::new(fake_path(fx))),
+            vcs: GitCli,
+        }
+    }
+
+    fn reviews(fx: &Fx) -> Vec<Issue> {
+        fx.ctx
+            .store
+            .list_issues(&IssueFilter {
+                kind: Some(IssueType::Review),
+                ..IssueFilter::default()
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn start_review_twice_reuses_the_review_issue_and_its_detached_worktree() {
+        let fx = fixture();
+        let root = fx.dir.path();
+        let w = worker(&fx);
+        let tip = git(root, &["rev-parse", "feat/asf-1"]);
+
+        let first = w.start_review(&fx.issue, &fx.run).unwrap();
+        let review = first.run.issue_id.clone();
+        assert_eq!(first.run.state, RunState::Working);
+
+        let rs = reviews(&fx);
+        assert_eq!(rs.len(), 1);
+        let r = &rs[0];
+        assert_eq!(r.id, review);
+        assert_eq!(r.title, "Review asf-1: add greeting");
+        assert_eq!(r.parent_id.as_ref(), Some(&fx.issue.id));
+        assert_eq!(r.file_scope, fx.issue.file_scope);
+        assert_eq!(r.status, Status::InProgress);
+
+        // detached worktree at the branch tip; the branch stays checked out in its own worktree
+        let wt = root.join(".worktrees").join(review.as_str());
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), tip);
+        assert!(
+            Command::new("git")
+                .args(["symbolic-ref", "-q", "HEAD"])
+                .current_dir(&wt)
+                .status()
+                .unwrap()
+                .code()
+                != Some(0),
+            "HEAD must be detached"
+        );
+        assert_eq!(
+            git(
+                &root.join(".worktrees").join("asf-1"),
+                &["rev-parse", "--abbrev-ref", "HEAD"]
+            ),
+            "feat/asf-1"
+        );
+
+        // brief, read-only settings and the model for the reviewer
+        let runs_dir = wt.join(FACTORY_DIR).join(RUNS_DIR).join(review.as_str());
+        let brief = std::fs::read_to_string(runs_dir.join("brief.md")).unwrap();
+        assert!(
+            brief.contains("# Review asf-1: add greeting") && brief.contains("cargo fmt --check"),
+            "{brief}"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(runs_dir.join("settings.json")).unwrap()).unwrap();
+        let strs = |k: &str| -> Vec<String> {
+            settings["permissions"][k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let allow = strs("allow");
+        for t in [
+            "Read",
+            "Grep",
+            "Glob",
+            "Bash(git diff *)",
+            "Bash(git log *)",
+            "Bash(asf *)",
+            "Bash(cargo fmt --check)",
+        ] {
+            assert!(allow.iter().any(|a| a == t), "{t} missing in {allow:?}");
+        }
+        assert!(
+            !allow
+                .iter()
+                .any(|a| a.starts_with("Edit") || a.starts_with("Write")),
+            "{allow:?}"
+        );
+        let deny = strs("deny");
+        for t in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+            assert!(deny.iter().any(|d| d == t), "{t} missing in {deny:?}");
+        }
+        let log = FakeRuntime::new(fake_path(&fx)).log();
+        let start = log.iter().find(|e| e.op == "start_agent").unwrap();
+        let args: Vec<&str> = start.args["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(args.windows(2).any(|p| p == ["--model", "opus"]), "{args:?}");
+
+        // second call: same issue, same worktree, same (still active) run, no second agent
+        let second = w.start_review(&fx.issue, &fx.run).unwrap();
+        assert_eq!(second.run.id, first.run.id);
+        assert_eq!(reviews(&fx).len(), 1);
+        assert_eq!(
+            git(root, &["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            3
+        );
+        let log = FakeRuntime::new(fake_path(&fx)).log();
+        assert_eq!(log.iter().filter(|e| e.op == "start_agent").count(), 1);
+    }
+
+    #[test]
+    fn start_review_after_an_aborted_review_run_starts_a_new_run_on_the_same_issue() {
+        let fx = fixture();
+        let w = worker(&fx);
+        let first = w.start_review(&fx.issue, &fx.run).unwrap();
+        w.abort(&first.run.issue_id).unwrap();
+        let again = w.start_review(&fx.issue, &fx.run).unwrap();
+        assert_eq!(again.run.issue_id, first.run.issue_id);
+        assert_ne!(again.run.id, first.run.id);
+        assert_eq!(again.run.state, RunState::Working);
+        assert_eq!(reviews(&fx).len(), 1);
+    }
 }

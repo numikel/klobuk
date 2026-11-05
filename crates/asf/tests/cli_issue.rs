@@ -203,3 +203,100 @@ fn deps_add_rm_cycle_and_ready_promotion() {
     let (_, ecode, _) = r.err(&["issue", "dep", "rm", &b, &a]);
     assert_eq!(ecode, "not_found");
 }
+
+// ---- `asf issue finish` guard -----------------------------------------------------------------
+
+fn report_file(r: &Repo, name: &str) -> String {
+    let p = r.path().join(name);
+    std::fs::write(&p, "# done\n").unwrap();
+    p.to_string_lossy().replace('\\', "/")
+}
+
+#[test]
+fn finish_is_refused_while_a_question_to_human_is_unanswered() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let report = report_file(&r, "report.md");
+    let q = r.ok(&[
+        "--lane",
+        &a,
+        "issue",
+        "comment",
+        &a,
+        "--type",
+        "QUESTION",
+        "--to",
+        "human",
+        "--body",
+        "which crate?",
+    ]);
+    let qid = q["id"].as_i64().unwrap().to_string();
+
+    let (code, ecode, msg) = r.err(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!((code, ecode.as_str()), (3, "conflict"), "{msg}");
+    assert!(msg.contains("QUESTION") && msg.contains("unanswered"), "{msg}");
+    assert_eq!(
+        r.ok(&["issue", "show", &a])["issue"]["status"],
+        "ready",
+        "a refused finish changes nothing"
+    );
+
+    // an unrelated ANSWER (no reply_to) does not resolve it
+    r.ok(&[
+        "--lane",
+        "human",
+        "issue",
+        "comment",
+        &a,
+        "--type",
+        "ANSWER",
+        "--to",
+        &a,
+        "--body",
+        "general remark",
+    ]);
+    let (code, _, _) = r.err(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(code, 3);
+
+    // the answer to that very question does
+    r.ok(&[
+        "--lane",
+        "human",
+        "issue",
+        "comment",
+        &a,
+        "--type",
+        "ANSWER",
+        "--to",
+        &a,
+        "--reply-to",
+        &qid,
+        "--body",
+        "asf-core",
+    ]);
+    let done = r.ok(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(done["issue"]["status"], "in-review");
+}
+
+#[test]
+fn finish_ignores_questions_that_are_not_to_human() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let b = r.create_issue("b", &["--ready"]);
+    let report = report_file(&r, "report.md");
+    r.ok(&[
+        "--lane",
+        &a,
+        "issue",
+        "comment",
+        &a,
+        "--type",
+        "QUESTION",
+        "--to",
+        &b,
+        "--body",
+        "peer question",
+    ]);
+    let done = r.ok(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(done["issue"]["status"], "in-review");
+}

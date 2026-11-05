@@ -356,11 +356,38 @@ struct FinishView {
     comment: Comment,
 }
 
+/// Ids of QUESTION comments to the human on this issue that nobody has answered yet. `resolved_at`
+/// is never written by the store, so a question counts as answered only when an ANSWER comment
+/// replies to it (`--reply-to`).
+fn unanswered_questions(comments: &[Comment]) -> Vec<i64> {
+    comments
+        .iter()
+        .filter(|q| q.kind == CommentType::Question && q.to_lane == LANE_HUMAN && q.resolved_at.is_none())
+        .filter(|q| {
+            !comments
+                .iter()
+                .any(|a| a.kind == CommentType::Answer && a.reply_to == Some(q.id))
+        })
+        .map(|q| q.id)
+        .collect()
+}
+
 fn finish(ctx: &Ctx, id: &IssueId, report: &Path) -> Result<Rendered, AppError> {
     if !report.is_file() {
         return Err(AppError::validation(format!(
             "report file {} does not exist",
             report.display()
+        )));
+    }
+    let open = unanswered_questions(&ctx.store.comments(id)?);
+    if !open.is_empty() {
+        let ids = open
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::conflict(format!(
+            "cannot finish {id}: a QUESTION to human is unanswered on the lane ({ids}); wait for the ANSWER (`asf issue inbox`) and finish again"
         )));
     }
     let report_str = report.to_string_lossy().replace('\\', "/");
