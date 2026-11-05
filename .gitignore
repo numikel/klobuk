@@ -9,6 +9,7 @@
 /plans/
 *.md
 !CLAUDE.md
+!README.md
 !methodologies/**/*.md
 !crates/**/README.md.keep
 
