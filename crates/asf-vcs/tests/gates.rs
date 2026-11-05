@@ -169,3 +169,57 @@ sys.exit(0 if not e else 101)",
         results[0].duration_ms
     );
 }
+
+mod stages {
+    use asf_core::config::{GateCfg, GateWhen};
+    use asf_vcs::gates::stage_specs;
+
+    fn gate(name: &str, when: Option<Vec<GateWhen>>) -> GateCfg {
+        let mut g = GateCfg {
+            name: name.into(),
+            cmd: vec!["true".into()],
+            ..GateCfg::default()
+        };
+        if let Some(w) = when {
+            g.when = w;
+        }
+        g
+    }
+
+    fn names(specs: &[asf_core::GateSpec]) -> Vec<&str> {
+        specs.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[test]
+    fn keeps_only_gates_that_run_in_the_stage_in_config_order() {
+        let gates = vec![
+            gate("v", Some(vec![GateWhen::Verify])),
+            gate("vm", Some(vec![GateWhen::Verify, GateWhen::Merge])),
+            gate("m", Some(vec![GateWhen::Merge])),
+            gate("main", Some(vec![GateWhen::Main])),
+        ];
+        assert_eq!(names(&stage_specs(&gates, GateWhen::Verify)), ["v", "vm"]);
+        assert_eq!(names(&stage_specs(&gates, GateWhen::Merge)), ["vm", "m"]);
+        assert_eq!(names(&stage_specs(&gates, GateWhen::Main)), ["main"]);
+    }
+
+    #[test]
+    fn a_gate_without_when_runs_in_every_stage() {
+        let gates = vec![gate("all", None)];
+        for stage in GateWhen::ALL {
+            assert_eq!(names(&stage_specs(&gates, stage)), ["all"], "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn carries_cmd_timeout_and_shell_over() {
+        let mut g = gate("x", None);
+        g.cmd = vec!["echo".into(), "hi".into()];
+        g.timeout_s = 7;
+        g.shell = Some("sh".into());
+        let specs = stage_specs(&[g], GateWhen::Merge);
+        assert_eq!(specs[0].cmd, ["echo", "hi"]);
+        assert_eq!(specs[0].timeout_s, 7);
+        assert_eq!(specs[0].shell.as_deref(), Some("sh"));
+    }
+}

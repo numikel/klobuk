@@ -493,3 +493,290 @@ fn tick_blocks_when_the_branch_gained_out_of_scope_commits_after_verification() 
         .iter()
         .any(|c| c.kind == CommentType::Blocker && c.body.contains("docs/sneaky.md")));
 }
+
+// ---- gate stages and the reviewer gate ----------------------------------------------------------
+
+/// Replaces `from` with `to` in the root config and commits it, so main stays clean for the fast-forward.
+fn set_config(f: &F, from: &str, to: &str) {
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains(from), "config template carries `{from}`");
+    std::fs::write(&cfg, s.replacen(from, to, 1)).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "config"]);
+}
+
+fn require_review(f: &F) {
+    set_config(f, "[review]\nrequired = false", "[review]\nrequired = true");
+}
+
+fn start_agents(f: &F) -> usize {
+    FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
+        .log()
+        .iter()
+        .filter(|e| e.op == "start_agent")
+        .count()
+}
+
+fn review_id(f: &F) -> String {
+    let reviews = store(f)
+        .list_issues(&IssueFilter {
+            kind: Some(IssueType::Review),
+            parent: Some(f.issue.parse().unwrap()),
+            ..IssueFilter::default()
+        })
+        .unwrap();
+    assert_eq!(reviews.len(), 1, "exactly one review issue: {reviews:?}");
+    reviews[0].id.to_string()
+}
+
+fn comment_count(f: &F) -> usize {
+    store(f).comments(&f.issue.parse().unwrap()).unwrap().len()
+}
+
+fn status_of(f: &F, id: &str) -> String {
+    f.repo.ok(&["issue", "show", id])["issue"]["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Posts a DECISION on the reviewed issue as the reviewer's lane (author `agent:<review-id>`).
+fn decide_as(f: &F, lane: &str, body: &str) {
+    f.repo.ok(&[
+        "--lane", lane, "issue", "comment", &f.issue, "--type", "DECISION", "--to", "human", "--body", body,
+    ]);
+}
+
+/// A finished, verified item with `[review] required = true`, ticked once into `reviewing`.
+fn reviewing() -> F {
+    let f = setup();
+    require_review(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    f
+}
+
+#[test]
+fn gates_run_in_the_merge_queue_only_when_their_when_lists_merge_or_main() {
+    let f = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\nopen(sys.argv[1], 'a').write(sys.argv[2] + ' ' + os.getcwd() + '\\n')\n",
+    )
+    .unwrap();
+    let log = dir.path().join("gate.log");
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let mut gates = String::new();
+    for (name, when) in [("v", "[\"verify\"]"), ("m", "[\"merge\"]"), ("r", "[\"main\"]")] {
+        gates.push_str(&format!(
+            "\n[[gate]]\nname = \"{name}\"\nwhen = {when}\ncmd = ['python', '{}', '{}', '{name}']\n",
+            fwd(&script),
+            fwd(&log)
+        ));
+    }
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("verify_main_after = false", "verify_main_after = true");
+    std::fs::write(&cfg, format!("{s}{gates}")).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "gates"]);
+
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let lines = |log: &Path| -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let before = lines(&log).len();
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(res["items"][0]["last_error"].is_null(), "{res}");
+
+    let ran = lines(&log)[before..].to_vec();
+    assert_eq!(ran.len(), 2, "only the merge and the main gate ran: {ran:?}");
+    assert!(
+        ran[0].starts_with("m ") && ran[0].contains(".worktrees"),
+        "merge gate in the worktree: {ran:?}"
+    );
+    assert!(
+        ran[1].starts_with("r ") && !ran[1].contains(".worktrees"),
+        "main gate in the root: {ran:?}"
+    );
+    let item = &store(&f).merge_queue().unwrap()[0];
+    let recorded: Vec<&str> = item.gate_results.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(recorded, ["m"], "the item records the gates it ran");
+}
+
+#[test]
+fn review_required_enters_reviewing_and_starts_the_reviewer_exactly_once() {
+    let f = setup();
+    require_review(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let agents = start_agents(&f);
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["processed"], 1, "{res}");
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(start_agents(&f), agents + 1, "start_review ran on the first tick");
+    assert!(!main_has(&f, "src/greet.rs"), "nothing merged before the verdict");
+    assert_eq!(status_of(&f, &f.issue), "validating");
+    let rid = review_id(&f);
+    assert_eq!(status_of(&f, &rid), "in-progress");
+    assert_eq!(store(&f).merge_queue().unwrap()[0].state, MergeState::Reviewing);
+
+    // later ticks neither start another reviewer nor write anything
+    let comments = comment_count(&f);
+    for _ in 0..2 {
+        let res = f.repo.ok(&["merge", "tick", "--once"]);
+        assert_eq!(res["processed"], 0, "{res}");
+    }
+    assert_eq!(start_agents(&f), agents + 1);
+    assert_eq!(comment_count(&f), comments, "no new comments while waiting");
+    assert_eq!(store(&f).merge_queue().unwrap()[0].state, MergeState::Reviewing);
+}
+
+#[test]
+fn an_item_without_a_review_requirement_merges_without_a_reviewer() {
+    let f = setup();
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let agents = start_agents(&f);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(start_agents(&f), agents, "no reviewer without [review] required");
+}
+
+#[test]
+fn a_review_label_forces_the_review_even_when_not_required() {
+    let f = setup();
+    set_config(&f, "on_labels = []", "on_labels = [\"risky\"]");
+    f.repo.ok(&["issue", "edit", &f.issue, "--label", "risky"]);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+}
+
+#[test]
+fn an_approve_decision_merges_and_closes_the_issue_and_the_review_issue() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "approve");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(main_has(&f, "src/greet.rs"));
+    assert_eq!(status_of(&f, &f.issue), "done");
+    assert_eq!(status_of(&f, &rid), "done");
+    assert!(store(&f).active_claims().unwrap().is_empty(), "claims released");
+    assert!(
+        f.repo.path().join(".worktrees").join(&rid).is_dir(),
+        "the review worktree is left for lane clean"
+    );
+}
+
+#[test]
+fn a_changes_decision_fails_the_item_blocks_the_issue_and_posts_a_blocker() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no test");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    let err = res["items"][0]["last_error"].as_str().unwrap();
+    assert!(err.contains("src/greet.rs: hello() has no test"), "{err}");
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+    assert!(!main_has(&f, "src/greet.rs"));
+    let blockers: Vec<String> = store(&f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind == CommentType::Blocker && c.to_lane == "human")
+        .map(|c| c.body)
+        .collect();
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(blockers[0].contains("hello() has no test"), "{}", blockers[0]);
+
+    // the next tick leaves the failed item alone
+    assert_eq!(f.repo.ok(&["merge", "tick", "--once"])["processed"], 0);
+    // a retry puts the issue back under validation and starts a fresh round
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    assert_eq!(status_of(&f, &f.issue), "validating");
+}
+
+#[test]
+fn the_third_changes_round_asks_the_human_instead_of_starting_another_reviewer() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    for round in 1..=2 {
+        decide_as(&f, &rid, &format!("changes:\n- round {round} finding"));
+        let res = f.repo.ok(&["merge", "tick", "--once"]);
+        assert_eq!(res["items"][0]["state"], "failed", "round {round}: {res}");
+        f.repo.ok(&["merge", "retry", &f.issue]);
+        let res = f.repo.ok(&["merge", "tick", "--once"]);
+        if round == 1 {
+            // the first verdict is history: the new round waits for its own
+            assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+            assert_eq!(f.repo.ok(&["merge", "tick", "--once"])["processed"], 0, "{res}");
+        }
+    }
+    // two `changes` rounds are on record: the retry above asked the human instead of reviewing again
+    let agents = start_agents(&f);
+    let item = &store(&f).merge_queue().unwrap()[0];
+    assert_eq!(item.state, MergeState::Blocked, "{item:?}");
+    assert!(
+        item.last_error.as_deref().unwrap().contains("max_rounds"),
+        "{item:?}"
+    );
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+    let blockers: Vec<String> = store(&f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind == CommentType::Blocker)
+        .map(|c| c.body)
+        .collect();
+    let last = blockers.last().unwrap();
+    assert!(last.contains("decide") && last.contains("max_rounds"), "{last}");
+    assert_eq!(f.repo.ok(&["merge", "tick", "--once"])["processed"], 0);
+    assert_eq!(start_agents(&f), agents, "no reviewer started");
+}
+
+#[test]
+fn no_verdict_keeps_the_item_reviewing_without_a_word() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    let comments = comment_count(&f);
+    // a DECISION from anyone but the reviewer, and a reviewer comment that is not a verdict, are not verdicts
+    decide_as(&f, "human", "approve");
+    decide_as(&f, &rid, "I am still looking at this");
+    let before = comment_count(&f);
+    assert_eq!(before, comments + 2);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["processed"], 0, "{res}");
+    assert_eq!(comment_count(&f), before, "the orchestrator stayed silent");
+    assert_eq!(store(&f).merge_queue().unwrap()[0].state, MergeState::Reviewing);
+    assert!(!main_has(&f, "src/greet.rs"));
+}
+
+#[test]
+fn a_dirty_main_parks_an_approved_item_in_reviewing_until_it_is_clean() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "approve");
+    std::fs::write(f.repo.path().join("src/lib.rs"), "dirty\n").unwrap();
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["processed"], 0, "parked, nothing to report: {res}");
+    let item = &store(&f).merge_queue().unwrap()[0];
+    assert_eq!(item.state, MergeState::Reviewing, "{item:?}");
+    assert!(!main_has(&f, "src/greet.rs"));
+    assert_eq!(status_of(&f, &f.issue), "validating");
+
+    git(f.repo.path(), &["checkout", "--", "src/lib.rs"]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(status_of(&f, &rid), "done");
+}

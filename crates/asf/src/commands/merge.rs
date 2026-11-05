@@ -3,14 +3,23 @@
 //! Conflicts are never resolved automatically: the rebase is aborted, the item and the issue go
 //! `blocked`, and a BLOCKER comment names the files.
 
+use asf_core::brief::{parse_verdict, Verdict};
+use asf_core::config::GateWhen;
 use asf_core::github::{ChecksState, GitHub, Mergeable, PrState};
+use asf_core::vcs::VcsError;
 use asf_core::*;
+use asf_vcs::gates::stage_specs;
 use asf_vcs::{run_gates, GitCli};
 use serde::Serialize;
 
 use crate::cli::{Cli, MergeCmd};
 use crate::ctx::Ctx;
 use crate::output::{AppError, ErrorCode, Rendered};
+use crate::worker::Worker;
+
+/// Event the queue appends when a review round starts; its `after_comment` is the id of the newest
+/// comment at that moment, so verdicts of earlier rounds are never read again.
+const REVIEW_STARTED: &str = "merge.review_started";
 
 /// Queues `feat/<id>` linked to the issue's latest run. Without `force` the latest run must be
 /// `succeeded` (independently verified): a worker cannot push its own branch into the queue.
@@ -92,7 +101,7 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
                 },
             )?;
             if ctx.store.get_issue(id)?.map(|i| i.status) == Some(Status::Blocked) {
-                ctx.store.set_status(id, Status::InReview, LANE_ORCHESTRATOR)?;
+                ctx.store.set_status(id, Status::Validating, LANE_ORCHESTRATOR)?;
             }
             Rendered::new(&updated, format!("#{} {} re-queued", updated.id, id))
         }
@@ -116,14 +125,25 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
     }
 }
 
-/// Processes queued items in FIFO order (`once` = at most one), then, for the GitHub target,
-/// polls every open pull request; a poll that changes nothing is not reported.
+/// Processes queued items in FIFO order (`once` = at most one), looking at every item waiting for
+/// its reviewer on the way, then, for the GitHub target, polls every open pull request; a look that
+/// changes nothing is not reported.
 pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
     let mut items = Vec::new();
     let queue = ctx.store.merge_queue()?;
     let mut main_red = false;
-    for next in queue.iter().filter(|m| m.state == MergeState::Queued) {
-        let done = process(ctx, next)?;
+    for next in queue
+        .iter()
+        .filter(|m| matches!(m.state, MergeState::Queued | MergeState::Reviewing))
+    {
+        let done = if next.state == MergeState::Queued {
+            process(ctx, next)?
+        } else {
+            match poll_review(ctx, next)? {
+                Some(changed) => changed,
+                None => continue,
+            }
+        };
         main_red = is_main_red(&done);
         items.push(done);
         if once || main_red {
@@ -194,17 +214,8 @@ fn fail(
     )
 }
 
-fn gate_specs(ctx: &Ctx) -> Vec<GateSpec> {
-    ctx.config
-        .gates
-        .iter()
-        .map(|g| GateSpec {
-            name: g.name.clone(),
-            cmd: g.cmd.clone(),
-            timeout_s: g.timeout_s,
-            shell: g.shell.clone(),
-        })
-        .collect()
+fn gate_specs(ctx: &Ctx, stage: GateWhen) -> Vec<GateSpec> {
+    stage_specs(&ctx.config.gates, stage)
 }
 
 /// The last `n` lines of `text`, in their original order.
@@ -230,11 +241,8 @@ fn comment(ctx: &Ctx, issue: &IssueId, kind: CommentType, to: &str, body: String
     Ok(())
 }
 
-/// Rebase → gates → ff-merge for one queued item. Never returns `Err` for a merge problem: the
-/// problem lands in the item's state and `last_error`.
-fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
-    let vcs = GitCli;
-    let default_branch = ctx.config.repo.default_branch.clone();
+/// The item's run, its worktree relative to the repo root, and that worktree as an absolute path.
+fn locate(ctx: &Ctx, item: &MergeItem) -> Result<(Option<Run>, String, std::path::PathBuf), AppError> {
     let run = match &item.run_id {
         Some(r) => ctx.store.get_run(r)?,
         None => None,
@@ -247,6 +255,15 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
         )
     });
     let wt = ctx.root.join(&worktree_rel);
+    Ok((run, worktree_rel, wt))
+}
+
+/// Rebase → gates → (review) → ff-merge for one queued item. Never returns `Err` for a merge
+/// problem: the problem lands in the item's state and `last_error`.
+fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
+    let vcs = GitCli;
+    let default_branch = ctx.config.repo.default_branch.clone();
+    let (run, worktree_rel, wt) = locate(ctx, item)?;
     if !wt.is_dir() {
         return fail(
             ctx,
@@ -361,7 +378,7 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
             ..MergePatch::default()
         },
     )?;
-    let results = run_gates(&gate_specs(ctx), &wt);
+    let results = run_gates(&gate_specs(ctx, GateWhen::Merge), &wt);
     if let Some(bad) = results.iter().find(|r| !r.ok) {
         let msg = format!(
             "gate `{}` failed (exit {:?}) after rebase:\n{}",
@@ -388,9 +405,28 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
         },
     )?;
 
-    // 4. integrate: push + pull request, or a local fast-forward
+    // 4. a review required by config or by label parks the item until the reviewer's verdict
+    if review_wanted(ctx, &item.issue_id)? {
+        return enter_review(ctx, item, &run);
+    }
+
+    // 5. integrate
+    integrate(ctx, item, &run, &wt, false)
+}
+
+/// Push + pull request, or a local fast-forward. With `park_if_dirty` (an approved review) a main
+/// checkout with uncommitted changes leaves the item in `reviewing` for a later tick instead of failing it.
+fn integrate(
+    ctx: &Ctx,
+    item: &MergeItem,
+    run: &Option<Run>,
+    wt: &std::path::Path,
+    park_if_dirty: bool,
+) -> Result<MergeItem, AppError> {
+    let vcs = GitCli;
+    let default_branch = ctx.config.repo.default_branch.clone();
     if ctx.config.merge.target == "github" {
-        return open_pr(ctx, item, &run, &wt);
+        return open_pr(ctx, item, run, wt);
     }
     set(
         ctx,
@@ -415,6 +451,21 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
     }
     let new_head = match vcs.ff_merge(&ctx.root, &item.branch) {
         Ok(h) => h,
+        Err(VcsError::Dirty(files)) if park_if_dirty => {
+            eprintln!(
+                "asf merge: {} is approved but {default_branch} has uncommitted changes ({}); staying in reviewing",
+                item.issue_id,
+                files.join(", ")
+            );
+            return set(
+                ctx,
+                item.id,
+                MergePatch {
+                    state: Some(MergeState::Reviewing),
+                    ..MergePatch::default()
+                },
+            );
+        }
         Err(e) => {
             return fail(
                 ctx,
@@ -425,7 +476,278 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
             )
         }
     };
-    finalize_merged(ctx, item, &run, new_head)
+    finalize_merged(ctx, item, run, new_head)
+}
+
+/// Whether `[review] required` or one of the issue's labels in `on_labels` asks for a reviewer.
+fn review_wanted(ctx: &Ctx, id: &IssueId) -> Result<bool, AppError> {
+    let cfg = &ctx.config.review;
+    if cfg.required {
+        return Ok(true);
+    }
+    Ok(ctx
+        .store
+        .get_issue(id)?
+        .is_some_and(|i| i.labels.iter().any(|l| cfg.on_labels.contains(l))))
+}
+
+/// The review children of `id` (one per review issue ever created for it).
+fn review_children(ctx: &Ctx, id: &IssueId) -> Result<Vec<IssueId>, AppError> {
+    Ok(ctx
+        .store
+        .list_issues(&IssueFilter {
+            kind: Some(IssueType::Review),
+            parent: Some(id.clone()),
+            ..IssueFilter::default()
+        })?
+        .into_iter()
+        .map(|i| i.id)
+        .collect())
+}
+
+/// Verdicts of `id`'s reviewers, oldest first, as `(comment id, verdict)`. Only a DECISION authored
+/// by a review child's lane counts (`agent:<review-id>`); the reviewer posts it on the reviewed
+/// issue, but a copy on its own issue is read too. Anything that is not a verdict is skipped.
+fn verdicts(ctx: &Ctx, id: &IssueId) -> Result<Vec<(i64, Verdict)>, AppError> {
+    let children = review_children(ctx, id)?;
+    let mut sources = vec![id.clone()];
+    sources.extend(children.iter().cloned());
+    let lanes: Vec<String> = children
+        .iter()
+        .flat_map(|c| [c.to_string(), format!("agent:{c}")])
+        .collect();
+    let mut found = Vec::new();
+    for src in &sources {
+        for c in ctx.store.comments(src)? {
+            if c.kind == CommentType::Decision && lanes.contains(&c.author) {
+                if let Some(v) = parse_verdict(&c.body) {
+                    found.push((c.id, v));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(id, _)| *id);
+    Ok(found)
+}
+
+/// Id of the newest comment on `id` or on one of its review issues (0 when there is none).
+fn newest_comment(ctx: &Ctx, id: &IssueId) -> Result<i64, AppError> {
+    let mut newest = 0;
+    let mut sources = vec![id.clone()];
+    sources.extend(review_children(ctx, id)?);
+    for src in &sources {
+        for c in ctx.store.comments(src)? {
+            newest = newest.max(c.id);
+        }
+    }
+    Ok(newest)
+}
+
+/// Comment id after which a verdict belongs to the current review round of `id`.
+fn round_boundary(ctx: &Ctx, id: &IssueId) -> Result<i64, AppError> {
+    let mut boundary = 0;
+    let mut seq = 0;
+    loop {
+        let page = ctx.store.events_since(seq, 500)?;
+        let Some(last) = page.last() else { break };
+        seq = last.seq;
+        for e in &page {
+            if e.kind == REVIEW_STARTED && e.issue_id.as_ref() == Some(id) {
+                boundary = e.payload["after_comment"].as_i64().unwrap_or(boundary);
+            }
+        }
+    }
+    Ok(boundary)
+}
+
+/// Review rounds of `id` that ended in `changes`.
+fn changes_rounds(ctx: &Ctx, id: &IssueId) -> Result<usize, AppError> {
+    Ok(verdicts(ctx, id)?
+        .iter()
+        .filter(|(_, v)| matches!(v, Verdict::Changes(_)))
+        .count())
+}
+
+fn bullets(findings: &[String]) -> String {
+    findings
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Gates are green and a review is wanted: ask the human instead once `max_rounds` rounds ended in
+/// `changes`, else mark the item `reviewing` and start the reviewer.
+fn enter_review(ctx: &Ctx, item: &MergeItem, run: &Option<Run>) -> Result<MergeItem, AppError> {
+    let (Some(run), Some(issue)) = (run, ctx.store.get_issue(&item.issue_id)?) else {
+        return fail(
+            ctx,
+            item,
+            MergeState::Failed,
+            format!("cannot start a reviewer: {} has no recorded run", item.issue_id),
+            None,
+        );
+    };
+    let max = ctx.config.review.max_rounds as usize;
+    let rounds = changes_rounds(ctx, &issue.id)?;
+    if rounds >= max {
+        let msg = format!(
+            "{rounds} review round(s) ended in `changes` and [review] max_rounds is {max}; no further reviewer is started"
+        );
+        let updated = fail(ctx, item, MergeState::Blocked, msg.clone(), None)?;
+        let _ = ctx
+            .store
+            .set_status(&item.issue_id, Status::Blocked, LANE_ORCHESTRATOR);
+        comment(
+            ctx,
+            &item.issue_id,
+            CommentType::Blocker,
+            LANE_HUMAN,
+            format!(
+                "{msg}.\n\nPlease decide: fix the findings in the worktree and raise `review.max_rounds` \
+                 (`asf config set review.max_rounds {}`) before `asf merge retry {}`, or merge by hand, or \
+                 `asf merge skip {}`.",
+                max + 1,
+                item.issue_id,
+                item.issue_id
+            ),
+        )?;
+        return Ok(updated);
+    }
+    let after_comment = newest_comment(ctx, &issue.id)?;
+    let updated = set(
+        ctx,
+        item.id,
+        MergePatch {
+            state: Some(MergeState::Reviewing),
+            last_error: Some(None),
+            ..MergePatch::default()
+        },
+    )?;
+    ctx.store.append_event(&NewEvent {
+        kind: REVIEW_STARTED.into(),
+        issue_id: Some(issue.id.clone()),
+        run_id: item.run_id.clone(),
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload: serde_json::json!({ "after_comment": after_comment, "round": rounds + 1 }),
+    })?;
+    match Worker::new(ctx).and_then(|w| w.start_review(&issue, run)) {
+        Ok(_) => Ok(updated),
+        Err(e) => {
+            let msg = format!("cannot start the reviewer: {}", e.message);
+            let failed = fail(ctx, item, MergeState::Failed, msg.clone(), None)?;
+            comment(
+                ctx,
+                &item.issue_id,
+                CommentType::Blocker,
+                LANE_HUMAN,
+                format!(
+                    "{msg}\n\nFix the cause, then `asf merge retry {}`.",
+                    item.issue_id
+                ),
+            )?;
+            Ok(failed)
+        }
+    }
+}
+
+/// One look at an item waiting for its reviewer. `None` when there is no verdict of the current
+/// round yet (nothing is written) or the approved item is parked behind a dirty main.
+fn poll_review(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
+    let boundary = round_boundary(ctx, &item.issue_id)?;
+    let Some((_, verdict)) = verdicts(ctx, &item.issue_id)?
+        .into_iter()
+        .rfind(|(id, _)| *id > boundary)
+    else {
+        return Ok(None);
+    };
+    match verdict {
+        Verdict::Approve => {
+            let (run, worktree_rel, wt) = locate(ctx, item)?;
+            if !wt.is_dir() {
+                return fail(
+                    ctx,
+                    item,
+                    MergeState::Failed,
+                    format!("worktree {worktree_rel} does not exist"),
+                    None,
+                )
+                .map(Some);
+            }
+            let done = integrate(ctx, item, &run, &wt, true)?;
+            Ok((done.state != MergeState::Reviewing).then_some(done))
+        }
+        Verdict::Changes(findings) => request_changes(ctx, item, &findings).map(Some),
+    }
+}
+
+/// `changes`: the item fails with the findings, the issue is blocked, the human gets a BLOCKER, and
+/// a worker still running is told through a run reply.
+fn request_changes(ctx: &Ctx, item: &MergeItem, findings: &[String]) -> Result<MergeItem, AppError> {
+    let list = bullets(findings);
+    let msg = format!("review asks for changes on {}:\n{list}", item.branch);
+    let updated = fail(ctx, item, MergeState::Failed, msg.clone(), None)?;
+    let _ = ctx
+        .store
+        .set_status(&item.issue_id, Status::Blocked, LANE_ORCHESTRATOR);
+    let alive = ctx
+        .store
+        .runs(Some(&item.issue_id), true)?
+        .into_iter()
+        .last()
+        .is_some();
+    let replied = alive
+        && Worker::new(ctx)
+            .and_then(|w| {
+                w.reply(
+                    &item.issue_id,
+                    &format!("The reviewer asks for changes, fix them, commit and finish again:\n{list}"),
+                )
+            })
+            .is_ok();
+    comment(
+        ctx,
+        &item.issue_id,
+        CommentType::Blocker,
+        LANE_HUMAN,
+        format!(
+            "{msg}\n\n{}Fix the findings in the worktree, then `asf merge retry {}`.",
+            if replied {
+                "The running worker was sent the findings. "
+            } else {
+                ""
+            },
+            item.issue_id
+        ),
+    )?;
+    Ok(updated)
+}
+
+/// After a merge: the review issues of `id` are closed `done`, their claims released, their runs and
+/// workspaces closed. Their worktrees stay for `asf lane clean`.
+fn close_reviews(ctx: &Ctx, id: &IssueId) {
+    let Ok(children) = review_children(ctx, id) else {
+        return;
+    };
+    let rt = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root).ok();
+    for rid in children {
+        for r in ctx.store.runs(Some(&rid), true).unwrap_or_default() {
+            if let (Some(rt), Some(ws)) = (&rt, &r.workspace_id) {
+                let _ = rt.close_workspace(ws);
+            }
+            let _ = ctx.store.update_run(
+                &r.id,
+                &RunPatch {
+                    state: Some(RunState::Succeeded),
+                    exit_reason: Some("review approved, branch merged".into()),
+                    finished_at: Some(now_rfc3339()),
+                    ..RunPatch::default()
+                },
+            );
+        }
+        let _ = ctx.store.release(&rid);
+        let _ = ctx.store.set_status(&rid, Status::Done, LANE_ORCHESTRATOR);
+    }
 }
 
 /// `merged`: issue `done`, claim released, workspace closed, FYI to all, event.
@@ -449,6 +771,7 @@ fn finalize_merged(
     ctx.store
         .set_status(&item.issue_id, Status::Done, LANE_ORCHESTRATOR)?;
     let _ = ctx.store.release(&item.issue_id);
+    close_reviews(ctx, &item.issue_id);
     if let Some(r) = run {
         if let Some(ws) = &r.workspace_id {
             if let Ok(rt) = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root) {
@@ -492,7 +815,7 @@ fn finalize_merged(
 /// a merged PR), regardless of `require_clean_main`. A red gate leaves the item `merged` (no automatic
 /// revert) but records `last_error`, a BLOCKER comment and a `merge.main_red` event; the caller stops the tick.
 fn verify_main(ctx: &Ctx, merged: MergeItem, head: &str) -> Result<MergeItem, AppError> {
-    let results = run_gates(&gate_specs(ctx), &ctx.root);
+    let results = run_gates(&gate_specs(ctx, GateWhen::Main), &ctx.root);
     let Some(bad) = results.iter().find(|r| !r.ok) else {
         return Ok(merged);
     };

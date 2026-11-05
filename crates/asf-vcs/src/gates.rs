@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use asf_core::config::{GateCfg, GateWhen};
 use asf_core::{GateResult, GateSpec};
 
 const TAIL_LINES: usize = 40;
@@ -210,4 +211,18 @@ pub fn run_gates(specs: &[GateSpec], cwd: &Path) -> Vec<GateResult> {
         }
     }
     results
+}
+
+/// The gates that run in `stage`, in config order, as runnable specs.
+pub fn stage_specs(gates: &[GateCfg], stage: GateWhen) -> Vec<GateSpec> {
+    gates
+        .iter()
+        .filter(|g| g.runs_in(stage))
+        .map(|g| GateSpec {
+            name: g.name.clone(),
+            cmd: g.cmd.clone(),
+            timeout_s: g.timeout_s,
+            shell: g.shell.clone(),
+        })
+        .collect()
 }
