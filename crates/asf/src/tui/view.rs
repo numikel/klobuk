@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
-use super::app::{App, Mode, View, BOARD_COLUMNS};
+use super::app::{board_columns, App, Mode, View};
 
 fn trunc(s: &str, n: usize) -> String {
     let s = s.lines().next().unwrap_or("");
@@ -65,15 +65,16 @@ fn footer(app: &App) -> Paragraph<'static> {
         Mode::Confirm { what, .. } => format!(" {what} (y/n)"),
         Mode::Normal => match &app.status {
             Some(s) => format!(" {s}"),
-            None => " 1-5 views · j/k move · Enter detail · s start · f focus · r reply · y/n keys · m merge · x abort · t tick · R refresh · q quit".into(),
+            None => " 1-6 views · j/k move · Enter detail · s start · f focus · r reply · y/n keys · m merge · x abort · t tick · R refresh · q quit".into(),
         },
     };
     Paragraph::new(text)
 }
 
 fn board(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Ratio(1, BOARD_COLUMNS.len() as u32); BOARD_COLUMNS.len()])
-        .split(area);
+    let columns = board_columns();
+    let cols =
+        Layout::horizontal(vec![Constraint::Ratio(1, columns.len() as u32); columns.len()]).split(area);
     let ordered = app.board_issues();
     let sel = app.selected(View::Board);
     let selected_id = ordered.get(sel).map(|i| i.id.clone());
@@ -82,7 +83,7 @@ fn board(frame: &mut Frame, app: &App, area: Rect) {
         .map(|c| c.width as usize)
         .unwrap_or(10)
         .saturating_sub(4);
-    for (st, col) in BOARD_COLUMNS.iter().zip(cols.iter()) {
+    for (st, col) in columns.iter().zip(cols.iter()) {
         let items: Vec<&Issue> = ordered.iter().copied().filter(|i| i.status == *st).collect();
         let n = items.len();
         let list_items: Vec<ListItem> = items
@@ -297,6 +298,35 @@ fn log(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut st);
 }
 
+fn config(frame: &mut Frame, app: &App, area: Rect) {
+    let rows: Vec<Row> = app
+        .snap
+        .config
+        .iter()
+        .map(|r| {
+            Row::new(vec![
+                Cell::from(r.key.clone()),
+                Cell::from(trunc(&r.value, 20)),
+                Cell::from(r.description.clone()),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(24),
+            Constraint::Length(20),
+            Constraint::Min(10),
+        ],
+    )
+    .header(Row::new(["key", "value", "description"]).bold())
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+    .block(Block::bordered().title(" config · Enter = edit (applies after `asf serve` restart) "));
+    let mut st = ratatui::widgets::TableState::default();
+    st.select(Some(app.selected(View::Config)));
+    frame.render_stateful_widget(table, area, &mut st);
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let show_detail = app.detail && app.view == View::Board && area.height >= 14;
@@ -325,6 +355,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         View::Inbox => inbox(frame, app, rows[2]),
         View::Queue => queue(frame, app, rows[2]),
         View::Log => log(frame, app, rows[2]),
+        View::Config => config(frame, app, rows[2]),
     }
     if show_detail {
         detail(frame, app, rows[3]);

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use asf_core::config_edit::editable_keys;
 use asf_core::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
@@ -23,6 +24,46 @@ pub struct Snapshot {
     pub queue: Vec<MergeItem>,
     /// Newest first.
     pub events: Vec<Event>,
+    /// One row per editable config key, read from `.factory/config.toml`.
+    pub config: Vec<ConfigRow>,
+}
+
+/// An editable config key with its current value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRow {
+    pub key: String,
+    pub description: String,
+    /// What the Config view shows (`(unset)` for an optional key that is absent).
+    pub value: String,
+    /// What the input prompt is prefilled with (empty for an unset key).
+    pub raw: String,
+}
+
+/// Rows for every [`editable_keys`] entry, with values taken from the TOML text `toml`.
+/// A file that does not parse yields `(unreadable)` rows so the view never shows stale defaults.
+pub fn config_rows(toml: &str) -> Vec<ConfigRow> {
+    let root = Config::from_toml(toml)
+        .ok()
+        .and_then(|c| serde_json::to_value(&c).ok());
+    editable_keys()
+        .iter()
+        .map(|(key, description)| {
+            let (value, raw) = match &root {
+                None => ("(unreadable)".to_string(), String::new()),
+                Some(root) => match key.split('.').try_fold(root, |node, seg| node.get(seg)) {
+                    None | Some(serde_json::Value::Null) => ("(unset)".to_string(), String::new()),
+                    Some(serde_json::Value::String(s)) => (s.clone(), s.clone()),
+                    Some(other) => (other.to_string(), other.to_string()),
+                },
+            };
+            ConfigRow {
+                key: (*key).to_string(),
+                description: (*description).to_string(),
+                value,
+                raw,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,10 +73,18 @@ pub enum View {
     Inbox,
     Queue,
     Log,
+    Config,
 }
 
 impl View {
-    pub const ALL: [View; 5] = [View::Board, View::Agents, View::Inbox, View::Queue, View::Log];
+    pub const ALL: [View; 6] = [
+        View::Board,
+        View::Agents,
+        View::Inbox,
+        View::Queue,
+        View::Log,
+        View::Config,
+    ];
 
     pub fn title(&self) -> &'static str {
         match self {
@@ -44,6 +93,7 @@ impl View {
             View::Inbox => "Inbox",
             View::Queue => "Queue",
             View::Log => "Log",
+            View::Config => "Config",
         }
     }
 
@@ -68,6 +118,15 @@ pub enum Action {
     Enqueue(IssueId),
     Abort(IssueId),
     MarkRead(IssueId),
+    /// Write `value` to the dotted config `key` (`.factory/config.toml`).
+    SetConfig(String, String),
+}
+
+/// What the input line is typing for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputTarget {
+    Reply(IssueId),
+    Config(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +135,7 @@ pub enum Mode {
     Input {
         prompt: String,
         buf: String,
-        target: IssueId,
+        target: InputTarget,
     },
     Confirm {
         what: String,
@@ -84,15 +143,14 @@ pub enum Mode {
     },
 }
 
-/// Board columns, left to right (cancelled is hidden).
-pub const BOARD_COLUMNS: [Status; 6] = [
-    Status::Backlog,
-    Status::Ready,
-    Status::InProgress,
-    Status::Blocked,
-    Status::InReview,
-    Status::Done,
-];
+/// Board columns, left to right: every status in `Status::ALL` order except `cancelled`, which is hidden.
+pub fn board_columns() -> Vec<Status> {
+    Status::ALL
+        .iter()
+        .copied()
+        .filter(|s| *s != Status::Cancelled)
+        .collect()
+}
 
 pub struct App {
     pub view: View,
@@ -132,7 +190,7 @@ impl App {
     /// Issues in board order: column by column, by sequence number inside a column.
     pub fn board_issues(&self) -> Vec<&Issue> {
         let mut out = Vec::new();
-        for st in BOARD_COLUMNS {
+        for st in board_columns() {
             let mut col: Vec<&Issue> = self.snap.issues.iter().filter(|i| i.status == st).collect();
             col.sort_by(|a, b| a.id.cmp(&b.id));
             out.extend(col);
@@ -147,6 +205,7 @@ impl App {
             View::Inbox => self.snap.inbox.len(),
             View::Queue => self.snap.queue.len(),
             View::Log => self.snap.events.len(),
+            View::Config => self.snap.config.len(),
         }
     }
 
@@ -165,7 +224,7 @@ impl App {
             View::Agents => self.snap.runs.get(i).map(|r| &r.issue_id),
             View::Inbox => self.snap.inbox.get(i).map(|c| &c.issue_id),
             View::Queue => self.snap.queue.get(i).map(|m| &m.issue_id),
-            View::Log => None,
+            View::Log | View::Config => None,
         }
     }
 
@@ -200,7 +259,11 @@ impl App {
                         if buf.trim().is_empty() {
                             Action::None
                         } else {
-                            Action::Reply(target, buf.trim().to_string())
+                            let text = buf.trim().to_string();
+                            match target {
+                                InputTarget::Reply(id) => Action::Reply(id, text),
+                                InputTarget::Config(key) => Action::SetConfig(key, text),
+                            }
                         }
                     }
                     KeyCode::Backspace => {
@@ -231,7 +294,7 @@ impl App {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char('R') => Action::Refresh,
             KeyCode::Char('t') => Action::Tick,
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 self.view = View::ALL[(c as u8 - b'1') as usize];
                 Action::None
             }
@@ -245,6 +308,16 @@ impl App {
             }
             KeyCode::Enter => match (self.view, self.selected_issue().cloned()) {
                 (View::Inbox, Some(id)) => Action::MarkRead(id),
+                (View::Config, _) => {
+                    if let Some(row) = self.snap.config.get(self.selected(View::Config)) {
+                        self.mode = Mode::Input {
+                            prompt: format!("set {}", row.key),
+                            buf: row.raw.clone(),
+                            target: InputTarget::Config(row.key.clone()),
+                        };
+                    }
+                    Action::None
+                }
                 _ => {
                     self.detail = !self.detail;
                     Action::None
@@ -281,7 +354,7 @@ impl App {
                     self.mode = Mode::Input {
                         prompt: format!("reply to {id}"),
                         buf: String::new(),
-                        target: id,
+                        target: InputTarget::Reply(id),
                     };
                 }
                 Action::None

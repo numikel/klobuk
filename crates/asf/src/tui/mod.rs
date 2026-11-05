@@ -11,21 +11,59 @@ pub mod view;
 mod tests;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use asf_core::*;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
 
 use crate::commands::merge::tick_all;
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, CONFIG_FILE, FACTORY_DIR};
 use crate::output::AppError;
 use crate::worker::Worker;
-use app::{Action, App, Snapshot, View};
+use app::{config_rows, Action, App, Snapshot, View};
 
 const KEY_POLL: Duration = Duration::from_millis(200);
 const STORE_REFRESH: Duration = Duration::from_secs(1);
 const AGENT_REFRESH: Duration = Duration::from_secs(2);
 const LOG_LIMIT: usize = 200;
+
+/// `.factory/config.toml` text with the BOM dropped and CRLF turned into LF (as `asf config` reads it).
+fn read_config_text(root: &Path) -> std::io::Result<String> {
+    let raw = std::fs::read_to_string(root.join(FACTORY_DIR).join(CONFIG_FILE))?;
+    Ok(raw.trim_start_matches('\u{feff}').replace("\r\n", "\n"))
+}
+
+/// Applies one Config-view edit and returns the status line for it.
+///
+/// The file is written only when `config_edit::set_key` accepted the value; a refused key or value
+/// (or an unreadable file) leaves it byte-identical and yields an `error: ...` line instead.
+pub(crate) fn config_set_status(root: &Path, key: &str, value: &str) -> String {
+    let path = root.join(FACTORY_DIR).join(CONFIG_FILE);
+    let text = match read_config_text(root) {
+        Ok(t) => t,
+        Err(e) => return format!("error: cannot read {}: {e}", path.display()),
+    };
+    let edited = match asf_core::config_edit::set_key(&text, key, value) {
+        Ok(t) => t,
+        Err(e) => return format!("error: {e}"),
+    };
+    if let Err(e) = std::fs::write(&path, edited.as_bytes()) {
+        return format!("error: cannot write {}: {e}", path.display());
+    }
+    let shown = |t: &str| {
+        config_rows(t)
+            .into_iter()
+            .find(|r| r.key == key)
+            .map(|r| r.value)
+            .unwrap_or_default()
+    };
+    format!(
+        "{key}: {} -> {} (restart `asf serve` to apply)",
+        shown(&text),
+        shown(&edited)
+    )
+}
 
 /// Loads everything the TUI shows. `rt` adds live agent states (skipped when `None`).
 pub fn load_snapshot(
@@ -77,6 +115,7 @@ pub fn load_snapshot(
             .filter(|m| !m.state.is_terminal())
             .collect(),
         events,
+        config: config_rows(&read_config_text(&ctx.root).unwrap_or_default()),
     })
 }
 
@@ -134,6 +173,7 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
             worker.abort(&id)?;
             Some(format!("aborted {id}"))
         }
+        Action::SetConfig(key, value) => Some(config_set_status(&ctx.root, &key, &value)),
         Action::MarkRead(_) => {
             let n = ctx.store.inbox(LANE_HUMAN, false, false)?.len();
             Some(format!("inbox: {n} item(s) marked read"))
@@ -149,7 +189,7 @@ pub fn run_once(ctx: &Ctx, view: Option<View>) -> Result<String, AppError> {
     if let Some(v) = view {
         app.view = v;
     }
-    Ok(view::render_to_text(&app, 100, 30))
+    Ok(view::render_to_text(&app, 120, 30))
 }
 
 pub fn run_interactive(ctx: &Ctx, view: Option<View>) -> Result<(), AppError> {

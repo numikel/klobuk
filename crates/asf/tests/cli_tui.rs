@@ -72,3 +72,28 @@ fn tui_once_can_open_other_views() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn tui_once_config_view_prints_every_editable_key() {
+    let repo = fake_repo();
+    let out = repo
+        .asf()
+        .args(["tui", "--once", "--view", "config"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    for (key, _) in asf_core::config_edit::editable_keys() {
+        assert!(text.contains(key), "missing {key} in:\n{text}");
+    }
+    assert!(text.contains("[6] Config"), "{text}");
+    assert!(text.contains("fake") || text.contains("local"), "{text}");
+}
+
+#[test]
+fn tui_once_board_has_a_validating_column() {
+    let repo = fake_repo();
+    let out = repo.asf().args(["tui", "--once"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("validating"), "{text}");
+}
