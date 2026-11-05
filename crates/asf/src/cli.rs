@@ -89,6 +89,24 @@ pub enum Cmd {
     Export(ExportArgs),
     /// Load a JSONL export into this store.
     Import(ImportArgs),
+    /// Show or change the editable keys of `.factory/config.toml`.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCmd {
+    /// Current values of the editable keys.
+    Show,
+    /// Change one editable key, keeping comments and layout. A running `asf serve` must be restarted.
+    Set {
+        /// Dotted key, e.g. `scheduler.max_parallel` (see `asf config show`).
+        key: String,
+        /// TOML scalar or array (`true`, `5`, `2.5`, `["a"]`, `"quoted"`); anything else is a plain string.
+        value: String,
+    },
 }
 
 #[derive(Args, Debug)]

@@ -1,3 +1,4 @@
+pub mod config;
 pub mod doctor;
 pub mod export;
 pub mod gh;
@@ -12,7 +13,7 @@ pub mod run;
 pub mod serve;
 pub mod tui;
 
-use crate::cli::{Cli, Cmd, IssueCmd};
+use crate::cli::{Cli, Cmd, ConfigCmd, IssueCmd};
 use crate::output::{AppError, Rendered};
 
 /// Commands a worker may run from inside its pane (`ASF_RUN` set): read, talk, hand off, finish.
@@ -22,6 +23,8 @@ fn allowed_in_worker(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Hook { .. } | Cmd::Lane { .. } | Cmd::Method { .. } => true,
         Cmd::Repo { cmd } => !matches!(cmd, crate::cli::RepoCmd::Init(_)),
+        // Reading the settings is harmless; changing them is the operator's.
+        Cmd::Config { cmd } => matches!(cmd, ConfigCmd::Show),
         Cmd::Issue { cmd } => matches!(
             cmd,
             IssueCmd::List(_)
@@ -58,6 +61,7 @@ fn top_level_name(cmd: &Cmd) -> &'static str {
         Cmd::Serve(_) => "serve",
         Cmd::Export(_) => "export",
         Cmd::Import(_) => "import",
+        Cmd::Config { .. } => "config",
     }
 }
 
@@ -84,5 +88,6 @@ pub fn dispatch(cli: &Cli) -> Result<Rendered, AppError> {
         Cmd::Serve(a) => serve::run(cli, a),
         Cmd::Export(a) => export::export(cli, a),
         Cmd::Import(a) => export::import(cli, a),
+        Cmd::Config { cmd } => config::run(cli, cmd),
     }
 }
