@@ -112,6 +112,13 @@ pub struct ServeArgs {
     /// Also start workers for the ready issues the allocation plan selects (autonomous mode).
     #[arg(long)]
     pub dispatch: bool,
+    /// Keep ticking until nothing is left to do, then print a summary and exit
+    /// (reasons: all_done, max_ticks, stuck; stuck exits 3).
+    #[arg(long, conflicts_with = "once")]
+    pub until_done: bool,
+    /// With --until-done: stop after this many ticks (>= 1).
+    #[arg(long, requires = "until_done", value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_ticks: Option<u64>,
 }
 
 #[derive(Args, Debug)]
