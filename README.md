@@ -50,8 +50,9 @@ asf repo doctor                # git, config, database, herdr, claude, github
 ```
 
 `repo init` also appends the runtime paths (`.factory/factory.db*`, `.factory/runs/`,
-`.worktrees/`, `CLAUDE.local.md`, `.claude/settings.local.json`) to `.gitignore` and
-`.git/info/exclude`. `.factory/config.toml` and `.factory/issues.jsonl` are meant to be committed.
+`.factory/plan/`, `.worktrees/`, `CLAUDE.local.md`, `.claude/settings.local.json`) to `.gitignore`
+and `.git/info/exclude`; `repo doctor` warns when any of them is missing. `.factory/config.toml`
+and `.factory/issues.jsonl` are meant to be committed.
 
 ## The loop, step by step
 
@@ -161,7 +162,11 @@ asf run start mp-3
 asf run start mp-3 --approve <inputs_hash>   # refuses if the plan changed since `asf run plan`
 ```
 
-`asf serve --once` runs a single tick, which is handy in scripts and tests.
+`asf serve --once` runs a single tick, which is handy in scripts and tests. For an unattended
+run use `asf serve --dispatch --until-done [--max-ticks N]`: the loop stops on its own and prints a
+summary with the reason `all_done` (exit 0), `max_ticks` (exit 0) or `stuck` (exit 3: open issues
+remain but no worker is active, nothing is queued and the plan has no slot, which includes workers
+waiting for your answer).
 
 ### 5. Watch and answer
 
@@ -198,7 +203,10 @@ and the branch `feat/<id>` enqueued.
 The merge queue processes items in order: rebase onto the default branch (a conflict is never
 resolved automatically: the item and the issue go `blocked` with a BLOCKER naming the files),
 scope re-check, gates again after the rebase, then `git merge --ff-only`. The issue becomes
-`done`, the worker's Herdr workspace is closed and an FYI comment is posted.
+`done`, the worker's Herdr workspace is closed and an FYI comment is posted. With
+`[merge] verify_main_after = true` the gates run once more in the repository root after every
+merge: a red default branch keeps the item `merged` (the commit is there), records the failing
+gate on it, posts a BLOCKER and stops the queue for that tick so nothing else lands on a red branch.
 
 ```bash
 asf merge list
@@ -298,6 +306,7 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 [merge]
 target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
 require_clean_main = true
+verify_main_after = false # run the gates in the repo root after each merge; a red main keeps the item `merged`, posts a BLOCKER and halts the tick
 # [merge.github]           # used when target = "github"
 # remote = "origin"
 # base = "main"            # default: [repo] default_branch
@@ -361,7 +370,7 @@ reported and never fatal.
 | Command | Purpose |
 | --- | --- |
 | `asf repo init [--prefix p]` | Create `.factory/` (config + database); idempotent, adopts a committed config |
-| `asf repo status` / `asf repo doctor` | Counts per status and claims / environment and store health |
+| `asf repo status` / `asf repo doctor` | Counts per status and claims / environment and store health (git, config, database, herdr, claude, github, gitignore) |
 | `asf issue list [--status s] [--type t] [--label l] [--ready]` | List issues |
 | `asf issue show <id> [--dossier]` | One issue with dependencies; `--dossier` adds comments and hand-offs |
 | `asf issue create --title t [--body b] [--scope g]… [--accept a]… [--dep id]… [--parent id] [--priority n] [--type task\|review\|epic] [--ready]` | Create an issue |
@@ -385,7 +394,7 @@ reported and never fatal.
 | `asf lane list` / `check` / `clean <id> [--dry-run]` | Claims and worktrees |
 | `asf method list` / `validate <dir>` | Methodologies |
 | `asf gh sync [--dry-run]` | Mirror issues to GitHub |
-| `asf serve [--interval s] [--once] [--dispatch]` | The orchestrator loop |
+| `asf serve [--interval s] [--once] [--dispatch] [--until-done [--max-ticks N]]` | The orchestrator loop; `--until-done` stops with `all_done`, `max_ticks` or `stuck` |
 | `asf tui [--view board\|agents\|inbox\|queue\|log] [--once]` | Terminal UI |
 | `asf export [--out f]` / `asf import <f> [--mode upsert\|replace]` | JSONL export and import |
 | `asf hook pre-tool\|post-tool\|stop\|status` | Claude Code hooks (called by the worker's settings, not by you) |

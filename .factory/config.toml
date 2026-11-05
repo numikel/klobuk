@@ -53,6 +53,7 @@ timeout_s = 1200
 [merge]
 target = "local"
 require_clean_main = true
+verify_main_after = true  # gates on main after every merge (dogfooding round 2)
 
 [review]
 required = false
