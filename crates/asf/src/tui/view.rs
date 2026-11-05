@@ -2,13 +2,19 @@
 
 use asf_core::*;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
-use super::app::{board_columns, App, Mode, View};
+use super::app::{board_columns, App, Mode, View, Waiting};
+
+/// Style of a waiting marker and of the row it sits on: bold red, never colour alone (the symbol differs too).
+fn blocked_style() -> Style {
+    Style::default().red().bold()
+}
 
 fn trunc(s: &str, n: usize) -> String {
     let s = s.lines().next().unwrap_or("");
@@ -27,7 +33,7 @@ fn header_line(app: &App) -> Line<'static> {
         Some(false) => "runtime DOWN".red(),
         None => "runtime ?".dark_gray(),
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(" asf · ").bold(),
         Span::raw(s.repo_name.clone()).bold(),
         Span::raw(format!(" · {} · ", s.branch)),
@@ -38,7 +44,40 @@ fn header_line(app: &App) -> Line<'static> {
             s.max_parallel,
             s.queue.len()
         )),
-    ])
+    ];
+    let waiting = app.waiting().len();
+    if waiting > 0 {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            format!("{waiting} waiting"),
+            Style::default().cyan().bold(),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The one-line banner naming the oldest waiter, cut to `width` with ` (+K more)` always kept.
+fn banner_line(waiting: &[Waiting], width: usize) -> Line<'static> {
+    let more = waiting.len().saturating_sub(1);
+    let suffix = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    let room = width.saturating_sub(suffix.chars().count());
+    let head = match waiting.first() {
+        Some(Waiting::Run { issue, .. }) => trunc(
+            &format!("■ {issue} is waiting for your answer · a answer · f focus pane"),
+            room,
+        ),
+        Some(Waiting::Question { issue, body, .. }) => {
+            let prefix = format!("■ {issue} asks: ");
+            let left = room.saturating_sub(prefix.chars().count()).max(1);
+            format!("{prefix}{}", trunc(body, left))
+        }
+        None => String::new(),
+    };
+    Line::styled(format!("{head}{suffix}"), Style::default().yellow().bold())
 }
 
 fn tabs(app: &App) -> Tabs<'static> {
@@ -63,9 +102,10 @@ fn footer(app: &App) -> Paragraph<'static> {
     let text = match &app.mode {
         Mode::Input { prompt, buf, .. } => format!(" {prompt}: {buf}▏  (Enter send · Esc cancel)"),
         Mode::Confirm { what, .. } => format!(" {what} (y/n)"),
+        Mode::Answer { id, .. } => format!(" answering {id}"),
         Mode::Normal => match &app.status {
             Some(s) => format!(" {s}"),
-            None => " 1-6 views · j/k move · Enter detail · s start · f focus · r reply · y/n keys · m merge · x abort · t tick · R refresh · q quit".into(),
+            None => " 1-6 views · j/k move · Enter detail · s start · f focus · r reply · a answer · d unset · m merge · x abort · t tick · R refresh · q quit".into(),
         },
     };
     Paragraph::new(text)
@@ -89,8 +129,15 @@ fn board(frame: &mut Frame, app: &App, area: Rect) {
         let list_items: Vec<ListItem> = items
             .iter()
             .map(|i| {
-                let marker = if app.run_for(&i.id).is_some() { "▶ " } else { "" };
-                ListItem::new(format!("{}{}\n  {}", marker, i.id, trunc(&i.title, width)))
+                let marker = match app.run_for(&i.id) {
+                    Some(r) if r.state == RunState::Blocked => Span::styled("■ ? ", blocked_style()),
+                    Some(_) => Span::raw("▶ "),
+                    None => Span::raw(""),
+                };
+                ListItem::new(Text::from(vec![
+                    Line::from(vec![marker, Span::raw(i.id.to_string())]),
+                    Line::from(format!("  {}", trunc(&i.title, width))),
+                ]))
             })
             .collect();
         let mut state = ListState::default();
@@ -178,21 +225,27 @@ fn agents(frame: &mut Frame, app: &App, area: Rect) {
                 .get(&r.issue_id)
                 .map(|a| a.state.to_string())
                 .unwrap_or_else(|| "?".into());
-            Row::new(vec![
-                Cell::from(r.issue_id.to_string()),
+            let blocked = r.state == RunState::Blocked;
+            let row = Row::new(vec![
+                Cell::from(format!("{}{}", if blocked { "■ " } else { "  " }, r.issue_id)),
                 Cell::from(r.state.to_string()),
                 Cell::from(agent),
                 Cell::from(format!("${:.2}", r.cost_usd)),
                 Cell::from(r.tool_calls.to_string()),
                 Cell::from(r.pane_id.clone().unwrap_or_else(|| "-".into())),
                 Cell::from(trunc(r.exit_reason.as_deref().unwrap_or(""), 40)),
-            ])
+            ]);
+            if blocked {
+                row.style(blocked_style())
+            } else {
+                row
+            }
         })
         .collect();
     let table = Table::new(
         rows,
         [
-            Constraint::Length(10),
+            Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(9),
             Constraint::Length(8),
@@ -329,46 +382,84 @@ fn config(frame: &mut Frame, app: &App, area: Rect) {
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let waiting = app.waiting();
     let show_detail = app.detail && app.view == View::Board && area.height >= 14;
-    let constraints = if show_detail {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(7),
-            Constraint::Length(1),
-        ]
-    } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ]
-    };
+    // The banner line exists only while something waits, so the layout is stable otherwise.
+    let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+    if !waiting.is_empty() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(if show_detail { 5 } else { 3 }));
+    if show_detail {
+        constraints.push(Constraint::Length(7));
+    }
+    constraints.push(Constraint::Length(1));
     let rows = Layout::vertical(constraints).split(area);
     frame.render_widget(Paragraph::new(header_line(app)), rows[0]);
     frame.render_widget(tabs(app), rows[1]);
+    let mut next = 2;
+    if !waiting.is_empty() {
+        frame.render_widget(
+            Paragraph::new(banner_line(&waiting, area.width as usize)),
+            rows[next],
+        );
+        next += 1;
+    }
+    let main = rows[next];
     match app.view {
-        View::Board => board(frame, app, rows[2]),
-        View::Agents => agents(frame, app, rows[2]),
-        View::Inbox => inbox(frame, app, rows[2]),
-        View::Queue => queue(frame, app, rows[2]),
-        View::Log => log(frame, app, rows[2]),
-        View::Config => config(frame, app, rows[2]),
+        View::Board => board(frame, app, main),
+        View::Agents => agents(frame, app, main),
+        View::Inbox => inbox(frame, app, main),
+        View::Queue => queue(frame, app, main),
+        View::Log => log(frame, app, main),
+        View::Config => config(frame, app, main),
     }
     if show_detail {
-        detail(frame, app, rows[3]);
+        detail(frame, app, rows[next + 1]);
     }
     frame.render_widget(footer(app), rows[rows.len() - 1]);
+    if let Mode::Answer { id, screen, text } = &app.mode {
+        answer_overlay(frame, area, id, screen, text.as_deref());
+    }
+}
+
+/// The centred answer modal: the last lines of the worker pane, with the key hints (or the reply
+/// being typed) on the bottom border so they stay visible however long the screen is.
+fn answer_overlay(frame: &mut Frame, area: Rect, id: &IssueId, screen: &str, text: Option<&str>) {
+    let popup = area.centered(
+        Constraint::Percentage(80),
+        Constraint::Length(24.min(area.height)),
+    );
+    let lines: Vec<&str> = screen.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(20)..];
+    let body: Vec<Line> = if tail.is_empty() {
+        vec![Line::from("(reading the pane...)").dark_gray()]
+    } else {
+        tail.iter().map(|l| Line::from((*l).to_string())).collect()
+    };
+    let hint = match text {
+        None => " 1-9 / Enter / Up / Down send keys · y/n · t type text · Esc close ".to_string(),
+        Some(buf) => format!(" reply: {buf}▏ (Enter send · Esc close) "),
+    };
+    let block = Block::bordered()
+        .title(format!(" answer {id} "))
+        .title_bottom(hint)
+        .border_style(Style::default().yellow().bold());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(body).block(block), popup);
+}
+
+/// Renders one frame into a `TestBackend` and returns the cell buffer (symbols and styles).
+pub fn render_to_buffer(app: &App, width: u16, height: u16) -> Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test backend");
+    terminal.draw(|f| render(f, app)).expect("draw");
+    terminal.backend().buffer().clone()
 }
 
 /// Renders one frame into a `TestBackend` and returns it as plain text (no ANSI).
 pub fn render_to_text(app: &App, width: u16, height: u16) -> String {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("test backend");
-    terminal.draw(|f| render(f, app)).expect("draw");
-    let buf = terminal.backend().buffer();
+    let buf = render_to_buffer(app, width, height);
     let mut out = String::new();
     for y in 0..height {
         let mut line = String::new();

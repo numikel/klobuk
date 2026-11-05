@@ -4,8 +4,8 @@ use asf_core::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::app::{board_columns, config_rows, Action, App, Mode, Snapshot, View};
-use super::config_set_status;
-use super::view::render_to_text;
+use super::view::{render_to_buffer, render_to_text};
+use super::{config_set_status, config_unset_status, keys_status};
 
 fn id(s: &str) -> IssueId {
     s.parse().unwrap()
@@ -102,6 +102,7 @@ fn snapshot() -> Snapshot {
             issue("asf-4", "Release", Status::Backlog),
         ],
         config: config_rows(Config::default_toml()),
+        questions: vec![],
         claims: vec![Claim {
             issue_id: id("asf-2"),
             worker: "asf-2".into(),
@@ -238,14 +239,9 @@ fn start_only_for_ready_issues() {
     );
     assert_eq!(a.handle_key(key('m')), Action::Enqueue(id("asf-2")));
     assert_eq!(a.handle_key(key('f')), Action::Focus(id("asf-2")));
-    assert_eq!(
-        a.handle_key(key('y')),
-        Action::Keys(id("asf-2"), vec!["y".into()])
-    );
-    assert_eq!(
-        a.handle_key(key('n')),
-        Action::Keys(id("asf-2"), vec!["n".into()])
-    );
+    // asf-30: bare y/n no longer reach the worker from normal mode.
+    assert_eq!(a.handle_key(key('y')), Action::None);
+    assert_eq!(a.handle_key(key('n')), Action::None);
 }
 
 #[test]
@@ -559,4 +555,444 @@ fn config_rows_read_values_from_the_toml_text() {
     assert_eq!(get("worker.model").raw, "");
     assert_eq!(get("worker.model").value, "(unset)");
     assert_eq!(rows.len(), asf_core::config_edit::editable_keys().len());
+}
+
+// ---------- asf-30: waiting agents ----------
+
+use ratatui::style::{Color, Modifier};
+
+/// asf-2's run is blocked on a prompt; the pane shows a numbered question.
+fn blocked_snapshot() -> Snapshot {
+    let mut s = snapshot();
+    s.runs[0].state = RunState::Blocked;
+    s
+}
+
+fn question(n: i64, i: &str, body: &str, at: &str) -> Comment {
+    let mut c = comment(i, CommentType::Question, body);
+    c.id = n;
+    c.created_at = at.into();
+    c
+}
+
+/// Colour and modifiers of the first cell of `needle`, searched only in screen rows containing `row`.
+fn cell_style(app: &App, row: &str, needle: &str) -> (Color, Modifier) {
+    let (w, h) = (120, 30);
+    let buf = render_to_buffer(app, w, h);
+    for y in 0..h {
+        let line: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        if !line.contains(row) {
+            continue;
+        }
+        if let Some(byte) = line.find(needle) {
+            let x = line[..byte].chars().count() as u16;
+            let c = &buf[(x, y)];
+            return (c.fg, c.modifier);
+        }
+    }
+    panic!("{needle:?} not on screen:\n{}", render_to_text(app, w, h));
+}
+
+fn line_of(text: &str, n: usize) -> String {
+    text.lines().nth(n).unwrap_or("").to_string()
+}
+
+#[test]
+fn header_counts_questions_plus_blocked_runs_only_when_positive() {
+    let t = render_to_text(&app(), 120, 30);
+    assert!(!t.contains("waiting"), "nothing waits, nothing is said:\n{t}");
+
+    let mut s = blocked_snapshot();
+    s.questions = vec![question(7, "asf-3", "which crate?", "2026-11-02T10:06:00Z")];
+    let a = App::new(s);
+    let t = render_to_text(&a, 120, 30);
+    assert!(line_of(&t, 0).contains("2 waiting"), "header:\n{t}");
+    let (fg, m) = cell_style(&a, "asf ·", "2 waiting");
+    assert_eq!(fg, Color::Cyan, "accent colour");
+    assert!(m.contains(Modifier::BOLD));
+}
+
+#[test]
+fn banner_names_a_blocked_run_directly_under_the_tab_bar() {
+    let a = App::new(blocked_snapshot());
+    let t = render_to_text(&a, 120, 30);
+    assert!(line_of(&t, 1).contains("[1] Board"), "tab bar is line 1:\n{t}");
+    assert_eq!(
+        line_of(&t, 2).trim(),
+        "■ asf-2 is waiting for your answer · a answer · f focus pane"
+    );
+    let (fg, m) = cell_style(&a, "is waiting", "■ asf-2 is waiting");
+    assert_eq!(fg, Color::Yellow);
+    assert!(m.contains(Modifier::BOLD));
+}
+
+#[test]
+fn banner_shows_the_first_line_of_an_unanswered_question() {
+    let mut s = snapshot();
+    s.questions = vec![question(
+        7,
+        "asf-3",
+        "Which crate owns the parser?\nsecond line is not shown",
+        "2026-11-02T10:06:00Z",
+    )];
+    let t = render_to_text(&App::new(s), 120, 30);
+    assert_eq!(
+        line_of(&t, 2).trim(),
+        "■ asf-3 asks: Which crate owns the parser?"
+    );
+    assert!(!t.contains("second line is not shown"), "{t}");
+}
+
+#[test]
+fn banner_with_several_waiters_shows_the_oldest_and_a_count() {
+    let mut s = blocked_snapshot(); // run started 10:00
+    s.questions = vec![
+        question(8, "asf-3", "newer question", "2026-11-02T10:09:00Z"),
+        question(7, "asf-4", "older question", "2026-11-02T10:06:00Z"),
+    ];
+    let t = render_to_text(&App::new(s), 120, 30);
+    assert_eq!(
+        line_of(&t, 2).trim(),
+        "■ asf-2 is waiting for your answer · a answer · f focus pane (+2 more)"
+    );
+    let mut s = snapshot();
+    s.questions = vec![
+        question(8, "asf-3", "newer question", "2026-11-02T10:09:00Z"),
+        question(7, "asf-4", "older question", "2026-11-02T10:06:00Z"),
+    ];
+    let t = render_to_text(&App::new(s), 120, 30);
+    assert_eq!(line_of(&t, 2).trim(), "■ asf-4 asks: older question (+1 more)");
+}
+
+#[test]
+fn long_question_is_truncated_but_keeps_the_more_suffix_inside_the_width() {
+    let mut s = snapshot();
+    s.questions = vec![
+        question(
+            7,
+            "asf-4",
+            &"very long question ".repeat(10),
+            "2026-11-02T10:06:00Z",
+        ),
+        question(8, "asf-3", "other", "2026-11-02T10:07:00Z"),
+    ];
+    let t = render_to_text(&App::new(s), 50, 20);
+    let l = line_of(&t, 2);
+    assert!(l.chars().count() <= 50, "{l:?}");
+    assert!(
+        l.starts_with("■ asf-4 asks: very long") && l.contains('…'),
+        "{l:?}"
+    );
+    assert!(l.trim_end().ends_with("(+1 more)"), "{l:?}");
+}
+
+#[test]
+fn banner_is_visible_in_every_view() {
+    let mut a = App::new(blocked_snapshot());
+    for c in '1'..='6' {
+        a.handle_key(key(c));
+        let t = render_to_text(&a, 120, 30);
+        assert!(
+            line_of(&t, 2).starts_with("■ asf-2 is waiting"),
+            "view {:?}:\n{t}",
+            a.view
+        );
+    }
+}
+
+#[test]
+fn no_banner_and_no_reserved_line_when_nothing_waits() {
+    let t = render_to_text(&app(), 120, 30);
+    assert!(
+        line_of(&t, 2).contains("backlog"),
+        "content starts right under the tab bar:\n{t}"
+    );
+    assert!(!t.contains("is waiting for your answer") && !t.contains(" asks:"));
+}
+
+#[test]
+fn answered_question_is_not_waiting() {
+    let q = question(7, "asf-3", "which crate?", "2026-11-02T10:06:00Z");
+    let mut ans = comment("asf-3", CommentType::Answer, "the core one");
+    ans.id = 9;
+    ans.reply_to = Some(7);
+    assert!(super::app::unanswered_questions(&[q.clone(), ans]).is_empty());
+    assert_eq!(
+        super::app::unanswered_questions(std::slice::from_ref(&q)),
+        vec![7]
+    );
+    let mut other = q;
+    other.to_lane = "orchestrator".into();
+    assert!(super::app::unanswered_questions(&[other]).is_empty());
+}
+
+#[test]
+fn board_marks_a_blocked_run_with_a_red_bold_question_marker() {
+    let a = App::new(blocked_snapshot());
+    let t = render_to_text(&a, 120, 30);
+    assert!(t.contains("■ ? asf-2") && !t.contains('▶'), "{t}");
+    let (fg, m) = cell_style(&a, "■ ? asf-2", "■ ? asf-2");
+    assert_eq!(fg, Color::Red);
+    assert!(m.contains(Modifier::BOLD));
+    let t = render_to_text(&app(), 120, 30);
+    assert!(
+        t.contains("▶ asf-2") && !t.contains('■'),
+        "a working run keeps its marker:\n{t}"
+    );
+}
+
+#[test]
+fn agents_row_of_a_blocked_run_starts_with_a_red_bold_square() {
+    let mut a = App::new(blocked_snapshot());
+    a.handle_key(key('2'));
+    let t = render_to_text(&a, 120, 30);
+    let row = t
+        .lines()
+        .find(|l| l.contains("asf-2") && l.contains("blocked") && l.contains('│'))
+        .unwrap_or_else(|| panic!("no agents row:\n{t}"));
+    assert!(row.trim_start_matches([' ', '│']).starts_with('■'), "{row:?}");
+    let (fg, m) = cell_style(&a, "blocked", "■");
+    assert_eq!(fg, Color::Red);
+    assert!(m.contains(Modifier::BOLD));
+    let mut w = App::new(snapshot());
+    w.handle_key(key('2'));
+    assert!(!render_to_text(&w, 120, 30).contains('■'));
+}
+
+// ---------- answer overlay ----------
+
+fn open_overlay() -> App {
+    let mut a = App::new(blocked_snapshot());
+    a.handle_key(key('2'));
+    assert_eq!(a.handle_key(key('a')), Action::Peek(id("asf-2")));
+    a
+}
+
+#[test]
+fn a_opens_the_overlay_only_for_a_blocked_run() {
+    let mut w = App::new(snapshot());
+    w.handle_key(key('2')); // asf-2 is working
+    assert_eq!(w.handle_key(key('a')), Action::None);
+    assert!(matches!(w.mode, Mode::Normal));
+    assert!(
+        w.status.as_deref().unwrap_or("").contains("no blocked run"),
+        "{:?}",
+        w.status
+    );
+    // an issue without a run (the board starts on asf-4, backlog)
+    let mut b = App::new(blocked_snapshot());
+    assert_eq!(b.handle_key(key('a')), Action::None);
+    assert!(matches!(b.mode, Mode::Normal));
+    // a blocked run, from Board, Agents and Inbox
+    for (view, steps) in [('1', 2), ('2', 0), ('3', 0)] {
+        let mut a = App::new(blocked_snapshot());
+        a.handle_key(key(view));
+        for _ in 0..steps {
+            a.handle_key(key('j'));
+        }
+        assert_eq!(a.handle_key(key('a')), Action::Peek(id("asf-2")), "view {view}");
+        assert!(matches!(a.mode, Mode::Answer { .. }));
+    }
+}
+
+#[test]
+fn overlay_renders_title_screen_and_hints() {
+    let mut a = open_overlay();
+    a.set_screen("Do you want to proceed?\n 1. Yes\n 2. No".into());
+    let t = render_to_text(&a, 100, 30);
+    for needle in [
+        "answer asf-2",
+        "Do you want to proceed?",
+        "1. Yes",
+        "2. No",
+        "Esc",
+    ] {
+        assert!(t.contains(needle), "missing {needle:?}:\n{t}");
+    }
+    // tiny terminals must not panic
+    let _ = render_to_text(&a, 20, 5);
+}
+
+#[test]
+fn digit_in_the_overlay_sends_keys_and_does_not_switch_views() {
+    let mut a = open_overlay();
+    assert_eq!(a.view, View::Agents);
+    assert_eq!(
+        a.handle_key(key('3')),
+        Action::Keys(id("asf-2"), vec!["3".into()])
+    );
+    assert_eq!(a.view, View::Agents, "digit is an answer, not a view switch");
+    assert!(matches!(a.mode, Mode::Normal), "modal closes after sending");
+}
+
+#[test]
+fn enter_up_down_y_n_are_sent_as_keys() {
+    for (k, name) in [
+        (code(KeyCode::Enter), "enter"),
+        (code(KeyCode::Up), "up"),
+        (code(KeyCode::Down), "down"),
+        (key('y'), "y"),
+        (key('n'), "n"),
+    ] {
+        let mut a = open_overlay();
+        assert_eq!(
+            a.handle_key(k),
+            Action::Keys(id("asf-2"), vec![name.into()]),
+            "{name}"
+        );
+        assert!(matches!(a.mode, Mode::Normal));
+    }
+}
+
+#[test]
+fn esc_closes_the_overlay_and_sends_nothing() {
+    let mut a = open_overlay();
+    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
+    assert!(matches!(a.mode, Mode::Normal));
+    assert_eq!(a.view, View::Agents);
+}
+
+#[test]
+fn no_other_binding_is_active_while_the_overlay_is_open() {
+    let mut a = open_overlay();
+    for c in ['q', 's', 'x', 'f', 'm', 'r', 'R', 'j', 'k', 'a', '0', 'd'] {
+        assert_eq!(a.handle_key(key(c)), Action::None, "{c}");
+        assert!(
+            matches!(a.mode, Mode::Answer { .. }),
+            "{c} must not close or change the modal"
+        );
+        assert_eq!(a.view, View::Agents);
+    }
+}
+
+#[test]
+fn t_switches_to_text_input_that_is_sent_as_a_reply() {
+    let mut a = open_overlay();
+    assert_eq!(a.handle_key(key('t')), Action::None);
+    for c in "use 2".chars() {
+        assert_eq!(a.handle_key(key(c)), Action::None, "typed {c}");
+    }
+    a.handle_key(code(KeyCode::Backspace));
+    a.handle_key(key('3'));
+    a.set_screen("refreshed screen".into()); // a late peek must not drop the typed text
+    let t = render_to_text(&a, 100, 30);
+    assert!(t.contains("use 3"), "{t}");
+    assert_eq!(
+        a.handle_key(code(KeyCode::Enter)),
+        Action::Reply(id("asf-2"), "use 3".into())
+    );
+    assert!(matches!(a.mode, Mode::Normal));
+    // empty text is not sent; Esc closes without sending
+    let mut a = open_overlay();
+    a.handle_key(key('t'));
+    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::None);
+    a.handle_key(key('x'));
+    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
+    assert!(matches!(a.mode, Mode::Normal));
+}
+
+#[test]
+fn sent_keys_are_reported_in_the_status_line() {
+    assert_eq!(
+        keys_status(&id("asf-27"), &["2".into(), "enter".into()]),
+        "sent 2 enter to asf-27"
+    );
+}
+
+#[test]
+fn footer_lists_a_answer_and_no_longer_y_n_keys() {
+    let t = render_to_text(&app(), 200, 30);
+    assert!(t.contains("a answer") && !t.contains("y/n keys"), "{t}");
+}
+
+// ---------- d = unset an optional config key ----------
+
+fn config_app(toml: &str, wanted: &str) -> App {
+    let mut s = snapshot();
+    s.config = config_rows(toml);
+    let mut a = App::new(s);
+    select_config_key(&mut a, wanted);
+    a
+}
+
+#[test]
+fn d_asks_for_confirmation_and_y_returns_the_unset_action() {
+    for key_name in ["worker.model", "review.model"] {
+        let mut a = config_app(
+            "[worker]\nmodel = \"sonnet\"\n[review]\nmodel = \"sonnet\"\n",
+            key_name,
+        );
+        assert_eq!(a.handle_key(key('d')), Action::None);
+        match &a.mode {
+            Mode::Confirm { what, .. } => {
+                assert!(what.contains(&format!("unset {key_name}?")), "{what}")
+            }
+            other => panic!("expected confirm, got {other:?}"),
+        }
+        let t = render_to_text(&a, 120, 30);
+        assert!(t.contains(&format!("unset {key_name}?")), "{t}");
+        assert_eq!(a.handle_key(key('y')), Action::UnsetConfig(key_name.into()));
+        assert!(matches!(a.mode, Mode::Normal));
+    }
+}
+
+#[test]
+fn any_other_key_cancels_the_unset() {
+    for cancel in [
+        key('n'),
+        key('q'),
+        code(KeyCode::Enter),
+        code(KeyCode::Esc),
+        key('d'),
+    ] {
+        let mut a = config_app("[worker]\nmodel = \"sonnet\"\n", "worker.model");
+        a.handle_key(key('d'));
+        assert_eq!(a.handle_key(cancel), Action::None);
+        assert!(matches!(a.mode, Mode::Normal));
+    }
+}
+
+#[test]
+fn d_on_a_required_key_or_an_already_unset_one_only_sets_a_status() {
+    let mut a = config_app(Config::default_toml(), "scheduler.max_parallel");
+    assert_eq!(a.handle_key(key('d')), Action::None);
+    assert!(matches!(a.mode, Mode::Normal));
+    assert!(
+        a.status.as_deref().unwrap_or("").contains("cannot be unset"),
+        "{:?}",
+        a.status
+    );
+    let mut a = config_app(Config::default_toml(), "worker.model"); // unset by default
+    assert_eq!(a.handle_key(key('d')), Action::None);
+    assert!(matches!(a.mode, Mode::Normal));
+    assert!(
+        a.status.as_deref().unwrap_or("").contains("already unset"),
+        "{:?}",
+        a.status
+    );
+    // d outside the Config view does nothing
+    let mut b = app();
+    assert_eq!(b.handle_key(key('d')), Action::None);
+    assert!(matches!(b.mode, Mode::Normal) && b.status.is_none());
+}
+
+#[test]
+fn confirmed_unset_removes_the_line_from_config_toml_and_reports() {
+    let (dir, path) = config_dir("# keep me\n[worker]\nbudget_usd = 5.0\nmodel = \"sonnet\"\n");
+    let msg = config_unset_status(dir.path(), "worker.model");
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, "# keep me\n[worker]\nbudget_usd = 5.0\n");
+    assert!(
+        !msg.starts_with("error") && msg.contains("worker.model") && msg.contains("(unset)"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn refused_unset_leaves_the_file_byte_identical() {
+    let (dir, path) = config_dir(Config::default_toml());
+    let before = std::fs::read(&path).unwrap();
+    let msg = config_unset_status(dir.path(), "scheduler.max_parallel");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(msg.starts_with("error"), "{msg}");
 }

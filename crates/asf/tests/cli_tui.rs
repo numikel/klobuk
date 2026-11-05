@@ -97,3 +97,82 @@ fn tui_once_board_has_a_validating_column() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("validating"), "{text}");
 }
+
+fn ask(repo: &Repo, issue: &str, body: &str) -> String {
+    let v = repo.ok(&[
+        "--lane", issue, "issue", "comment", issue, "--type", "QUESTION", "--to", "human", "--body", body,
+    ]);
+    v["id"].as_i64().unwrap().to_string()
+}
+
+fn tui_once_text(repo: &Repo) -> String {
+    let out = repo.asf().args(["tui", "--once"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+#[test]
+fn tui_once_shows_a_banner_for_an_unanswered_question_and_drops_it_when_answered() {
+    let repo = fake_repo();
+    let a = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
+    let quiet = tui_once_text(&repo);
+    assert!(!quiet.contains("waiting") && !quiet.contains(" asks:"), "{quiet}");
+
+    let qid = ask(&repo, &a, "Which crate owns the parser?\nsecond line");
+    let text = tui_once_text(&repo);
+    let banner = text.lines().nth(2).unwrap_or_default();
+    assert_eq!(
+        banner.trim(),
+        format!("■ {a} asks: Which crate owns the parser?"),
+        "{text}"
+    );
+    assert!(text.lines().next().unwrap().contains("1 waiting"), "{text}");
+
+    // Reading the inbox (cursor advance) must not hide a question that still blocks `finish`.
+    repo.ok(&["--lane", "human", "issue", "inbox"]);
+    let text = tui_once_text(&repo);
+    assert!(
+        text.lines().nth(2).unwrap_or_default().contains(" asks:"),
+        "{text}"
+    );
+
+    repo.ok(&[
+        "--lane",
+        "human",
+        "issue",
+        "comment",
+        &a,
+        "--type",
+        "ANSWER",
+        "--to",
+        &a,
+        "--reply-to",
+        &qid,
+        "--body",
+        "asf-core",
+    ]);
+    let text = tui_once_text(&repo);
+    assert!(!text.contains("waiting") && !text.contains(" asks:"), "{text}");
+}
+
+#[test]
+fn tui_once_banner_shows_in_other_views_too() {
+    let repo = fake_repo();
+    let a = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
+    ask(&repo, &a, "pick one");
+    for view in ["agents", "queue", "log", "config"] {
+        let out = repo
+            .asf()
+            .args(["tui", "--once", "--view", view])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.lines()
+                .nth(2)
+                .unwrap_or_default()
+                .starts_with(&format!("■ {a} asks: pick one")),
+            "{view}:\n{text}"
+        );
+    }
+}

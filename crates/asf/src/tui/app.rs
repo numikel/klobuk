@@ -21,6 +21,8 @@ pub struct Snapshot {
     pub agents: BTreeMap<IssueId, AgentInfo>,
     /// Unread comments addressed to the human (peeked).
     pub inbox: Vec<Comment>,
+    /// Every unanswered QUESTION to the human on a live issue, read or not, oldest first.
+    pub questions: Vec<Comment>,
     pub queue: Vec<MergeItem>,
     /// Newest first.
     pub events: Vec<Event>,
@@ -64,6 +66,43 @@ pub fn config_rows(toml: &str) -> Vec<ConfigRow> {
             }
         })
         .collect()
+}
+
+/// Ids of the QUESTION comments to the human among `comments` that nobody has answered. A question
+/// counts as answered when an ANSWER comment replies to it (`--reply-to`) or `resolved_at` is set;
+/// the same rule `asf issue finish` applies.
+pub fn unanswered_questions(comments: &[Comment]) -> Vec<i64> {
+    comments
+        .iter()
+        .filter(|q| q.kind == CommentType::Question && q.to_lane == LANE_HUMAN && q.resolved_at.is_none())
+        .filter(|q| {
+            !comments
+                .iter()
+                .any(|a| a.kind == CommentType::Answer && a.reply_to == Some(q.id))
+        })
+        .map(|q| q.id)
+        .collect()
+}
+
+/// Something that needs the human before it can go on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Waiting {
+    /// A run in `blocked`: the agent sits on a prompt.
+    Run { issue: IssueId, since: String },
+    /// An unanswered QUESTION to the human.
+    Question {
+        issue: IssueId,
+        body: String,
+        since: String,
+    },
+}
+
+impl Waiting {
+    pub fn since(&self) -> &str {
+        match self {
+            Waiting::Run { since, .. } | Waiting::Question { since, .. } => since,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -120,6 +159,10 @@ pub enum Action {
     MarkRead(IssueId),
     /// Write `value` to the dotted config `key` (`.factory/config.toml`).
     SetConfig(String, String),
+    /// Remove the optional config `key` from `.factory/config.toml`.
+    UnsetConfig(String),
+    /// Read the worker's pane so the answer overlay can show what it asks.
+    Peek(IssueId),
 }
 
 /// What the input line is typing for.
@@ -140,6 +183,13 @@ pub enum Mode {
     Confirm {
         what: String,
         action: Box<Action>,
+    },
+    /// The answer overlay for a blocked run. `text` is `Some` while a free-text reply is typed.
+    Answer {
+        id: IssueId,
+        /// Last lines of the worker pane (empty until the peek arrives).
+        screen: String,
+        text: Option<String>,
     },
 }
 
@@ -236,6 +286,35 @@ impl App {
         self.snap.runs.iter().find(|r| &r.issue_id == id)
     }
 
+    /// Blocked runs and unanswered questions, oldest first (RFC 3339 UTC strings sort by time; a run
+    /// counts from its start because the store keeps no "blocked since").
+    pub fn waiting(&self) -> Vec<Waiting> {
+        let runs = self
+            .snap
+            .runs
+            .iter()
+            .filter(|r| r.state == RunState::Blocked)
+            .map(|r| Waiting::Run {
+                issue: r.issue_id.clone(),
+                since: r.started_at.clone(),
+            });
+        let questions = self.snap.questions.iter().map(|c| Waiting::Question {
+            issue: c.issue_id.clone(),
+            body: c.body.clone(),
+            since: c.created_at.clone(),
+        });
+        let mut all: Vec<Waiting> = runs.chain(questions).collect();
+        all.sort_by(|a, b| a.since().cmp(b.since()));
+        all
+    }
+
+    /// Feeds the pane text read for the open answer overlay; anything else ignores it.
+    pub fn set_screen(&mut self, text: String) {
+        if let Mode::Answer { screen, .. } = &mut self.mode {
+            *screen = text;
+        }
+    }
+
     fn move_sel(&mut self, delta: i64) {
         let n = self.rows(self.view) as i64;
         if n == 0 {
@@ -244,6 +323,64 @@ impl App {
         let cur = self.selected(self.view) as i64;
         let next = (cur + delta).clamp(0, n - 1) as usize;
         self.sel.insert(self.view, next);
+    }
+
+    /// Keys inside the answer overlay: nothing else is bound while it is open. Digits, Enter, Up,
+    /// Down, `y` and `n` go to the worker pane as keys and close the overlay; `t` types a reply;
+    /// Esc closes without sending.
+    fn handle_answer_key(
+        &mut self,
+        key: KeyEvent,
+        id: IssueId,
+        screen: String,
+        text: Option<String>,
+    ) -> Action {
+        let keys = |name: &str, id: IssueId| Action::Keys(id, vec![name.to_string()]);
+        if let Some(mut buf) = text {
+            return match key.code {
+                KeyCode::Esc => Action::None,
+                KeyCode::Enter if !buf.trim().is_empty() => Action::Reply(id, buf.trim().to_string()),
+                other => {
+                    match other {
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
+                    }
+                    self.mode = Mode::Answer {
+                        id,
+                        screen,
+                        text: Some(buf),
+                    };
+                    Action::None
+                }
+            };
+        }
+        match key.code {
+            KeyCode::Esc => Action::None,
+            KeyCode::Char(c @ '1'..='9') => keys(&c.to_string(), id.clone()),
+            KeyCode::Char(c @ ('y' | 'n')) => keys(&c.to_string(), id.clone()),
+            KeyCode::Enter => keys("enter", id.clone()),
+            KeyCode::Up => keys("up", id.clone()),
+            KeyCode::Down => keys("down", id.clone()),
+            KeyCode::Char('t') => {
+                self.mode = Mode::Answer {
+                    id,
+                    screen,
+                    text: Some(String::new()),
+                };
+                Action::None
+            }
+            _ => {
+                self.mode = Mode::Answer {
+                    id,
+                    screen,
+                    text: None,
+                };
+                Action::None
+            }
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -288,6 +425,7 @@ impl App {
                     _ => Action::None,
                 };
             }
+            Mode::Answer { id, screen, text } => return self.handle_answer_key(key, id, screen, text),
             Mode::Normal => {}
         }
         match key.code {
@@ -344,11 +482,40 @@ impl App {
                 .cloned()
                 .map(Action::Focus)
                 .unwrap_or(Action::None),
-            KeyCode::Char(c @ ('y' | 'n')) => self
-                .selected_issue()
-                .cloned()
-                .map(|id| Action::Keys(id, vec![c.to_string()]))
-                .unwrap_or(Action::None),
+            KeyCode::Char('a') if matches!(self.view, View::Board | View::Agents | View::Inbox) => {
+                match self.selected_issue().cloned() {
+                    Some(id) if self.run_for(&id).is_some_and(|r| r.state == RunState::Blocked) => {
+                        self.mode = Mode::Answer {
+                            id: id.clone(),
+                            screen: String::new(),
+                            text: None,
+                        };
+                        Action::Peek(id)
+                    }
+                    Some(id) => {
+                        self.status = Some(format!("{id} has no blocked run to answer"));
+                        Action::None
+                    }
+                    None => Action::None,
+                }
+            }
+            KeyCode::Char('d') if self.view == View::Config => {
+                let Some(row) = self.snap.config.get(self.selected(View::Config)) else {
+                    return Action::None;
+                };
+                let key = row.key.clone();
+                if !asf_core::config_edit::unsettable_keys().contains(&key.as_str()) {
+                    self.status = Some(format!("{key} cannot be unset"));
+                } else if row.raw.is_empty() {
+                    self.status = Some(format!("{key} is already unset"));
+                } else {
+                    self.mode = Mode::Confirm {
+                        what: format!("unset {key}?"),
+                        action: Box::new(Action::UnsetConfig(key)),
+                    };
+                }
+                Action::None
+            }
             KeyCode::Char('r') => {
                 if let Some(id) = self.selected_issue().cloned() {
                     self.mode = Mode::Input {

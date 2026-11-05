@@ -21,7 +21,7 @@ use crate::commands::merge::tick_all;
 use crate::ctx::{Ctx, CONFIG_FILE, FACTORY_DIR};
 use crate::output::AppError;
 use crate::worker::Worker;
-use app::{config_rows, Action, App, Snapshot, View};
+use app::{config_rows, unanswered_questions, Action, App, Snapshot, View};
 
 const KEY_POLL: Duration = Duration::from_millis(200);
 const STORE_REFRESH: Duration = Duration::from_secs(1);
@@ -39,17 +39,58 @@ fn read_config_text(root: &Path) -> std::io::Result<String> {
 /// The file is written only when `config_edit::set_key` accepted the value; a refused key or value
 /// (or an unreadable file) leaves it byte-identical and yields an `error: ...` line instead.
 pub(crate) fn config_set_status(root: &Path, key: &str, value: &str) -> String {
+    config_edit_status(root, key, |text| asf_core::config_edit::set_key(text, key, value))
+}
+
+/// Removes an optional config key and returns the status line for it; same file rules as
+/// [`config_set_status`] (a refused key leaves the file byte-identical).
+pub(crate) fn config_unset_status(root: &Path, key: &str) -> String {
+    config_edit_status(root, key, |text| asf_core::config_edit::unset_key(text, key))
+}
+
+/// Status line for a sent key sequence: `sent 2 enter to asf-27`.
+pub(crate) fn keys_status(id: &IssueId, keys: &[String]) -> String {
+    format!("sent {} to {id}", keys.join(" "))
+}
+
+/// The last 20 lines of the worker pane for the answer overlay, or a note saying why it is not there.
+fn peek_screen(worker: &Worker<'_>, id: &IssueId) -> String {
+    let run = match worker.run_for(id) {
+        Ok(r) => r,
+        Err(e) => return format!("(cannot read {id}: {})", e.message),
+    };
+    let (Some(pane), Some(name)) = (&run.pane_id, &run.agent_name) else {
+        return format!("(run of {id} has no pane)");
+    };
+    let handle = AgentHandle {
+        name: name.clone(),
+        pane_id: pane.clone(),
+        workspace_id: run.workspace_id.clone().unwrap_or_default(),
+    };
+    worker
+        .rt
+        .read(&handle, 20)
+        .unwrap_or_else(|e| format!("(cannot read the pane: {e})"))
+}
+
+fn config_edit_status(
+    root: &Path,
+    key: &str,
+    edit: impl FnOnce(&str) -> Result<String, asf_core::ConfigError>,
+) -> String {
     let path = root.join(FACTORY_DIR).join(CONFIG_FILE);
     let text = match read_config_text(root) {
         Ok(t) => t,
         Err(e) => return format!("error: cannot read {}: {e}", path.display()),
     };
-    let edited = match asf_core::config_edit::set_key(&text, key, value) {
+    let edited = match edit(&text) {
         Ok(t) => t,
         Err(e) => return format!("error: {e}"),
     };
-    if let Err(e) = std::fs::write(&path, edited.as_bytes()) {
-        return format!("error: cannot write {}: {e}", path.display());
+    if edited != text {
+        if let Err(e) = std::fs::write(&path, edited.as_bytes()) {
+            return format!("error: cannot write {}: {e}", path.display());
+        }
     }
     let shown = |t: &str| {
         config_rows(t)
@@ -95,6 +136,19 @@ pub fn load_snapshot(
         events = events.split_off(events.len() - LOG_LIMIT);
     }
     events.reverse();
+    let issues = store.list_issues(&IssueFilter::default())?;
+    // Unanswered questions are read from all comments, not the inbox: marking the inbox read must
+    // not hide a question that still blocks `asf issue finish`.
+    let mut questions = Vec::new();
+    for issue in issues
+        .iter()
+        .filter(|i| !matches!(i.status, Status::Done | Status::Cancelled))
+    {
+        let comments = store.comments(&issue.id)?;
+        let open = unanswered_questions(&comments);
+        questions.extend(comments.into_iter().filter(|c| open.contains(&c.id)));
+    }
+    questions.sort_by(|a, b| (&a.created_at, a.id).cmp(&(&b.created_at, b.id)));
     Ok(Snapshot {
         repo_name: ctx
             .root
@@ -104,11 +158,12 @@ pub fn load_snapshot(
         branch: ctx.config.repo.default_branch.clone(),
         runtime_ok,
         max_parallel: ctx.config.scheduler.max_parallel,
-        issues: store.list_issues(&IssueFilter::default())?,
+        issues,
         claims: store.active_claims()?,
         runs,
         agents,
         inbox: store.inbox(LANE_HUMAN, true, false)?,
+        questions,
         queue: store
             .merge_queue()?
             .into_iter()
@@ -122,7 +177,8 @@ pub fn load_snapshot(
 /// Executes one action; returns the status line to show.
 fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<String>, AppError> {
     Ok(match action {
-        Action::None | Action::Quit | Action::Refresh => None,
+        // Peek is served by the event loop (it needs the app state); nothing to run here.
+        Action::None | Action::Quit | Action::Refresh | Action::Peek(_) => None,
         Action::Tick => {
             let w = worker.watch()?;
             let m = tick_all(ctx, false)?;
@@ -163,7 +219,7 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
         }
         Action::Keys(id, keys) => {
             worker.keys(&id, &keys)?;
-            Some(format!("keys {} sent to {id}", keys.join(" ")))
+            Some(keys_status(&id, &keys))
         }
         Action::Enqueue(id) => {
             let m = crate::commands::merge::enqueue_checked(ctx, &id, false)?;
@@ -174,6 +230,7 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
             Some(format!("aborted {id}"))
         }
         Action::SetConfig(key, value) => Some(config_set_status(&ctx.root, &key, &value)),
+        Action::UnsetConfig(key) => Some(config_unset_status(&ctx.root, &key)),
         Action::MarkRead(_) => {
             let n = ctx.store.inbox(LANE_HUMAN, false, false)?.len();
             Some(format!("inbox: {n} item(s) marked read"))
@@ -224,6 +281,9 @@ fn event_loop(
                 let action = app.handle_key(key);
                 if action == Action::Quit {
                     return Ok(());
+                }
+                if let Action::Peek(id) = &action {
+                    app.set_screen(peek_screen(worker, id));
                 }
                 let refresh = action != Action::None;
                 match execute(action, ctx, worker) {
