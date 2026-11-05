@@ -476,3 +476,164 @@ fn start_tolerates_a_startup_detection_timeout_when_the_agent_comes_up() {
         "never restarted"
     );
 }
+
+// ---- `asf run verify` -------------------------------------------------------------------------
+
+/// Adds a gate that passes only once `src/fixed.rs` exists in the worktree.
+fn add_fixed_file_gate(f: &F) {
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(
+        "\n[[gate]]\nname = \"needs-fix\"\ncmd = [\"python\", \"-c\", \"import os, sys; print('fix missing'); sys.exit(0 if os.path.exists('src/fixed.rs') else 2)\"]\n",
+    );
+    std::fs::write(&cfg, s).unwrap();
+}
+
+/// The worker's side: commit an in-scope change, write the report, run `issue finish`.
+fn worker_finishes(f: &F) {
+    commit_in(&wt(f), "src/greet.rs", "pub fn hello() {}\n");
+    let report = wt(f)
+        .join(".factory")
+        .join("runs")
+        .join(&f.issue)
+        .join("report.md");
+    std::fs::write(&report, "# done\n").unwrap();
+    f.repo.ok(&[
+        "--lane",
+        &f.issue,
+        "issue",
+        "finish",
+        &f.issue,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+}
+
+fn blockers(f: &F) -> usize {
+    store(f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .iter()
+        .filter(|c| c.kind == CommentType::Blocker)
+        .count()
+}
+
+#[test]
+fn verify_succeeds_after_a_failed_gate_is_fixed_and_enqueues_the_branch() {
+    let f = setup();
+    add_fixed_file_gate(&f);
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "failed", "{res}");
+    assert!(active_run(&f).exit_reason.unwrap().contains("needs-fix"));
+    assert!(store(&f).merge_queue().unwrap().is_empty());
+
+    // still broken: verify fails again, the run stays failed and a new BLOCKER is posted
+    let res = f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(
+        (res["from"].as_str(), res["to"].as_str()),
+        (Some("failed"), Some("failed")),
+        "{res}"
+    );
+    assert_eq!(active_run(&f).state, RunState::Failed);
+    assert!(active_run(&f).exit_reason.unwrap().contains("fix missing"));
+    assert_eq!(blockers(&f), 2);
+    assert!(store(&f).merge_queue().unwrap().is_empty());
+
+    // fix it, verify again
+    commit_in(&wt(&f), "src/fixed.rs", "\n");
+    let res = f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(res["from"], "failed", "{res}");
+    assert_eq!(res["to"], "succeeded", "{res}");
+    let run = active_run(&f);
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(run.exit_reason.as_deref(), Some("verified"));
+    let q = store(&f).merge_queue().unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].branch, "feat/asf-1");
+    assert_eq!(q[0].state, MergeState::Queued);
+    assert_eq!(blockers(&f), 2, "no BLOCKER on success");
+}
+
+#[test]
+fn verify_accepts_a_finishing_run_without_waiting_for_watch() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    assert_eq!(active_run(&f).state, RunState::Finishing);
+    let res = f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(res["to"], "succeeded", "{res}");
+    assert_eq!(store(&f).merge_queue().unwrap().len(), 1);
+}
+
+#[test]
+fn verify_without_a_run_is_a_conflict() {
+    let f = setup();
+    let (code, ecode, msg) = f.repo.err(&["run", "verify", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (3, "conflict"));
+    assert_eq!(msg, "no run to verify");
+}
+
+#[test]
+fn verify_of_a_succeeded_run_is_a_conflict() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    f.repo.ok(&["run", "verify", &f.issue]);
+    let (code, ecode, msg) = f.repo.err(&["run", "verify", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (3, "conflict"));
+    assert_eq!(msg, "already verified and queued");
+    assert_eq!(store(&f).merge_queue().unwrap().len(), 1);
+}
+
+#[test]
+fn verify_while_the_worker_is_active_is_a_conflict() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    for state in [RunState::Starting, RunState::Working, RunState::Blocked] {
+        store(&f)
+            .update_run(
+                &active_run(&f).id,
+                &RunPatch {
+                    state: Some(state),
+                    ..RunPatch::default()
+                },
+            )
+            .unwrap();
+        let (code, ecode, msg) = f.repo.err(&["run", "verify", &f.issue]);
+        assert_eq!((code, ecode.as_str()), (3, "conflict"), "{state}");
+        assert_eq!(
+            msg, "worker still active; wait for `asf issue finish` or `asf run abort`",
+            "{state}"
+        );
+        assert_eq!(active_run(&f).state, state, "refusal changes nothing");
+    }
+}
+
+#[test]
+fn verify_of_an_aborted_run_is_a_conflict() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    f.repo.ok(&["run", "abort", &f.issue]);
+    let (code, ecode, msg) = f.repo.err(&["run", "verify", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (3, "conflict"));
+    assert_eq!(msg, "run was aborted; dispatch again");
+}
+
+#[test]
+fn verify_is_refused_inside_a_worker_run() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let out = f
+        .repo
+        .asf()
+        .env("ASF_RUN", "01RUN")
+        .args(["run", "verify", &f.issue, "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "forbidden", "{v}");
+    assert_eq!(active_run(&f).state, RunState::Finishing, "nothing was verified");
+}

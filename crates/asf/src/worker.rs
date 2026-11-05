@@ -619,6 +619,32 @@ impl<'a> Worker<'a> {
         })
     }
 
+    /// Operator-triggered rerun of the verification `watch` performs. State checks come first and
+    /// are conflicts (exit 3); only `failed`, `finishing` and `verifying` runs reach the gates.
+    pub fn verify_issue(&self, id: &IssueId) -> Result<Transition, AppError> {
+        let store = &self.ctx.store;
+        let issue = store
+            .get_issue(id)?
+            .ok_or_else(|| AppError::not_found(format!("issue {id}")))?;
+        let run = store
+            .runs(Some(id), false)?
+            .into_iter()
+            .last()
+            .ok_or_else(|| AppError::conflict("no run to verify"))?;
+        match run.state {
+            RunState::Succeeded => Err(AppError::conflict("already verified and queued")),
+            RunState::Starting
+            | RunState::Working
+            | RunState::Blocked
+            | RunState::Stalled
+            | RunState::OverBudget => Err(AppError::conflict(
+                "worker still active; wait for `asf issue finish` or `asf run abort`",
+            )),
+            RunState::Aborted => Err(AppError::conflict("run was aborted; dispatch again")),
+            RunState::Failed | RunState::Finishing | RunState::Verifying => self.verify(&run, &issue),
+        }
+    }
+
     /// Independent verification after the worker's finish ritual.
     fn verify(&self, run: &Run, issue: &Issue) -> Result<Transition, AppError> {
         let wt_abs = self.ctx.root.join(&run.worktree);

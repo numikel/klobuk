@@ -433,6 +433,8 @@ pub enum RunCmd {
     Nudge { id: IssueId },
     /// Stop the worker, release the claim, close the workspace; the worktree is kept.
     Abort { id: IssueId },
+    /// Rerun the verification `watch` does (scope, clean tree, gates) for a failed or finished run; on success enqueue the merge.
+    Verify { id: IssueId },
     /// Poll active runs: post BLOCKERs for waiting agents, verify finished work, enqueue merges.
     Watch {
         /// One pass (the default for now; `asf serve` loops).

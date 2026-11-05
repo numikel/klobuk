@@ -82,6 +82,17 @@ pub fn run(cli: &Cli, cmd: &RunCmd) -> Result<Rendered, AppError> {
                 format!("{} aborted (claim released, worktree kept)", r.issue_id),
             )
         }
+        RunCmd::Verify { id } => {
+            let t = Worker::new(&ctx)?.verify_issue(id)?;
+            let text = format!(
+                "{} {} -> {}: {}",
+                t.issue_id,
+                t.from,
+                t.to,
+                t.detail.lines().next().unwrap_or("")
+            );
+            Rendered::new(&t, text)
+        }
         RunCmd::Watch { once: _ } => {
             let w = Worker::new(&ctx)?.watch()?;
             let text = worker::transitions_text(&w);
