@@ -196,7 +196,7 @@ fn tick_fails_on_gate_and_retry_requeues() {
     assert!(item.last_error.as_deref().unwrap().contains("flaky"));
     assert_eq!(
         f.repo.ok(&["issue", "show", &f.issue])["issue"]["status"],
-        "in-review",
+        "validating",
         "issue stays in review"
     );
     std::fs::write(wt.join("PASS"), "").unwrap();
@@ -314,7 +314,7 @@ fn verify_main_after_marks_a_red_main_and_halts_the_tick() {
     assert_eq!(f.repo.ok(&["issue", "show", &f.issue])["issue"]["status"], "done");
     assert_eq!(
         f.repo.ok(&["issue", "show", &r.second])["issue"]["status"],
-        "in-review"
+        "validating"
     );
 
     let events = store(f).events_since(0, 10_000).unwrap();

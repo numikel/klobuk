@@ -134,7 +134,7 @@ fn github_target_opens_a_pr_waits_for_checks_then_merges() {
     assert!(git_out(&f.bare, &["branch", "--list"]).contains(&format!("feat/{}", f.issue)));
     assert_eq!(
         f.repo.ok(&["issue", "show", &f.issue])["issue"]["status"],
-        "in-review"
+        "validating"
     );
     let cs = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
     assert!(
