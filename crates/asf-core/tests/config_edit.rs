@@ -1,5 +1,5 @@
 use asf_core::config::GateWhen;
-use asf_core::config_edit::{editable_keys, set_key};
+use asf_core::config_edit::{editable_keys, set_key, unset_key};
 use asf_core::{Config, ConfigError};
 
 const COMMENTED: &str = "\
@@ -219,4 +219,91 @@ fn editing_preserves_gate_tables() {
     let c = Config::from_toml(&out).unwrap();
     assert_eq!(c.gates[0].when, vec![GateWhen::Verify]);
     assert!(c.review.required);
+}
+
+// ---------- asf-30: unset_key ----------
+
+const WITH_MODELS: &str = "\
+# top comment
+[worker]
+budget_usd = 5.0
+# which model the workers run on
+model = \"sonnet\" # chosen in round 3
+permission_mode = \"acceptEdits\"
+
+# reviewer
+[review]
+required = true
+model = \"sonnet\"
+max_rounds = 2 # rounds
+";
+
+#[test]
+fn unset_removes_only_that_key_and_keeps_other_comments() {
+    let out = unset_key(WITH_MODELS, "worker.model").unwrap();
+    assert!(!out.contains("model = \"sonnet\" # chosen"), "{out}");
+    let kept: Vec<&str> = WITH_MODELS
+        .lines()
+        .filter(|l| !l.starts_with("model = \"sonnet\" # chosen") && *l != "# which model the workers run on")
+        .collect();
+    let after: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        kept, after,
+        "only the key line (and its own leading comment) may go:\n{out}"
+    );
+    assert!(out.contains("# top comment") && out.contains("# reviewer") && out.contains("# rounds"));
+    assert_eq!(Config::from_toml(&out).unwrap().worker.model, None);
+}
+
+#[test]
+fn unset_review_model_falls_back_to_the_default() {
+    let out = unset_key(WITH_MODELS, "review.model").unwrap();
+    let c = Config::from_toml(&out).unwrap();
+    assert_eq!(c.review.model, "opus");
+    assert!(c.review.required, "sibling keys survive");
+    assert_eq!(c.worker.model.as_deref(), Some("sonnet"));
+}
+
+#[test]
+fn unset_of_an_absent_key_or_section_is_a_noop() {
+    for (text, key) in [
+        ("", "worker.model"),
+        ("[repo]\nprefix = \"asf\"\n", "review.model"),
+        (Config::default_toml(), "worker.model"),
+    ] {
+        let out = unset_key(text, key).unwrap();
+        assert_eq!(out, text, "{key}");
+        Config::from_toml(&out).unwrap();
+    }
+}
+
+#[test]
+fn unset_refuses_required_unknown_and_malformed() {
+    for key in [
+        "scheduler.max_parallel",
+        "merge.target",
+        "planner.model",
+        "worker.budget_usd",
+        "review.required",
+        "repo.prefix",
+        "nope.key",
+        "worker",
+        "",
+    ] {
+        let e = unset_key(WITH_MODELS, key).unwrap_err();
+        assert!(matches!(e, ConfigError::Invalid(_)), "{key}: {e}");
+    }
+    let e = unset_key("[worker\n", "worker.model").unwrap_err();
+    assert!(matches!(e, ConfigError::Parse(_)), "{e}");
+}
+
+#[test]
+fn unset_output_always_parses() {
+    for key in ["worker.model", "review.model"] {
+        let out = unset_key(WITH_MODELS, key).unwrap();
+        Config::from_toml(&out).unwrap();
+        // and set_key can bring it back
+        let back = set_key(&out, key, "haiku").unwrap();
+        Config::from_toml(&back).unwrap();
+    }
 }

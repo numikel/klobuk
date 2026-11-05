@@ -93,6 +93,49 @@ pub fn set_key(toml: &str, key: &str, value: &str) -> Result<String, ConfigError
     Ok(out)
 }
 
+/// Optional keys: removing one is safe because the loader falls back to a default (`worker.model`
+/// to the Claude Code default, `review.model` to `opus`). Every other key is required.
+const UNSETTABLE: &[&str] = &["worker.model", "review.model"];
+
+/// The keys [`unset_key`] accepts.
+pub fn unsettable_keys() -> &'static [&'static str] {
+    UNSETTABLE
+}
+
+/// Removes the dotted `key` from the TOML document `toml` and returns the new text.
+///
+/// Only optional keys (`worker.model`, `review.model`) can be removed; any other key, known or not,
+/// is refused with [`ConfigError::Invalid`]. Removing a key that is absent returns `toml` unchanged.
+/// Other comments, key order and formatting survive; the comment lines directly above the removed
+/// key go with it. The result is validated with [`Config::from_toml`] before it is returned.
+pub fn unset_key(toml: &str, key: &str) -> Result<String, ConfigError> {
+    if !UNSETTABLE.contains(&key) {
+        return Err(ConfigError::Invalid(format!(
+            "config key `{key}` is required and cannot be unset"
+        )));
+    }
+    let mut doc: DocumentMut = toml
+        .parse()
+        .map_err(|e: toml_edit::TomlError| ConfigError::Parse(e.to_string()))?;
+
+    let mut path: Vec<&str> = key.split('.').collect();
+    let leaf = path.pop().unwrap_or_default();
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    for segment in path {
+        let Some(next) = table.get_mut(segment).and_then(Item::as_table_like_mut) else {
+            return Ok(toml.to_string()); // the section is absent, so is the key
+        };
+        table = next;
+    }
+    if table.remove(leaf).is_none() {
+        return Ok(toml.to_string());
+    }
+
+    let out = doc.to_string();
+    Config::from_toml(&out)?;
+    Ok(out)
+}
+
 /// A TOML scalar or array when `raw` is one, otherwise `raw` as a string.
 fn parse_value(raw: &str) -> Value {
     let raw = raw.trim();
@@ -128,6 +171,13 @@ mod tests {
     fn parse_value_keeps_tables_and_dates_as_strings() {
         assert_eq!(parse_value("{ a = 1 }").as_str(), Some("{ a = 1 }"));
         assert_eq!(parse_value("2026-11-05").as_str(), Some("2026-11-05"));
+    }
+
+    #[test]
+    fn every_unsettable_key_is_editable() {
+        for k in UNSETTABLE {
+            assert!(EDITABLE.iter().any(|(e, _)| e == k), "{k}");
+        }
     }
 
     #[test]
