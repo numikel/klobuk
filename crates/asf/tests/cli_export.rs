@@ -142,7 +142,7 @@ fn doctor_reports_checks() {
         .find(|c| c["name"] == "database")
         .unwrap();
     assert_eq!(db["ok"], true);
-    assert!(db["detail"].as_str().unwrap().contains("schema 1"));
+    assert!(db["detail"].as_str().unwrap().contains("schema 2"));
     let herdr = res["checks"]
         .as_array()
         .unwrap()
