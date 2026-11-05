@@ -11,6 +11,7 @@
 
 pub mod brief;
 pub mod config;
+pub mod config_edit;
 pub mod error;
 pub mod github;
 pub mod ids;

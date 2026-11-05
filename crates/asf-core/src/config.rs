@@ -133,6 +133,23 @@ impl Default for WorkerCfg {
     }
 }
 
+/// The stage a `[[gate]]` runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateWhen {
+    /// Worker verification in the worktree, before the issue is enqueued.
+    Verify,
+    /// Merge queue, in the worktree after the rebase.
+    Merge,
+    /// Repository root after a merge (`[merge] verify_main_after`).
+    Main,
+}
+
+impl GateWhen {
+    /// Every stage, in pipeline order; the default for a gate without `when`.
+    pub const ALL: [GateWhen; 3] = [GateWhen::Verify, GateWhen::Merge, GateWhen::Main];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GateCfg {
@@ -140,6 +157,8 @@ pub struct GateCfg {
     pub cmd: Vec<String>,
     pub timeout_s: u64,
     pub shell: Option<String>,
+    /// Stages the gate runs in; absent means all of them.
+    pub when: Vec<GateWhen>,
 }
 
 impl Default for GateCfg {
@@ -149,7 +168,15 @@ impl Default for GateCfg {
             cmd: Vec::new(),
             timeout_s: 600,
             shell: None,
+            when: GateWhen::ALL.to_vec(),
         }
+    }
+}
+
+impl GateCfg {
+    /// Whether the gate runs in `stage`.
+    pub fn runs_in(&self, stage: GateWhen) -> bool {
+        self.when.contains(&stage)
     }
 }
 
@@ -239,11 +266,26 @@ impl Default for MethodologyCfg {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewCfg {
     pub required: bool,
     pub on_labels: Vec<String>,
+    /// Model the read-only reviewer worker runs on.
+    pub model: String,
+    /// Review rounds that may end in `changes` before the human is asked to decide.
+    pub max_rounds: u32,
+}
+
+impl Default for ReviewCfg {
+    fn default() -> Self {
+        ReviewCfg {
+            required: false,
+            on_labels: Vec::new(),
+            model: "opus".into(),
+            max_rounds: 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -304,6 +346,7 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 # name = "test"
 # cmd = ["cargo", "test", "--workspace"]
 # timeout_s = 900
+# when = ["verify", "merge"]   # stages the gate runs in: verify (worker) | merge (queue, after rebase) | main (root, after merge); default: all three
 
 [merge]
 target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
@@ -319,6 +362,8 @@ verify_main_after = false # run the gates in the repo root after each merge; a r
 [review]
 required = false
 on_labels = []            # e.g. ["risky"]: labels that force a review worker before merge
+# model = "opus"          # model of the read-only reviewer
+# max_rounds = 2          # `changes` verdicts allowed before the human has to decide
 
 [planner]
 runner = "claude"         # claude (headless `claude -p`, read-only tools) | fake (tests)
@@ -377,6 +422,12 @@ impl Config {
             if g.name.trim().is_empty() || g.cmd.is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "gate `{}` needs a name and a non-empty cmd",
+                    g.name
+                )));
+            }
+            if g.when.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "gate `{}`: `when` must list at least one of verify, merge, main",
                     g.name
                 )));
             }
