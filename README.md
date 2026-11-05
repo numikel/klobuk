@@ -188,17 +188,24 @@ asf run nudge mp-3      # remind the worker about the finish ritual
 asf run abort mp-3      # stop the worker, release the claim, keep the worktree
 ```
 
-TUI keys: `1`–`5` views, `j`/`k` move, `Enter` details, `s` start the selected ready issue,
-`m` enqueue for merge, `f` focus the worker's pane, `r` reply, `y`/`n` quick keys, `x` abort,
-`t` tick, `R` refresh, `q` quit.
+TUI keys: `1`–`6` views (Board, Agents, Inbox, Queue, Log, Config), `j`/`k` move, `Enter`
+details, `s` start the selected ready issue, `m` enqueue for merge, `f` focus the worker's pane,
+`r` reply, `y`/`n` quick keys, `x` abort, `t` tick, `R` refresh, `q` quit. The Config view lists
+the editable settings (models per role, budgets, parallelism, merge target, reviewer); `Enter`
+edits one in place, with validation, and writes it to `.factory/config.toml`. A running
+`asf serve` reads the configuration at start, so restart it after a change.
 
 ### 6. Verification and merge
 
 A worker finishes by committing, writing `.factory/runs/<id>/report.md` and running
 `asf issue finish <id> --report …`. The orchestrator never trusts that report alone. It checks
 that the worktree is clean, that there are commits since the base, that every changed file is
-inside `file_scope`, and it runs the gates in the worktree. Only then is the run `succeeded`
-and the branch `feat/<id>` enqueued.
+inside `file_scope`, that the report has no "open questions" section (questions belong in comments,
+see below), and it runs the gates whose `when` includes `verify` in the worktree. The report is
+copied to `.factory/runs/<id>/report.md` in the repository root so it survives `lane clean`. Only
+then is the run `succeeded`, the issue becomes `validating` and the branch `feat/<id>` is enqueued.
+A failed verification sets the issue to `blocked` with a BLOCKER; after a fix in the worktree,
+`asf run verify <id>` reruns it.
 
 The merge queue processes items in order: rebase onto the default branch (a conflict is never
 resolved automatically: the item and the issue go `blocked` with a BLOCKER naming the files),
@@ -207,6 +214,14 @@ scope re-check, gates again after the rebase, then `git merge --ff-only`. The is
 `[merge] verify_main_after = true` the gates run once more in the repository root after every
 merge: a red default branch keeps the item `merged` (the commit is there), records the failing
 gate on it, posts a BLOCKER and stops the queue for that tick so nothing else lands on a red branch.
+
+With `[review] required = true` (or a label from `[review] on_labels`) the queue inserts a review
+stage after the gates: a second worker with a clean context, running on `[review] model` (default
+`opus`), gets a detached checkout of the branch in `.worktrees/<review-id>`, read-only tools and a
+brief with the diff and the acceptance criteria. It never edits; it ends with one DECISION comment
+on the issue: `approve` lets the merge continue, `changes:` with findings fails the item, blocks the
+issue and sends the findings back to the original worker. After `[review] max_rounds` rounds of
+`changes` the queue stops and asks you to decide.
 
 ```bash
 asf merge list
@@ -253,13 +268,29 @@ asf issue comment mp-3 --type STATUS --body "Parser done, tests green."
 ```
 
 Types: `QUESTION`, `ANSWER`, `DECISION`, `HANDOFF`, `BLOCKER`, `STATUS`, `FYI`. `--to` is an
-issue id, `all` or `human`. `asf issue inbox` shows the unread ones for the current lane and
+issue id, `all` or `human`. Questions never get lost: a question that changes the deliverable is
+asked with Claude Code's `AskUserQuestion` tool in the pane (the run shows up as `blocked` with the
+question in your inbox; answer with `asf run keys <id> 1` or `asf run reply`), a question that does
+not block is a QUESTION comment to `human`, and `asf issue finish` is refused while such a question
+has no ANSWER. Decisions a worker takes on its own are posted as DECISION comments, not buried in
+the report. `asf issue inbox` shows the unread ones for the current lane and
 advances a read cursor (`--peek` does not). Hand-offs addressed to an issue are copied into the
 brief of the worker that later picks it up.
 
 ## Configuration
 
 `asf repo init` writes this template to `.factory/config.toml`. Unknown sections are ignored.
+Change the common settings without opening the file:
+
+```bash
+asf config show                      # every editable key with its value and meaning
+asf config set review.required true  # validated, comments in the file are kept
+asf config set worker.model sonnet
+asf config set planner.model opus
+```
+
+A sensible split: planning and review on a stronger model (`opus` or `sonnet`), implementation on
+`sonnet` or `haiku`.
 
 ```toml
 [repo]
@@ -294,7 +325,8 @@ permission_mode = "auto"  # auto | acceptEdits | dontAsk | bypassPermissions (de
 auto_trust = true         # answer Claude's trust dialog for worktrees of this repo
 pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json before launch
 
-# Gates run in the worktree before merge, in order; first failure stops.
+# Gates run in order; first failure stops. `when` picks the stages: verify (worker verification),
+# merge (after the rebase in the queue), main (repo root after the merge). Default: all three.
 # [[gate]]
 # name = "fmt"
 # cmd = ["cargo", "fmt", "--all", "--", "--check"]
@@ -302,6 +334,10 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 # name = "test"
 # cmd = ["cargo", "test", "--workspace"]
 # timeout_s = 900
+# [[gate]]
+# name = "ci"
+# cmd = ["bash", "scripts/ci-local.sh"]   # e.g. the same job your CI runs
+# when = ["merge"]
 
 [merge]
 target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
@@ -315,8 +351,10 @@ verify_main_after = false # run the gates in the repo root after each merge; a r
 # delete_branch = false
 
 [review]
-required = false
+required = false          # a read-only reviewer with a clean context before every merge
 on_labels = []            # e.g. ["risky"]: labels that force a review worker before merge
+model = "opus"            # model the reviewer runs on
+max_rounds = 2            # `changes` verdicts allowed before the human decides
 
 [planner]
 runner = "claude"         # claude (headless `claude -p`, read-only tools) | fake (tests)
@@ -371,6 +409,7 @@ reported and never fatal.
 | --- | --- |
 | `asf repo init [--prefix p]` | Create `.factory/` (config + database); idempotent, adopts a committed config |
 | `asf repo status` / `asf repo doctor` | Counts per status and claims / environment and store health (git, config, database, herdr, claude, github, gitignore) |
+| `asf config show` / `asf config set <key> <value>` | Read and change the editable settings in `.factory/config.toml` (validated, comments kept) |
 | `asf issue list [--status s] [--type t] [--label l] [--ready]` | List issues |
 | `asf issue show <id> [--dossier]` | One issue with dependencies; `--dossier` adds comments and hand-offs |
 | `asf issue create --title t [--body b] [--scope g]… [--accept a]… [--dep id]… [--parent id] [--priority n] [--type task\|review\|epic] [--ready]` | Create an issue |
@@ -395,7 +434,7 @@ reported and never fatal.
 | `asf method list` / `validate <dir>` | Methodologies |
 | `asf gh sync [--dry-run]` | Mirror issues to GitHub |
 | `asf serve [--interval s] [--once] [--dispatch] [--until-done [--max-ticks N]]` | The orchestrator loop; `--until-done` stops with `all_done`, `max_ticks` or `stuck` |
-| `asf tui [--view board\|agents\|inbox\|queue\|log] [--once]` | Terminal UI |
+| `asf tui [--view board\|agents\|inbox\|queue\|log\|config] [--once]` | Terminal UI |
 | `asf export [--out f]` / `asf import <f> [--mode upsert\|replace]` | JSONL export and import |
 | `asf hook pre-tool\|post-tool\|stop\|status` | Claude Code hooks (called by the worker's settings, not by you) |
 
@@ -420,7 +459,7 @@ Global options: `--repo <path>`, `--lane <id|orchestrator|human>`, `--json`, `-q
 | Symptom | What to do |
 | --- | --- |
 | `asf repo doctor` says `herdr not found` or protocol mismatch | Install Herdr 0.9.5 and start its server (`herdr status` shows `protocol: 22`) |
-| A worker is `blocked` right after start with "timed out waiting for agent status" | Herdr did not detect the Claude pane in time; `asf run abort <id>`, the next tick starts it again |
+| A worker is `blocked` right after start with "timed out waiting for agent status" | Herdr reported the Claude pane idle later than `[worker] start_timeout_ms` (default 90 s); raise it (180000 works on slow machines), then `asf run abort <id>` and the next tick starts it again |
 | A run is `blocked` and your inbox has a BLOCKER with a screen dump | Read it, then `asf run keys <id> y` or `asf run reply <id> "…"` |
 | Merge `failed` with `gate … failed after rebase` | Fix in `.worktrees/<id>` (or reply to the worker), then `asf merge retry <id>` |
 | Merge `blocked` with `rebase … conflicts in:` | Resolve in the worktree, then `asf merge retry <id>` |
