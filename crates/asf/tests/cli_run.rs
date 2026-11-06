@@ -173,6 +173,12 @@ fn start_happy_path_creates_worktree_files_workspace_and_agent() {
             .any(|w| w[0] == "--session-id" && w[1].len() == 36),
         "{args:?}"
     );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--name" && w[1] == "asf-1-add-greeting"),
+        "{args:?}"
+    );
+    assert_eq!(log[3].args["name"], "asf-1", "the Herdr agent name is unchanged");
     assert!(log[4].args["text"].as_str().unwrap().contains("brief.md"));
 
     let run = active_run(&f);

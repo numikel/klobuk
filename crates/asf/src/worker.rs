@@ -40,6 +40,8 @@ struct Launch<'a> {
     run: &'a Run,
     wt_abs: &'a Path,
     label: String,
+    /// Claude Code's session display name (`--name`); the Herdr agent name stays the issue id.
+    session_name: String,
     settings_path: PathBuf,
     model: Option<String>,
     kick: String,
@@ -132,8 +134,36 @@ const REVIEW_TOOLS: [&str; 6] = [
     "Bash(asf *)",
 ];
 /// Denied outright, so `permission_mode = auto` can never approve an edit for a reviewer.
+/// (`MultiEdit` is gone from Claude Code; a deny rule for a missing tool only prints a warning.)
 #[allow(dead_code)] // wired into the merge flow by asf-21
-const REVIEW_DENY: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+const REVIEW_DENY: [&str; 3] = ["Edit", "Write", "NotebookEdit"];
+
+/// Longest value passed to `claude --name`.
+const SESSION_NAME_MAX: usize = 60;
+
+/// Display name for a Claude Code session (`claude --name`): `prefix`, a hyphen and a slug of `title`.
+/// The runtime types the arguments into a shell, so the result has no spaces, quotes or other
+/// shell-special characters: the slug is lowercase ASCII letters and digits with single hyphens
+/// (every other character, non-ASCII included, is a separator) and the whole value is at most
+/// `SESSION_NAME_MAX` characters. A title without ASCII letters or digits yields just `prefix`.
+fn session_name(prefix: &str, title: &str) -> String {
+    let mut slug = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    // The slug is ASCII, so cutting at a byte offset cannot split a character.
+    slug.truncate(SESSION_NAME_MAX.saturating_sub(prefix.len() + 1));
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}-{slug}")
+    }
+}
 
 /// Run `git` in `dir` and return trimmed stdout (for what `asf_vcs::GitCli` does not offer).
 #[allow(dead_code)] // wired into the merge flow by asf-21
@@ -401,6 +431,7 @@ impl<'a> Worker<'a> {
                 run: &run,
                 wt_abs: &wt_abs,
                 label: format!("{id} {}", issue.title),
+                session_name: session_name(id.as_str(), &issue.title),
                 settings_path,
                 model: self.ctx.config.worker.model.clone(),
                 kick: format!("Start {id}: read {FACTORY_DIR}/{RUNS_DIR}/{id}/brief.md and follow it."),
@@ -570,6 +601,8 @@ impl<'a> Worker<'a> {
             fwd(&l.settings_path),
             "--session-id".to_string(),
             session_id,
+            "--name".to_string(),
+            l.session_name.clone(),
         ];
         if let Some(m) = &l.model {
             args.push("--model".into());
@@ -820,6 +853,7 @@ impl<'a> Worker<'a> {
                 run: &rrun,
                 wt_abs: &wt_abs,
                 label: format!("{rid} {}", review.title),
+                session_name: session_name(&format!("review-{}", issue.id), &issue.title),
                 settings_path,
                 model: Some(self.ctx.config.review.model.clone()),
                 kick: format!("Start {rid}: read {FACTORY_DIR}/{RUNS_DIR}/{rid}/brief.md and follow it."),
@@ -1347,6 +1381,67 @@ mod tests {
     }
 
     #[test]
+    fn session_name_is_the_prefix_and_a_slug_of_the_title() {
+        assert_eq!(
+            session_name("asf-27", "Add asf issue scope add/rm and scope request"),
+            "asf-27-add-asf-issue-scope-add-rm-and-scope-request"
+        );
+        assert_eq!(
+            session_name("review-asf-1", "Add Greeting"),
+            "review-asf-1-add-greeting"
+        );
+    }
+
+    #[test]
+    fn session_name_treats_non_ascii_as_a_separator() {
+        assert_eq!(session_name("asf-1", "Zażółć gęślą jaźń 2"), "asf-1-za-g-l-ja-2");
+    }
+
+    #[test]
+    fn session_name_collapses_runs_of_punctuation_and_trims_the_ends() {
+        assert_eq!(
+            session_name("asf-1", "  --Fix `foo::bar()`!! (really) -- "),
+            "asf-1-fix-foo-bar-really"
+        );
+    }
+
+    #[test]
+    fn session_name_is_just_the_prefix_without_ascii_alphanumerics() {
+        for title in ["", "!!! --- ???", "日本語のタイトル", "  \t "] {
+            assert_eq!(session_name("asf-1", title), "asf-1", "{title:?}");
+        }
+    }
+
+    #[test]
+    fn session_name_is_at_most_60_characters_and_never_ends_in_a_hyphen() {
+        let long = "word ".repeat(40);
+        let n = session_name("asf-123", &long);
+        assert!(n.len() <= 60, "{n}");
+        assert!(n.starts_with("asf-123-word-word"), "{n}");
+        assert!(!n.ends_with('-'), "{n}");
+
+        // The cut lands exactly on a hyphen: 5 + 1 + 53 letters fill 59, the 60th character is '-'.
+        let n = session_name("asf-1", &format!("{} b", "a".repeat(53)));
+        assert_eq!(n, format!("asf-1-{}", "a".repeat(53)));
+
+        // A cut inside a word keeps the letters before it.
+        let n = session_name("asf-1", &"a".repeat(100));
+        assert_eq!(n.len(), 60);
+        assert_eq!(n, format!("asf-1-{}", "a".repeat(54)));
+    }
+
+    #[test]
+    fn session_name_has_only_lowercase_ascii_letters_digits_and_hyphens() {
+        let n = session_name("asf-9", "He said \"hi\" & it's $HOME; rm -rf / ĄĘ 42");
+        assert!(
+            n.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{n}"
+        );
+        assert!(!n.contains("--"), "{n}");
+    }
+
+    #[test]
     fn start_review_twice_reuses_the_review_issue_and_its_detached_worktree() {
         let fx = fixture();
         let root = fx.dir.path();
@@ -1423,9 +1518,11 @@ mod tests {
             "{allow:?}"
         );
         let deny = strs("deny");
-        for t in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+        for t in ["Edit", "Write", "NotebookEdit"] {
             assert!(deny.iter().any(|d| d == t), "{t} missing in {deny:?}");
         }
+        // MultiEdit no longer exists in Claude Code; a deny rule for it only prints a warning.
+        assert!(!deny.iter().any(|d| d == "MultiEdit"), "{deny:?}");
         let log = FakeRuntime::new(fake_path(&fx)).log();
         let start = log.iter().find(|e| e.op == "start_agent").unwrap();
         let args: Vec<&str> = start.args["args"]
@@ -1435,6 +1532,17 @@ mod tests {
             .map(|a| a.as_str().unwrap())
             .collect();
         assert!(args.windows(2).any(|p| p == ["--model", "opus"]), "{args:?}");
+        // the session is named after the reviewed issue, not after the review issue's own title
+        assert!(
+            args.windows(2)
+                .any(|p| p == ["--name", "review-asf-1-add-greeting"]),
+            "{args:?}"
+        );
+        assert_eq!(
+            start.args["name"],
+            review.as_str(),
+            "the Herdr agent name is unchanged"
+        );
 
         // second call: same issue, same worktree, same (still active) run, no second agent
         let second = w.start_review(&fx.issue, &fx.run).unwrap();
