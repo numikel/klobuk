@@ -1,128 +1,25 @@
-//! App state and key handling. Pure: no IO, no terminal, so every transition is unit-testable.
+//! `App`: the current view, the state of each of the seven views, the overlay stack and the status
+//! message, plus the dispatch of keys and drawing to them. Pure: no IO, no terminal, so every
+//! transition is unit-testable. What a key wants done outside the app is an [`Action`].
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
 use std::time::Duration;
 
-use asf_core::config_edit::editable_keys;
 use asf_core::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
+use ratatui::Frame;
 
-use super::now::{self, NeedSource, NowRow};
+use super::overlays::{self, is_chord, is_ctrl_c, InputTarget, Mode};
+use super::snapshot::{PanePreview, Snapshot};
+use super::theme::Theme;
+use super::views::{agents, board, config, inbox, log, now, queue};
+
+/// The questions the services answer (`serve.rs` shares the rule with `asf issue finish`).
+pub use super::snapshot::unanswered_questions;
 
 /// How long a status message stays in the footer when no key is pressed.
 pub const STATUS_TTL: Duration = Duration::from_secs(4);
-
-/// Everything the TUI shows, loaded in one pass (`tui::load_snapshot`).
-#[derive(Debug, Clone, Default)]
-pub struct Snapshot {
-    pub repo_name: String,
-    pub branch: String,
-    /// `None` = runtime not probed, `Some(false)` = unhealthy.
-    pub runtime_ok: Option<bool>,
-    pub max_parallel: usize,
-    pub issues: Vec<Issue>,
-    pub claims: Vec<Claim>,
-    /// Active runs only.
-    pub runs: Vec<Run>,
-    pub agents: BTreeMap<IssueId, AgentInfo>,
-    /// Unread comments addressed to the human (peeked).
-    pub inbox: Vec<Comment>,
-    /// Every unanswered QUESTION to the human on a live issue, read or not, oldest first.
-    pub questions: Vec<Comment>,
-    pub queue: Vec<MergeItem>,
-    /// Newest first.
-    pub events: Vec<Event>,
-    /// One row per editable config key, read from `.factory/config.toml`.
-    pub config: Vec<ConfigRow>,
-    /// When the snapshot was taken, RFC 3339 UTC (the clock of the ages in the Now view).
-    pub now: String,
-    /// Seconds east of UTC of the local time zone, for "closed today" (0 when it cannot be read).
-    pub utc_offset_secs: i32,
-    /// The newest run of every live issue whose newest run `failed`; `runs` holds active ones only.
-    pub failed_runs: Vec<Run>,
-    /// The newest BLOCKER comment of every live issue (it carries the worker screen of a blocked run).
-    pub blockers: Vec<Comment>,
-    /// Every dependency edge, for "what the up-next issues wait for".
-    pub deps: Vec<Dep>,
-    /// `[review] model`: what a reviewer run is shown with.
-    pub review_model: String,
-}
-
-/// An editable config key with its current value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigRow {
-    pub key: String,
-    pub description: String,
-    /// What the Config view shows (`(unset)` for an optional key that is absent).
-    pub value: String,
-    /// What the input prompt is prefilled with (empty for an unset key).
-    pub raw: String,
-}
-
-/// Rows for every [`editable_keys`] entry, with values taken from the TOML text `toml`.
-/// A file that does not parse yields `(unreadable)` rows so the view never shows stale defaults.
-pub fn config_rows(toml: &str) -> Vec<ConfigRow> {
-    let root = Config::from_toml(toml)
-        .ok()
-        .and_then(|c| serde_json::to_value(&c).ok());
-    editable_keys()
-        .iter()
-        .map(|(key, description)| {
-            let (value, raw) = match &root {
-                None => ("(unreadable)".to_string(), String::new()),
-                Some(root) => match key.split('.').try_fold(root, |node, seg| node.get(seg)) {
-                    None | Some(serde_json::Value::Null) => ("(unset)".to_string(), String::new()),
-                    Some(serde_json::Value::String(s)) => (s.clone(), s.clone()),
-                    Some(other) => (other.to_string(), other.to_string()),
-                },
-            };
-            ConfigRow {
-                key: (*key).to_string(),
-                description: (*description).to_string(),
-                value,
-                raw,
-            }
-        })
-        .collect()
-}
-
-/// Ids of the QUESTION comments to the human among `comments` that nobody has answered. A question
-/// counts as answered when an ANSWER comment replies to it (`--reply-to`) or `resolved_at` is set;
-/// the same rule `asf issue finish` applies.
-pub fn unanswered_questions(comments: &[Comment]) -> Vec<i64> {
-    comments
-        .iter()
-        .filter(|q| q.kind == CommentType::Question && q.to_lane == LANE_HUMAN && q.resolved_at.is_none())
-        .filter(|q| {
-            !comments
-                .iter()
-                .any(|a| a.kind == CommentType::Answer && a.reply_to == Some(q.id))
-        })
-        .map(|q| q.id)
-        .collect()
-}
-
-/// Something that needs the human before it can go on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Waiting {
-    /// A run in `blocked`: the agent sits on a prompt.
-    Run { issue: IssueId, since: String },
-    /// An unanswered QUESTION to the human.
-    Question {
-        issue: IssueId,
-        body: String,
-        since: String,
-    },
-}
-
-impl Waiting {
-    pub fn since(&self) -> &str {
-        match self {
-            Waiting::Run { since, .. } | Waiting::Question { since, .. } => since,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum View {
@@ -167,6 +64,8 @@ impl View {
     }
 }
 
+/// What a key asks for. The first group needs IO and goes back to the event loop (`tui/mod.rs`); the
+/// second only changes the app (a window, a message, the view) and never leaves [`App::handle_key`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     None,
@@ -187,7 +86,8 @@ pub enum Action {
     SetConfig(String, String),
     /// Remove the optional config `key` from `.factory/config.toml`.
     UnsetConfig(String),
-    /// Read the worker's pane so the answer overlay can show what it asks.
+    /// Read the last lines of the worker's pane: the answer overlay shows them, `Snapshot::pane_preview`
+    /// keeps them.
     Peek(IssueId),
     /// Post an ANSWER comment from the human that replies to QUESTION comment `.1` on the issue.
     Answer(IssueId, i64, String),
@@ -195,61 +95,55 @@ pub enum Action {
     Verify(IssueId),
     /// Re-queue the issue's failed or blocked merge item in the background (`asf merge retry <id>`).
     Retry(IssueId),
-}
+    /// Load the comments and dependency status of an issue into `Snapshot::detail`.
+    LoadDetail(IssueId),
 
-/// What the input line is typing for.
-#[derive(Debug, Clone, PartialEq)]
-pub enum InputTarget {
-    Reply(IssueId),
-    Config(String),
-    /// An answer to QUESTION comment `.1` on the issue.
-    Answer(IssueId, i64),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Mode {
-    Normal,
-    Input {
+    // ---- handled by the app itself ----
+    /// Show a message in the footer.
+    Status(String),
+    /// Open the answer overlay for the issue's worker (then `Peek` reads its pane).
+    OpenAnswer(IssueId),
+    /// Open the one-line text input.
+    OpenInput {
         prompt: String,
         buf: String,
         target: InputTarget,
     },
+    /// Ask `what` in the footer; `y` runs `then`, any other key cancels.
     Confirm {
         what: String,
-        action: Box<Action>,
+        then: Box<Action>,
     },
-    /// The answer overlay for a blocked run. `text` is `Some` while a free-text reply is typed.
-    Answer {
-        id: IssueId,
-        /// Last lines of the worker pane (empty until the peek arrives).
-        screen: String,
-        text: Option<String>,
-    },
-    /// The Inbox modal with one comment in full, scrolled `scroll` lines down.
-    Comment {
-        comment: Comment,
-        scroll: u16,
-    },
-    /// The full-screen key reference.
-    Help {
-        scroll: u16,
-    },
+    /// Open one comment in full.
+    OpenComment(Comment),
+    /// Switch to the Board with the issue selected.
+    OpenOnBoard(IssueId),
 }
 
-/// Board columns, left to right: every status in `Status::ALL` order except `cancelled`, which is hidden.
-pub fn board_columns() -> Vec<Status> {
-    Status::ALL
-        .iter()
-        .copied()
-        .filter(|s| *s != Status::Cancelled)
-        .collect()
+impl Action {
+    /// Whether the action starts a background child process (only one runs at a time).
+    fn is_background(&self) -> bool {
+        matches!(
+            self,
+            Action::Tick | Action::Start(_) | Action::Verify(_) | Action::Retry(_)
+        )
+    }
 }
+
+static NO_OVERLAY: Mode = Mode::Normal;
 
 pub struct App {
     pub view: View,
-    pub mode: Mode,
-    sel: BTreeMap<View, usize>,
-    pub detail: bool,
+    /// The seven view states.
+    pub now: now::State,
+    pub board: board::State,
+    pub agents: agents::State,
+    pub inbox: inbox::State,
+    pub queue: queue::State,
+    pub log: log::State,
+    pub config: config::State,
+    /// Open windows, the top one last; the keyboard talks to the top one.
+    overlays: Vec<Mode>,
     /// Shown in the footer until [`STATUS_TTL`] passes (see [`App::advance`]) or the next key press.
     pub status: Option<String>,
     pub snap: Snapshot,
@@ -260,29 +154,40 @@ pub struct App {
     pub clock: Duration,
     /// The message the expiry timer is running for, and when it first appeared.
     status_stamp: Option<(String, Duration)>,
-    /// Largest useful scroll of the open modal, written by the renderer (it alone knows the wrapped
+    /// Largest useful scroll of the open window, written by the renderer (it alone knows the wrapped
     /// height), read when scrolling so `j` cannot run past the end.
     pub(crate) scroll_max: Cell<u16>,
-    /// Whether the renderer may use colours; the entry points clear it when `NO_COLOR` is set.
-    pub color: bool,
+    /// The colours (or the lack of them); the entry points build it from `NO_COLOR`.
+    pub theme: Theme,
 }
 
 impl App {
     /// A fresh app on the Now view, in colour (the entry points apply `NO_COLOR`).
-    pub fn new(snap: Snapshot) -> App {
+    pub fn new(mut snap: Snapshot) -> App {
+        snap.derive();
         App {
             view: View::Now,
-            color: true,
-            mode: Mode::Normal,
-            sel: BTreeMap::new(),
-            detail: true,
+            now: now::State::default(),
+            board: board::State::default(),
+            agents: agents::State::default(),
+            inbox: inbox::State::default(),
+            queue: queue::State::default(),
+            log: log::State::default(),
+            config: config::State::default(),
+            overlays: Vec::new(),
             status: None,
             snap,
             busy: None,
             clock: Duration::ZERO,
             status_stamp: None,
             scroll_max: Cell::new(u16::MAX),
+            theme: Theme::default(),
         }
+    }
+
+    /// The window the keyboard talks to, or [`Mode::Normal`] when none is open.
+    pub fn mode(&self) -> &Mode {
+        self.overlays.last().unwrap_or(&NO_OVERLAY)
     }
 
     /// Feeds the clock: expires a status message that has been on screen for [`STATUS_TTL`].
@@ -304,327 +209,52 @@ impl App {
         }
     }
 
-    /// Swaps the data and keeps every selection inside the new bounds.
-    pub fn replace(&mut self, snap: Snapshot) {
+    /// Swaps the data. What was loaded on demand (the Board detail, the pane preview) stays until the
+    /// event loop loads it again; the views clamp their selections when they read them.
+    pub fn replace(&mut self, mut snap: Snapshot) {
+        if snap.detail.is_none() {
+            snap.detail = self.snap.detail.take();
+        }
+        if snap.pane_preview.is_none() {
+            snap.pane_preview = self.snap.pane_preview.take();
+        }
+        snap.derive();
         self.snap = snap;
-        for v in View::ALL {
-            let n = self.rows(v);
-            let s = self.sel.entry(v).or_insert(0);
-            if n == 0 {
-                *s = 0;
-            } else if *s >= n {
-                *s = n - 1;
-            }
-        }
     }
 
-    /// Issues in board order: column by column, by sequence number inside a column.
-    pub fn board_issues(&self) -> Vec<&Issue> {
-        let mut out = Vec::new();
-        for st in board_columns() {
-            let mut col: Vec<&Issue> = self.snap.issues.iter().filter(|i| i.status == st).collect();
-            col.sort_by(|a, b| a.id.cmp(&b.id));
-            out.extend(col);
-        }
-        out
-    }
-
-    /// The Now view's rows in selection order: NEEDS YOU, then RUNNING.
-    pub fn now_issues(&self) -> Vec<IssueId> {
-        let needs = now::needs(&self.snap);
-        let running = now::running(&self.snap);
-        needs
-            .into_iter()
-            .map(|n| n.issue)
-            .chain(running.into_iter().map(|r| r.issue))
-            .collect()
-    }
-
-    pub fn rows(&self, view: View) -> usize {
-        match view {
-            View::Now => self.now_issues().len(),
-            View::Board => self.board_issues().len(),
-            View::Agents => self.snap.runs.len(),
-            View::Inbox => self.snap.inbox.len(),
-            View::Queue => self.snap.queue.len(),
-            View::Log => self.snap.events.len(),
-            View::Config => self.snap.config.len(),
-        }
-    }
-
-    pub fn selected(&self, view: View) -> usize {
-        self.sel
-            .get(&view)
-            .copied()
-            .unwrap_or(0)
-            .min(self.rows(view).saturating_sub(1))
-    }
-
-    pub fn selected_issue(&self) -> Option<&IssueId> {
-        let i = self.selected(self.view);
+    /// Draws the active view into `area` (the rows the chrome leaves).
+    pub fn render_view(&self, frame: &mut Frame, area: Rect) {
+        let (snap, t) = (&self.snap, &self.theme);
         match self.view {
-            View::Now => self
-                .now_issues()
-                .get(i)
-                .and_then(|id| self.issue(id))
-                .map(|x| &x.id),
-            View::Board => self.board_issues().get(i).map(|x| &x.id),
-            View::Agents => self.snap.runs.get(i).map(|r| &r.issue_id),
-            View::Inbox => self.snap.inbox.get(i).map(|c| &c.issue_id),
-            View::Queue => self.snap.queue.get(i).map(|m| &m.issue_id),
-            View::Log | View::Config => None,
+            View::Now => now::render(frame, area, snap, &self.now, t),
+            View::Board => board::render(frame, area, snap, &self.board, t),
+            View::Agents => agents::render(frame, area, snap, &self.agents, t),
+            View::Inbox => inbox::render(frame, area, snap, &self.inbox, t),
+            View::Queue => queue::render(frame, area, snap, &self.queue, t),
+            View::Log => log::render(frame, area, snap, &self.log, t),
+            View::Config => config::render(frame, area, snap, &self.config, t),
         }
     }
 
-    pub fn issue(&self, id: &IssueId) -> Option<&Issue> {
-        self.snap.issues.iter().find(|i| &i.id == id)
-    }
-
-    pub fn run_for(&self, id: &IssueId) -> Option<&Run> {
-        self.snap.runs.iter().find(|r| &r.issue_id == id)
-    }
-
-    /// Blocked runs and unanswered questions, oldest first (RFC 3339 UTC strings sort by time; a run
-    /// counts from its start because the store keeps no "blocked since").
-    pub fn waiting(&self) -> Vec<Waiting> {
-        let runs = self
-            .snap
-            .runs
-            .iter()
-            .filter(|r| r.state == RunState::Blocked)
-            .map(|r| Waiting::Run {
-                issue: r.issue_id.clone(),
-                since: r.started_at.clone(),
-            });
-        let questions = self.snap.questions.iter().map(|c| Waiting::Question {
-            issue: c.issue_id.clone(),
-            body: c.body.clone(),
-            since: c.created_at.clone(),
-        });
-        let mut all: Vec<Waiting> = runs.chain(questions).collect();
-        all.sort_by(|a, b| a.since().cmp(b.since()));
-        all
-    }
-
-    /// What the Now view's selection points at: the NEEDS YOU rows first, then the RUNNING rows.
-    pub fn selected_now_row(&self) -> Option<NowRow> {
-        let i = self.selected(View::Now);
-        let needs = now::needs(&self.snap);
-        let n = needs.len();
-        if i < n {
-            needs.into_iter().nth(i).map(NowRow::Need)
-        } else {
-            now::running(&self.snap)
-                .into_iter()
-                .nth(i - n)
-                .map(NowRow::Running)
+    /// The issue whose Board detail should be loaded: the selected one, when the Board is open and the
+    /// snapshot holds the detail of another issue. The event loop turns it into `Action::LoadDetail`.
+    pub fn detail_wanted(&self) -> Option<IssueId> {
+        if self.view != View::Board || !self.board.detail {
+            return None;
         }
-    }
-
-    fn selected_now_issue(&self) -> Option<IssueId> {
-        self.selected_now_row().map(|r| match r {
-            NowRow::Need(n) => n.issue,
-            NowRow::Running(r) => r.issue,
-        })
-    }
-
-    /// Switches to the Board with `id` selected (it stays where it was when the Board hides it).
-    fn open_on_board(&mut self, id: &IssueId) {
-        if let Some(at) = self.board_issues().iter().position(|i| &i.id == id) {
-            self.sel.insert(View::Board, at);
-        }
-        self.view = View::Board;
-    }
-
-    /// `a` on the Now view: a blocked or stalled worker gets the answer overlay (a reply moves a
-    /// stalled run back to working), a QUESTION comment a typed answer.
-    fn now_answer(&mut self) -> Action {
-        match self.selected_now_row() {
-            Some(NowRow::Need(n)) => match n.source {
-                NeedSource::BlockedRun | NeedSource::Run(RunState::Stalled) => {
-                    self.mode = Mode::Answer {
-                        id: n.issue.clone(),
-                        screen: String::new(),
-                        text: None,
-                    };
-                    Action::Peek(n.issue)
-                }
-                NeedSource::Question(question) => {
-                    self.mode = Mode::Input {
-                        prompt: format!("answer {} (#{question})", n.issue),
-                        buf: String::new(),
-                        target: InputTarget::Answer(n.issue, question),
-                    };
-                    Action::None
-                }
-                _ => {
-                    self.status = Some(format!(
-                        "{}: a answers a question; this row takes {}",
-                        n.issue,
-                        n.act.hint()
-                    ));
-                    Action::None
-                }
-            },
-            Some(NowRow::Running(r)) => {
-                self.status = Some(format!("{} is running; nothing to answer", r.issue));
-                Action::None
-            }
-            None => Action::None,
-        }
-    }
-
-    /// `v` on the Now view: rerun verification of a failed run. `asf run verify` refuses a worker
-    /// that is still active (stalled, over budget), so those rows never get here.
-    fn now_verify(&mut self) -> Action {
-        match self.selected_now_row() {
-            Some(NowRow::Need(n)) if n.source == NeedSource::Run(RunState::Failed) => {
-                if self.busy_refusal() {
-                    Action::None
-                } else {
-                    Action::Verify(n.issue)
-                }
-            }
-            Some(row) => {
-                self.status = Some(format!(
-                    "{}: v verifies a failed run; {}",
-                    row.issue(),
-                    row.advice()
-                ));
-                Action::None
-            }
-            None => Action::None,
-        }
-    }
-
-    /// `x` on the Now view: abort an over-budget worker, after a confirmation (the Board's `x`).
-    fn now_abort(&mut self) -> Action {
-        match self.selected_now_row() {
-            Some(NowRow::Need(n)) if n.source == NeedSource::Run(RunState::OverBudget) => {
-                self.mode = Mode::Confirm {
-                    what: format!("abort {}?", n.issue),
-                    action: Box::new(Action::Abort(n.issue)),
-                };
-                Action::None
-            }
-            Some(row) => {
-                self.status = Some(format!(
-                    "{}: x aborts an over-budget run; {}",
-                    row.issue(),
-                    row.advice()
-                ));
-                Action::None
-            }
-            None => Action::None,
-        }
-    }
-
-    /// `r` on the Now view: re-queue a failed or blocked merge item.
-    fn now_retry(&mut self) -> Action {
-        match self.selected_now_row() {
-            Some(NowRow::Need(n)) if matches!(n.source, NeedSource::Merge(_)) => {
-                if self.busy_refusal() {
-                    Action::None
-                } else {
-                    Action::Retry(n.issue)
-                }
-            }
-            Some(row) => {
-                self.status = Some(format!(
-                    "{}: r retries a failed or blocked merge; {}",
-                    row.issue(),
-                    row.advice()
-                ));
-                Action::None
-            }
-            None => Action::None,
-        }
+        board::selected_issue(&self.snap, &self.board).filter(|id| self.snap.detail_of(id).is_none())
     }
 
     /// Feeds the pane text read for the open answer overlay; anything else ignores it.
     pub fn set_screen(&mut self, text: String) {
-        if let Mode::Answer { screen, .. } = &mut self.mode {
+        if let Some(Mode::Answer { screen, .. }) = self.overlays.last_mut() {
             *screen = text;
         }
     }
 
-    fn move_sel(&mut self, delta: i64) {
-        let n = self.rows(self.view) as i64;
-        if n == 0 {
-            return;
-        }
-        let cur = self.selected(self.view) as i64;
-        let next = (cur + delta).clamp(0, n - 1) as usize;
-        self.sel.insert(self.view, next);
-    }
-
-    /// Keys inside the answer overlay: nothing else is bound while it is open. Digits, Enter, Up,
-    /// Down, `y` and `n` go to the worker pane as keys and close the overlay; `t` types a reply;
-    /// Esc closes without sending.
-    fn handle_answer_key(
-        &mut self,
-        key: KeyEvent,
-        id: IssueId,
-        screen: String,
-        text: Option<String>,
-    ) -> Action {
-        let keys = |name: &str, id: IssueId| Action::Keys(id, vec![name.to_string()]);
-        if let Some(mut buf) = text {
-            return match key.code {
-                KeyCode::Esc => Action::None,
-                KeyCode::Enter if !buf.trim().is_empty() => Action::Reply(id, buf.trim().to_string()),
-                _ => {
-                    edit_line(&mut buf, &key);
-                    self.mode = Mode::Answer {
-                        id,
-                        screen,
-                        text: Some(buf),
-                    };
-                    Action::None
-                }
-            };
-        }
-        match key.code {
-            // A chord is never an answer: Ctrl+3 must not send "3" to the worker.
-            _ if is_chord(&key) => {
-                self.mode = Mode::Answer {
-                    id,
-                    screen,
-                    text: None,
-                };
-                Action::None
-            }
-            KeyCode::Esc => Action::None,
-            KeyCode::Char(c @ '1'..='9') => keys(&c.to_string(), id.clone()),
-            KeyCode::Char(c @ ('y' | 'n')) => keys(&c.to_string(), id.clone()),
-            KeyCode::Enter => keys("enter", id.clone()),
-            KeyCode::Up => keys("up", id.clone()),
-            KeyCode::Down => keys("down", id.clone()),
-            KeyCode::Char('t') => {
-                self.mode = Mode::Answer {
-                    id,
-                    screen,
-                    text: Some(String::new()),
-                };
-                Action::None
-            }
-            _ => {
-                self.mode = Mode::Answer {
-                    id,
-                    screen,
-                    text: None,
-                };
-                Action::None
-            }
-        }
-    }
-
-    /// Jumps to the first (`last == false`) or last row of the current view.
-    fn jump(&mut self, last: bool) {
-        let n = self.rows(self.view);
-        if n > 0 {
-            self.sel.insert(self.view, if last { n - 1 } else { 0 });
-        }
+    /// Keeps the last lines read from `issue`'s pane for the views (`Snapshot::pane_preview`).
+    pub fn set_pane_preview(&mut self, issue: IssueId, text: String) {
+        self.snap.pane_preview = Some(PanePreview { issue, text });
     }
 
     /// Next (`step == 1`) or previous (`step == -1`) view, wrapping around.
@@ -632,23 +262,6 @@ impl App {
         let n = View::ALL.len() as isize;
         let at = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0) as isize;
         self.view = View::ALL[(at + step).rem_euclid(n) as usize];
-    }
-
-    /// New scroll offset after `key` in a scrollable modal, or `None` when the key does not scroll.
-    fn scrolled(&self, key: &KeyEvent, scroll: u16) -> Option<u16> {
-        if is_chord(key) {
-            return None;
-        }
-        let max = self.scroll_max.get();
-        Some(match key.code {
-            KeyCode::Char('j') | KeyCode::Down => scroll.saturating_add(1).min(max),
-            KeyCode::Char('k') | KeyCode::Up => scroll.saturating_sub(1),
-            KeyCode::PageDown => scroll.saturating_add(10).min(max),
-            KeyCode::PageUp => scroll.saturating_sub(10),
-            KeyCode::Char('g') | KeyCode::Home => 0,
-            KeyCode::Char('G') | KeyCode::End => max,
-            _ => return None,
-        })
     }
 
     /// A background action may only start when none runs; otherwise the status says which one does.
@@ -662,6 +275,45 @@ impl App {
         }
     }
 
+    /// Carries out what a view or a window asked for inside the app and returns what is left for the
+    /// event loop.
+    fn dispatch(&mut self, action: Action) -> Action {
+        match action {
+            Action::Status(text) => {
+                self.status = Some(text);
+                Action::None
+            }
+            Action::OpenAnswer(id) => {
+                self.overlays.push(Mode::Answer {
+                    id: id.clone(),
+                    screen: String::new(),
+                    text: None,
+                });
+                Action::Peek(id)
+            }
+            Action::OpenInput { prompt, buf, target } => {
+                self.overlays.push(Mode::Input { prompt, buf, target });
+                Action::None
+            }
+            Action::Confirm { what, then } => {
+                self.overlays.push(Mode::Confirm { what, action: then });
+                Action::None
+            }
+            Action::OpenComment(comment) => {
+                self.scroll_max.set(u16::MAX);
+                self.overlays.push(Mode::Comment { comment, scroll: 0 });
+                Action::None
+            }
+            Action::OpenOnBoard(id) => {
+                board::select(&mut self.board, &self.snap, &id);
+                self.view = View::Board;
+                Action::None
+            }
+            a if a.is_background() && self.busy_refusal() => Action::None,
+            a => a,
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         // Any key press retires the status message; a key that has news sets a new one below.
         self.status = None;
@@ -669,56 +321,10 @@ impl App {
         if is_ctrl_c(&key) {
             return Action::Quit;
         }
-        match std::mem::replace(&mut self.mode, Mode::Normal) {
-            Mode::Input {
-                prompt,
-                mut buf,
-                target,
-            } => {
-                return match key.code {
-                    KeyCode::Esc => Action::None,
-                    KeyCode::Enter => {
-                        if buf.trim().is_empty() {
-                            Action::None
-                        } else {
-                            let text = buf.trim().to_string();
-                            match target {
-                                InputTarget::Reply(id) => Action::Reply(id, text),
-                                InputTarget::Config(key) => Action::SetConfig(key, text),
-                                InputTarget::Answer(id, question) => Action::Answer(id, question, text),
-                            }
-                        }
-                    }
-                    _ => {
-                        edit_line(&mut buf, &key);
-                        self.mode = Mode::Input { prompt, buf, target };
-                        Action::None
-                    }
-                };
-            }
-            Mode::Confirm { action, .. } => {
-                return match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') if !is_chord(&key) => *action,
-                    _ => Action::None,
-                };
-            }
-            Mode::Answer { id, screen, text } => return self.handle_answer_key(key, id, screen, text),
-            Mode::Comment { comment, scroll } => {
-                if key.code != KeyCode::Esc || is_chord(&key) {
-                    let scroll = self.scrolled(&key, scroll).unwrap_or(scroll);
-                    self.mode = Mode::Comment { comment, scroll };
-                }
-                return Action::None;
-            }
-            Mode::Help { scroll } => {
-                let closes = matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) && !is_chord(&key);
-                if !closes {
-                    let scroll = self.scrolled(&key, scroll).unwrap_or(scroll);
-                    self.mode = Mode::Help { scroll };
-                }
-                return Action::None;
-            }
-            Mode::Normal => {}
+        if let Some(top) = self.overlays.pop() {
+            let (keep, action) = overlays::handle_key(top, key, self.scroll_max.get());
+            self.overlays.extend(keep);
+            return self.dispatch(action);
         }
         // Ctrl/Alt chords are not bindings (and never text); Ctrl+C was handled above.
         if is_chord(&key) {
@@ -728,17 +334,11 @@ impl App {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char('?') => {
                 self.scroll_max.set(u16::MAX);
-                self.mode = Mode::Help { scroll: 0 };
+                self.overlays.push(Mode::Help { scroll: 0 });
                 Action::None
             }
             KeyCode::Char('R') => Action::Refresh,
-            KeyCode::Char('t') => {
-                if self.busy_refusal() {
-                    Action::None
-                } else {
-                    Action::Tick
-                }
-            }
+            KeyCode::Char('t') => self.dispatch(Action::Tick),
             KeyCode::Char(c @ '1'..='7') => {
                 self.view = View::ALL[(c as u8 - b'1') as usize];
                 Action::None
@@ -751,203 +351,24 @@ impl App {
                 self.cycle_view(-1);
                 Action::None
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.move_sel(1);
-                Action::None
+            _ => {
+                let action = self.view_key(key);
+                self.dispatch(action)
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.move_sel(-1);
-                Action::None
-            }
-            KeyCode::Char('g') | KeyCode::Home => {
-                self.jump(false);
-                Action::None
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                self.jump(true);
-                Action::None
-            }
-            KeyCode::Esc => {
-                if self.view == View::Board {
-                    self.detail = false;
-                }
-                Action::None
-            }
-            KeyCode::Char('m') if self.view == View::Inbox => self
-                .selected_issue()
-                .cloned()
-                .map(Action::MarkRead)
-                .unwrap_or(Action::None),
-            KeyCode::Char('M') if self.view == View::Inbox => {
-                let n = self.snap.inbox.len();
-                if n > 0 {
-                    self.mode = Mode::Confirm {
-                        what: format!("mark all {n} read?"),
-                        action: Box::new(Action::MarkAllRead),
-                    };
-                }
-                Action::None
-            }
-            KeyCode::Enter if self.view == View::Now => {
-                if let Some(id) = self.selected_now_issue() {
-                    self.open_on_board(&id);
-                }
-                Action::None
-            }
-            KeyCode::Char('a') if self.view == View::Now => self.now_answer(),
-            KeyCode::Char('v') if self.view == View::Now => self.now_verify(),
-            KeyCode::Char('r') if self.view == View::Now => self.now_retry(),
-            KeyCode::Char('x') if self.view == View::Now => self.now_abort(),
-            KeyCode::Char('f') if self.view == View::Now => self
-                .selected_now_issue()
-                .map(Action::Focus)
-                .unwrap_or(Action::None),
-            KeyCode::Enter => match (self.view, self.selected_issue().cloned()) {
-                (View::Inbox, Some(_)) => {
-                    if let Some(comment) = self.snap.inbox.get(self.selected(View::Inbox)).cloned() {
-                        self.scroll_max.set(u16::MAX);
-                        self.mode = Mode::Comment { comment, scroll: 0 };
-                    }
-                    Action::None
-                }
-                (View::Config, _) => {
-                    if let Some(row) = self.snap.config.get(self.selected(View::Config)) {
-                        self.mode = Mode::Input {
-                            prompt: format!("set {}", row.key),
-                            buf: row.raw.clone(),
-                            target: InputTarget::Config(row.key.clone()),
-                        };
-                    }
-                    Action::None
-                }
-                (View::Board, _) => {
-                    self.detail = !self.detail;
-                    Action::None
-                }
-                _ => Action::None,
-            },
-            KeyCode::Char('s') if self.view == View::Board => match self.selected_issue().cloned() {
-                Some(id) => match self.issue(&id).map(|i| i.status) {
-                    Some(Status::Ready) if self.busy_refusal() => Action::None,
-                    Some(Status::Ready) => Action::Start(id),
-                    Some(st) => {
-                        self.status = Some(format!("{id} is {st}; only ready issues can be started"));
-                        Action::None
-                    }
-                    None => Action::None,
-                },
-                None => Action::None,
-            },
-            KeyCode::Char('m') if matches!(self.view, View::Board | View::Agents) => self
-                .selected_issue()
-                .cloned()
-                .map(Action::Enqueue)
-                .unwrap_or(Action::None),
-            KeyCode::Char('f') if matches!(self.view, View::Board | View::Agents | View::Queue) => self
-                .selected_issue()
-                .cloned()
-                .map(Action::Focus)
-                .unwrap_or(Action::None),
-            KeyCode::Char('a') if matches!(self.view, View::Board | View::Agents | View::Inbox) => {
-                match self.selected_issue().cloned() {
-                    Some(id) if self.run_for(&id).is_some_and(|r| r.state == RunState::Blocked) => {
-                        self.mode = Mode::Answer {
-                            id: id.clone(),
-                            screen: String::new(),
-                            text: None,
-                        };
-                        Action::Peek(id)
-                    }
-                    Some(id) => {
-                        self.status = Some(format!("{id} has no blocked run to answer"));
-                        Action::None
-                    }
-                    None => Action::None,
-                }
-            }
-            KeyCode::Char('d') if self.view == View::Config => {
-                let Some(row) = self.snap.config.get(self.selected(View::Config)) else {
-                    return Action::None;
-                };
-                let key = row.key.clone();
-                if !asf_core::config_edit::unsettable_keys().contains(&key.as_str()) {
-                    self.status = Some(format!("{key} cannot be unset"));
-                } else if row.raw.is_empty() {
-                    self.status = Some(format!("{key} is already unset"));
-                } else {
-                    self.mode = Mode::Confirm {
-                        what: format!("unset {key}?"),
-                        action: Box::new(Action::UnsetConfig(key)),
-                    };
-                }
-                Action::None
-            }
-            KeyCode::Char('r')
-                if matches!(self.view, View::Board | View::Agents | View::Inbox | View::Queue) =>
-            {
-                if let Some(id) = self.selected_issue().cloned() {
-                    self.mode = Mode::Input {
-                        prompt: format!("reply to {id}"),
-                        buf: String::new(),
-                        target: InputTarget::Reply(id),
-                    };
-                }
-                Action::None
-            }
-            KeyCode::Char('x') if matches!(self.view, View::Board | View::Agents | View::Queue) => {
-                if let Some(id) = self.selected_issue().cloned() {
-                    if self.run_for(&id).is_some() {
-                        self.mode = Mode::Confirm {
-                            what: format!("abort {id}?"),
-                            action: Box::new(Action::Abort(id)),
-                        };
-                    } else {
-                        self.status = Some(format!("{id} has no active run"));
-                    }
-                }
-                Action::None
-            }
-            _ => Action::None,
         }
     }
-}
 
-/// Ctrl+C (and only that, not the AltGr Ctrl+Alt+C of a Polish layout).
-fn is_ctrl_c(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-        && matches!(key.code, KeyCode::Char('c' | 'C'))
-}
-
-/// A Ctrl or Alt chord: never text, never a plain binding.
-fn is_chord(key: &KeyEvent) -> bool {
-    key.modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-}
-
-/// Deletes the last word and the blanks after it, like readline's Ctrl+W.
-fn delete_word(buf: &mut String) {
-    while buf.ends_with(char::is_whitespace) {
-        buf.pop();
-    }
-    while buf.chars().last().is_some_and(|c| !c.is_whitespace()) {
-        buf.pop();
-    }
-}
-
-/// Applies one key to a single-line text buffer. Ctrl+U clears, Ctrl+W deletes a word, and a
-/// Ctrl or Alt chord never inserts its character. The one exception is Ctrl+Alt together: Windows
-/// reports AltGr (Polish ą ę ł ó ...) that way, and that is text.
-fn edit_line(buf: &mut String, key: &KeyEvent) {
-    let m = key.modifiers;
-    let (ctrl, alt) = (m.contains(KeyModifiers::CONTROL), m.contains(KeyModifiers::ALT));
-    match key.code {
-        KeyCode::Backspace => {
-            buf.pop();
+    /// Hands `key` to the active view.
+    fn view_key(&mut self, key: KeyEvent) -> Action {
+        let snap = &self.snap;
+        match self.view {
+            View::Now => now::handle_key(key, snap, &mut self.now),
+            View::Board => board::handle_key(key, snap, &mut self.board),
+            View::Agents => agents::handle_key(key, snap, &mut self.agents),
+            View::Inbox => inbox::handle_key(key, snap, &mut self.inbox),
+            View::Queue => queue::handle_key(key, snap, &mut self.queue),
+            View::Log => log::handle_key(key, snap, &mut self.log),
+            View::Config => config::handle_key(key, snap, &mut self.config),
         }
-        KeyCode::Char('u') if ctrl && !alt => buf.clear(),
-        KeyCode::Char('w') if ctrl && !alt => delete_word(buf),
-        KeyCode::Char(c) if (!ctrl && !alt) || (ctrl && alt) => buf.push(c),
-        _ => {}
     }
 }

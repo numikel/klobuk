@@ -1,5 +1,14 @@
 //! Terminal UI (M3): a ratatui app meant to run as a pane in Herdr.
 //!
+//! Layout of this module:
+//! - `theme`: the symbols and every style, `NO_COLOR` included; `chrome`: header, tabs, banner, rules,
+//!   key hints and the too-small gate; `bindings`: the one table of key bindings behind the footer and
+//!   the help page; `overlays`: the answer overlay, help page, comment modal, confirmation and input.
+//! - `snapshot`: what is loaded from the store, and the helpers the views share.
+//! - `views/<name>`: one module per view, each with `State`, `render`, `handle_key` and `BINDINGS`.
+//! - `app`: `App` (the current view, the seven states, the overlay stack, the status message) and the
+//!   dispatch of keys and drawing; this file: the event loop and every action that needs IO.
+//!
 //! Synchronous loop: keys are polled every 200 ms, the store snapshot is refreshed every second and
 //! the agents' live state every two seconds. Quick actions go through the same `Worker` and
 //! merge-queue code the CLI uses, so the TUI never has behaviour of its own. The two slow ones, a
@@ -7,10 +16,12 @@
 //! processes of this very executable and are polled from the loop, so the screen keeps redrawing.
 
 pub mod app;
-pub mod keys;
-pub mod now;
+pub mod bindings;
+pub mod chrome;
+pub mod overlays;
+pub mod snapshot;
 pub mod theme;
-pub mod view;
+pub mod views;
 
 #[cfg(test)]
 mod tests;
@@ -25,25 +36,19 @@ use std::time::{Duration, Instant};
 
 use asf_core::*;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
-use time::UtcOffset;
 
 use crate::ctx::{Ctx, CONFIG_FILE, FACTORY_DIR};
 use crate::output::AppError;
 use crate::worker::Worker;
-use app::{config_rows, unanswered_questions, Action, App, Snapshot, View};
+use app::{Action, App, View};
+use snapshot::{config_rows, load_detail, load_snapshot, read_config_text};
+use theme::Theme;
 
 const KEY_POLL: Duration = Duration::from_millis(200);
 /// Faster while a background action runs, so the spinner turns smoothly.
 const BUSY_POLL: Duration = Duration::from_millis(100);
 const STORE_REFRESH: Duration = Duration::from_secs(1);
 const AGENT_REFRESH: Duration = Duration::from_secs(2);
-const LOG_LIMIT: usize = 200;
-
-/// `.factory/config.toml` text with the BOM dropped and CRLF turned into LF (as `asf config` reads it).
-fn read_config_text(root: &Path) -> std::io::Result<String> {
-    let raw = std::fs::read_to_string(root.join(FACTORY_DIR).join(CONFIG_FILE))?;
-    Ok(raw.trim_start_matches('\u{feff}').replace("\r\n", "\n"))
-}
 
 /// Applies one Config-view edit and returns the status line for it.
 ///
@@ -321,103 +326,6 @@ impl Background {
     }
 }
 
-/// Loads everything the TUI shows. `rt` adds live agent states (skipped when `None`).
-pub fn load_snapshot(
-    ctx: &Ctx,
-    rt: Option<&dyn AgentRuntime>,
-    prev_agents: &BTreeMap<IssueId, AgentInfo>,
-) -> Result<Snapshot, AppError> {
-    let store = &ctx.store;
-    let runs = store.runs(None, true)?;
-    let mut agents = prev_agents.clone();
-    let mut runtime_ok = None;
-    if let Some(rt) = rt {
-        runtime_ok = Some(rt.health().is_ok());
-        for r in &runs {
-            if let (Some(pane), Some(name)) = (&r.pane_id, &r.agent_name) {
-                let h = AgentHandle {
-                    name: name.clone(),
-                    pane_id: pane.clone(),
-                    workspace_id: r.workspace_id.clone().unwrap_or_default(),
-                };
-                if let Ok(info) = rt.info(&h) {
-                    agents.insert(r.issue_id.clone(), info);
-                }
-            }
-        }
-    }
-    let mut events = store.events_since(0, usize::MAX)?;
-    if events.len() > LOG_LIMIT {
-        events = events.split_off(events.len() - LOG_LIMIT);
-    }
-    events.reverse();
-    let issues = store.list_issues(&IssueFilter::default())?;
-    // Unanswered questions are read from all comments, not the inbox: marking the inbox read must
-    // not hide a question that still blocks `asf issue finish`. The newest BLOCKER of each live
-    // issue rides along: it quotes the screen of a blocked worker.
-    let mut questions = Vec::new();
-    let mut blockers = Vec::new();
-    for issue in issues
-        .iter()
-        .filter(|i| !matches!(i.status, Status::Done | Status::Cancelled))
-    {
-        let comments = store.comments(&issue.id)?;
-        let open = unanswered_questions(&comments);
-        blockers.extend(
-            comments
-                .iter()
-                .filter(|c| c.kind == CommentType::Blocker)
-                .max_by_key(|c| c.id)
-                .cloned(),
-        );
-        questions.extend(comments.into_iter().filter(|c| open.contains(&c.id)));
-    }
-    questions.sort_by(|a, b| (&a.created_at, a.id).cmp(&(&b.created_at, b.id)));
-    // `runs` is active-only, so a `failed` run is found among all runs: the newest run of a live
-    // issue, when it failed and no run of the issue is active.
-    let mut newest: BTreeMap<IssueId, Run> = BTreeMap::new();
-    for r in store.runs(None, false)? {
-        newest.insert(r.issue_id.clone(), r); // ordered by start: the last one wins
-    }
-    let failed_runs: Vec<Run> = issues
-        .iter()
-        .filter(|i| !matches!(i.status, Status::Done | Status::Cancelled))
-        .filter_map(|i| newest.remove(&i.id))
-        .filter(|r| r.state == RunState::Failed)
-        .collect();
-    // `time`'s local-offset support is enabled workspace-wide by ratatui; UTC when it cannot be read.
-    let utc_offset_secs = UtcOffset::current_local_offset().map_or(0, |o| o.whole_seconds());
-    Ok(Snapshot {
-        repo_name: ctx
-            .root
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default(),
-        branch: ctx.config.repo.default_branch.clone(),
-        runtime_ok,
-        max_parallel: ctx.config.scheduler.max_parallel,
-        issues,
-        claims: store.active_claims()?,
-        runs,
-        agents,
-        inbox: store.inbox(LANE_HUMAN, true, false)?,
-        questions,
-        queue: store
-            .merge_queue()?
-            .into_iter()
-            .filter(|m| !m.state.is_terminal())
-            .collect(),
-        events,
-        config: config_rows(&read_config_text(&ctx.root).unwrap_or_default()),
-        now: now_rfc3339(),
-        utc_offset_secs,
-        failed_runs,
-        blockers,
-        deps: store.deps()?,
-        review_model: ctx.config.review.model.clone(),
-    })
-}
-
 /// Posts the human's ANSWER to QUESTION comment `question` on `id` and returns the status line. It is
 /// the comment `asf issue comment --lane human --type ANSWER --reply-to <q>` writes: the worker finds
 /// it in its inbox, and the question stops blocking `asf issue finish`.
@@ -443,8 +351,15 @@ pub(crate) fn post_answer(
 fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<String>, AppError> {
     Ok(match action {
         // Peek is served by the event loop (it needs the app state); nothing to run here.
-        Action::None | Action::Quit | Action::Refresh | Action::Peek(_) => None,
+        Action::None | Action::Quit | Action::Refresh | Action::Peek(_) | Action::LoadDetail(_) => None,
         Action::Tick | Action::Start(_) | Action::Verify(_) | Action::Retry(_) => None,
+        // The app consumed these itself; none of them reaches the event loop.
+        Action::Status(_)
+        | Action::OpenAnswer(_)
+        | Action::OpenInput { .. }
+        | Action::Confirm { .. }
+        | Action::OpenComment(_)
+        | Action::OpenOnBoard(_) => None,
         Action::Answer(id, question, text) => Some(post_answer(&ctx.store, &id, question, &text)?),
         Action::Focus(id) => {
             let run = worker.run_for(&id)?;
@@ -494,17 +409,17 @@ pub fn run_once(ctx: &Ctx, view: Option<View>) -> Result<String, AppError> {
     let rt = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root).ok();
     let snap = load_snapshot(ctx, rt.as_deref(), &BTreeMap::new())?;
     let mut app = App::new(snap);
-    app.color = !theme::no_color_from_env();
+    app.theme = Theme::from_env();
     if let Some(v) = view {
         app.view = v;
     }
-    Ok(view::render_to_text(&app, 120, 30))
+    Ok(chrome::render_to_text(&app, 120, 30))
 }
 
 pub fn run_interactive(ctx: &Ctx, view: Option<View>) -> Result<(), AppError> {
     let worker = Worker::new(ctx)?;
     let mut app = App::new(load_snapshot(ctx, Some(worker.rt.as_ref()), &BTreeMap::new())?);
-    app.color = !theme::no_color_from_env();
+    app.theme = Theme::from_env();
     if let Some(v) = view {
         app.view = v;
     }
@@ -512,6 +427,14 @@ pub fn run_interactive(ctx: &Ctx, view: Option<View>) -> Result<(), AppError> {
     let result = event_loop(&mut terminal, &mut app, ctx, &worker);
     ratatui::restore();
     result
+}
+
+/// Loads the Board detail of `id` into the snapshot; a failure leaves the panel without it.
+fn load_detail_into(app: &mut App, ctx: &Ctx, id: &IssueId) {
+    match load_detail(ctx, id) {
+        Ok(detail) => app.snap.detail = Some(detail),
+        Err(e) => app.status = Some(format!("detail failed: {}", e.message)),
+    }
 }
 
 fn event_loop(
@@ -527,7 +450,7 @@ fn event_loop(
     loop {
         app.advance(started.elapsed());
         terminal
-            .draw(|f| view::render(f, app))
+            .draw(|f| chrome::render(f, app))
             .map_err(|e| AppError::io(e.to_string()))?;
         let wait = if background.is_some() { BUSY_POLL } else { KEY_POLL };
         if event::poll(wait).map_err(|e| AppError::io(e.to_string()))? {
@@ -541,7 +464,12 @@ fn event_loop(
                     return Ok(());
                 }
                 if let Action::Peek(id) = &action {
-                    app.set_screen(peek_screen(worker, id));
+                    let text = peek_screen(worker, id);
+                    app.set_pane_preview(id.clone(), text.clone());
+                    app.set_screen(text);
+                }
+                if let Action::LoadDetail(id) = &action {
+                    load_detail_into(app, ctx, id);
                 }
                 let kind = match &action {
                     Action::Tick => Some(BgKind::Tick),
@@ -571,6 +499,10 @@ fn event_loop(
                     last_agents -= AGENT_REFRESH;
                 }
             }
+        }
+        // A view switch or a refresh can leave the Board without the detail of its selection.
+        if let Some(id) = app.detail_wanted() {
+            load_detail_into(app, ctx, &id);
         }
         if let Some(msg) = background.as_mut().and_then(Background::poll) {
             background = None;

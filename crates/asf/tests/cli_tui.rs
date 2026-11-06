@@ -436,3 +436,58 @@ fn line_with(text: &str, needle: impl std::fmt::Display) -> String {
         .unwrap_or_else(|| panic!("no line with {needle:?}:\n{text}"))
         .to_string()
 }
+
+#[test]
+fn tui_once_draws_the_same_frame_around_every_view() {
+    let repo = fake_repo();
+    let a = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
+    repo.ok(&["run", "start", &a]);
+    let views = ["now", "board", "agents", "inbox", "queue", "log", "config"];
+    for (n, view) in views.iter().enumerate() {
+        let out = repo
+            .asf()
+            .args(["tui", "--once", "--view", view])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{view}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() >= 4, "{view}:\n{text}");
+        assert!(
+            lines[0].contains("asf ·") && lines[0].contains("workers 1/3"),
+            "{view} header: {:?}",
+            lines[0]
+        );
+        let tab = format!("[{}] ", n + 1);
+        assert!(lines[1].contains(&tab), "{view} tabs: {:?}", lines[1]);
+        let last = lines.len() - 1;
+        assert_eq!(
+            lines[last - 1],
+            "─".repeat(120),
+            "{view}: a rule above the key hints"
+        );
+        assert!(
+            lines[last].ends_with("? help  q quit"),
+            "{view} hints: {:?}",
+            lines[last]
+        );
+    }
+}
+
+#[test]
+fn tui_once_with_no_color_set_prints_the_same_text_and_still_no_escapes() {
+    let repo = fake_repo();
+    let out = repo
+        .asf()
+        .env("NO_COLOR", "1")
+        .args(["tui", "--once", "--view", "now"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("NEEDS YOU") && !text.contains("\u{1b}["), "{text}");
+}
