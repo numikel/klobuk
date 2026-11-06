@@ -483,6 +483,7 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         // Any key press retires the status message; a key that has news sets a new one below.
         self.status = None;
+        self.status_stamp = None;
         if is_ctrl_c(&key) {
             return Action::Quit;
         }
@@ -628,7 +629,7 @@ impl App {
                 }
                 _ => Action::None,
             },
-            KeyCode::Char('s') => match self.selected_issue().cloned() {
+            KeyCode::Char('s') if self.view == View::Board => match self.selected_issue().cloned() {
                 Some(id) => match self.issue(&id).map(|i| i.status) {
                     Some(Status::Ready) if self.busy_refusal() => Action::None,
                     Some(Status::Ready) => Action::Start(id),
@@ -640,12 +641,12 @@ impl App {
                 },
                 None => Action::None,
             },
-            KeyCode::Char('m') => self
+            KeyCode::Char('m') if matches!(self.view, View::Board | View::Agents) => self
                 .selected_issue()
                 .cloned()
                 .map(Action::Enqueue)
                 .unwrap_or(Action::None),
-            KeyCode::Char('f') => self
+            KeyCode::Char('f') if matches!(self.view, View::Board | View::Agents | View::Queue) => self
                 .selected_issue()
                 .cloned()
                 .map(Action::Focus)
@@ -684,7 +685,9 @@ impl App {
                 }
                 Action::None
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r')
+                if matches!(self.view, View::Board | View::Agents | View::Inbox | View::Queue) =>
+            {
                 if let Some(id) = self.selected_issue().cloned() {
                     self.mode = Mode::Input {
                         prompt: format!("reply to {id}"),
@@ -694,7 +697,7 @@ impl App {
                 }
                 Action::None
             }
-            KeyCode::Char('x') => {
+            KeyCode::Char('x') if matches!(self.view, View::Board | View::Agents | View::Queue) => {
                 if let Some(id) = self.selected_issue().cloned() {
                     if self.run_for(&id).is_some() {
                         self.mode = Mode::Confirm {

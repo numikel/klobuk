@@ -222,7 +222,13 @@ struct Background {
     kind: BgKind,
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: Option<JoinHandle<Vec<u8>>>,
+    /// When the child was first seen to have exited; the pipes get [`DRAIN_GRACE`] after that.
+    exited: Option<Instant>,
 }
+
+/// How long after the child exits its pipes may stay open (a grandchild that inherited the handle)
+/// before the outcome is reported from what was read; the UI never blocks on a join.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 fn drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
@@ -250,6 +256,7 @@ impl Background {
             kind,
             stdout,
             stderr,
+            exited: None,
         })
     }
 
@@ -260,8 +267,15 @@ impl Background {
             Ok(Some(status)) => status.code(),
             Err(e) => return Some(format!("✗ cannot poll {}: {e}", self.kind.noun())),
         };
+        let exited = *self.exited.get_or_insert_with(Instant::now);
+        let open = |h: &Option<JoinHandle<Vec<u8>>>| h.as_ref().is_some_and(|h| !h.is_finished());
+        if (open(&self.stdout) || open(&self.stderr)) && exited.elapsed() < DRAIN_GRACE {
+            return None;
+        }
+        // Past the grace period an unfinished reader is dropped (detached) instead of joined.
         let text = |h: Option<JoinHandle<Vec<u8>>>| {
-            h.and_then(|h| h.join().ok())
+            h.filter(|h| h.is_finished())
+                .and_then(|h| h.join().ok())
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .unwrap_or_default()
         };

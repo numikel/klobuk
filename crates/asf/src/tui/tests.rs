@@ -1559,3 +1559,116 @@ fn escape_in_normal_mode_closes_the_board_detail_panel() {
     a.handle_key(code(KeyCode::Enter));
     assert!(a.detail, "Enter still toggles it back");
 }
+
+// ---------- asf-31 review round 1 ----------
+
+#[test]
+fn a_status_set_again_by_a_key_gets_a_fresh_four_seconds() {
+    let mut a = app();
+    a.advance(ms(0));
+    a.handle_key(key('j')); // asf-3, ready
+    a.busy = Some("tick".into());
+    a.handle_key(key('t'));
+    assert_eq!(a.status.as_deref(), Some("busy: tick"));
+    a.advance(ms(0)); // stamped at t = 0
+    a.advance(ms(3_000));
+    // the same text again, set by a key before the next advance()
+    a.handle_key(key('t'));
+    assert_eq!(a.status.as_deref(), Some("busy: tick"));
+    a.advance(ms(3_000)); // stamps the new message at t = 3 s
+    a.advance(ms(6_000));
+    assert_eq!(
+        a.status.as_deref(),
+        Some("busy: tick"),
+        "the first message's 4 s must not cut the second one short"
+    );
+    a.advance(ms(3_000) + STATUS_TTL);
+    assert!(a.status.is_none(), "gone 4 s after the second press");
+}
+
+#[test]
+fn a_key_is_inert_in_every_view_the_table_does_not_list_it_for() {
+    for view in View::ALL {
+        for c in ['s', 'm', 'f', 'r', 'x', 'a', 'd', 'M'] {
+            let listed = BINDINGS
+                .iter()
+                .any(|b| b.key == c.to_string() && b.applies(view, ModeKind::Normal));
+            if listed {
+                continue;
+            }
+            let mut a = app();
+            a.view = view;
+            assert_eq!(a.handle_key(key(c)), Action::None, "{c} in {view:?}");
+            assert!(
+                matches!(a.mode, Mode::Normal),
+                "{c} in {view:?} opened {:?}",
+                a.mode
+            );
+            assert!(a.status.is_none(), "{c} in {view:?}: {:?}", a.status);
+        }
+    }
+    // the cases the review named, spelled out
+    let mut a = inbox_app();
+    for c in ['s', 'f', 'x'] {
+        assert_eq!(a.handle_key(key(c)), Action::None, "{c} in the Inbox");
+    }
+    assert_eq!(a.handle_key(key('m')), Action::MarkRead(id("asf-2")));
+    let mut q = app();
+    q.view = View::Queue;
+    assert_eq!(q.handle_key(key('s')), Action::None);
+    assert_eq!(q.handle_key(key('m')), Action::None);
+    let mut g = app();
+    g.view = View::Agents;
+    assert_eq!(g.handle_key(key('s')), Action::None);
+    assert_eq!(g.handle_key(key('m')), Action::Enqueue(id("asf-2")));
+}
+
+#[test]
+fn the_table_lists_page_and_jump_keys_where_they_work() {
+    let listed = |mode: ModeKind, word: &str| {
+        BINDINGS
+            .iter()
+            .any(|b| b.modes.contains(&mode) && b.key.contains(word))
+    };
+    for word in ["Home", "End"] {
+        assert!(listed(ModeKind::Normal, word), "{word} in normal mode");
+    }
+    for mode in [ModeKind::Help, ModeKind::Comment] {
+        for word in ["PageUp", "PageDown", "Home", "End"] {
+            assert!(listed(mode, word), "{word} in {mode:?}");
+        }
+    }
+    let mut a = app();
+    a.handle_key(key('?'));
+    let t = render_to_text(&a, 100, 150);
+    for word in ["PageUp", "PageDown", "Home", "End"] {
+        assert!(t.contains(word), "help view lacks {word}");
+    }
+}
+
+#[test]
+fn page_and_jump_keys_do_what_the_help_says() {
+    let mut s = snapshot();
+    s.inbox[0].body = (1..=80)
+        .map(|n| format!("line {n:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut a = App::new(s);
+    a.handle_key(key('3'));
+    a.handle_key(code(KeyCode::Enter));
+    render_to_text(&a, 100, 30); // publishes the scroll limit
+    a.handle_key(code(KeyCode::PageDown));
+    assert!(render_to_text(&a, 100, 30).contains("line 11"));
+    a.handle_key(code(KeyCode::End));
+    assert!(render_to_text(&a, 100, 30).contains("line 80"));
+    a.handle_key(code(KeyCode::PageUp));
+    assert!(!render_to_text(&a, 100, 30).contains("line 80"));
+    a.handle_key(code(KeyCode::Home));
+    assert!(render_to_text(&a, 100, 30).contains("line 10"));
+    // Home / End move the selection in normal mode
+    let mut b = app();
+    b.handle_key(code(KeyCode::End));
+    assert_eq!(b.selected_issue().unwrap().as_str(), "asf-1");
+    b.handle_key(code(KeyCode::Home));
+    assert_eq!(b.selected_issue().unwrap().as_str(), "asf-4");
+}
