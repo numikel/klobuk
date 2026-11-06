@@ -170,13 +170,13 @@ fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
     if set.is_match(&rel) {
         return Ok(String::new());
     }
+    let asf = crate::ctx::asf_bin();
     let reason = format!(
-        "asf: `{rel}` is outside the file scope of {} ({}). Edit only files matching the scope; if the scope is \
-         wrong, post `{} issue comment {} --type BLOCKER --to human --body \"...\"` and stop.",
-        issue.id,
-        issue.file_scope.join(", "),
-        crate::ctx::asf_bin(),
-        issue.id
+        "asf: `{rel}` is outside the file scope of {id} ({scope}). Edit only files matching the scope; if the scope is \
+         too narrow, ask for it with `{asf} issue comment {id} --type QUESTION --to human --body \"SCOPE: <path> because <reason>\"`, \
+         then continue with other work and check `{asf} issue inbox`.",
+        id = issue.id,
+        scope = issue.file_scope.join(", "),
     );
     ctx.store.append_event(&NewEvent {
         kind: "hook.denied".into(),

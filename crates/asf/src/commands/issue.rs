@@ -5,7 +5,7 @@ use std::path::Path;
 use asf_core::*;
 use serde::Serialize;
 
-use crate::cli::{Cli, CommentArgs, CreateArgs, DepCmd, EditArgs, IssueCmd, ListArgs};
+use crate::cli::{Cli, CommentArgs, CreateArgs, DepCmd, EditArgs, IssueCmd, ListArgs, ScopeCmd};
 use crate::ctx::Ctx;
 use crate::output::{AppError, Rendered};
 
@@ -25,6 +25,7 @@ pub fn run(cli: &Cli, cmd: &IssueCmd) -> Result<Rendered, AppError> {
         IssueCmd::Comment(a) => comment(&ctx, a),
         IssueCmd::Inbox { peek, all } => inbox(&ctx, *peek, *all),
         IssueCmd::Handoff { id, to, body } => handoff(&ctx, id, to, body),
+        IssueCmd::Scope { cmd } => scope(&ctx, cmd),
     }?;
     if !matches!(
         cmd,
@@ -454,4 +455,120 @@ fn inbox(ctx: &Ctx, peek: bool, all: bool) -> Result<Rendered, AppError> {
         items.iter().map(comment_line).collect::<Vec<_>>().join("\n")
     };
     Rendered::new(&items, text)
+}
+
+#[derive(Serialize)]
+struct ScopeView {
+    id: IssueId,
+    /// The scope after the change.
+    file_scope: Vec<String>,
+    /// Globs actually added or removed (duplicates and unknown globs are not listed).
+    changed: Vec<String>,
+    /// Ids of the `SCOPE:` QUESTIONs this call answered.
+    answered: Vec<i64>,
+}
+
+/// First occurrence wins; the order the operator typed is kept.
+fn unique(globs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for g in globs {
+        if !out.contains(g) {
+            out.push(g.clone());
+        }
+    }
+    out
+}
+
+/// Marker a worker puts at the start of a QUESTION to ask for a wider scope.
+const SCOPE_REQUEST_PREFIX: &str = "SCOPE:";
+
+/// `scope add|rm`. Orchestrator-only: `dispatch` refuses it inside a worker run because `Scope`
+/// is not on `allowed_in_worker`'s list.
+fn scope(ctx: &Ctx, cmd: &ScopeCmd) -> Result<Rendered, AppError> {
+    let (id, globs, adding) = match cmd {
+        ScopeCmd::Add { id, globs } => (id, unique(globs), true),
+        ScopeCmd::Rm { id, globs } => (id, unique(globs), false),
+    };
+    let current = require(ctx, id)?.file_scope;
+    let changed: Vec<String> = globs
+        .iter()
+        .filter(|g| current.contains(g) != adding)
+        .cloned()
+        .collect();
+    let next: Vec<String> = if adding {
+        current.iter().chain(changed.iter()).cloned().collect()
+    } else {
+        current.iter().filter(|g| !changed.contains(g)).cloned().collect()
+    };
+    // The store validates every glob (globset) before it writes, so an invalid one fails the
+    // whole call with `validation` and the scope stays as it was. `rm` skips the check on
+    // purpose: it only drops entries that are already stored.
+    let issue = if changed.is_empty() {
+        require(ctx, id)?
+    } else {
+        ctx.store.update_issue(
+            id,
+            &IssuePatch {
+                file_scope: Some(next),
+                ..IssuePatch::default()
+            },
+        )?
+    };
+    let answered = if adding {
+        answer_scope_requests(ctx, id, &globs)?
+    } else {
+        Vec::new()
+    };
+
+    let mut text = format!(
+        "{id} scope: {}",
+        if issue.file_scope.is_empty() {
+            "- (empty scope: no restriction)".to_string()
+        } else {
+            issue.file_scope.join(" ")
+        }
+    );
+    if !answered.is_empty() {
+        let ids = answered
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "
+answered scope request {ids}"
+        ));
+    }
+    Rendered::new(
+        &ScopeView {
+            id: id.clone(),
+            file_scope: issue.file_scope,
+            changed,
+            answered,
+        },
+        text,
+    )
+}
+
+/// Posts an ANSWER (`reply_to` the question, so the `finish` guard lets go) for every open
+/// `SCOPE:` QUESTION to the human on `id`. Safe to repeat: answered questions are skipped.
+fn answer_scope_requests(ctx: &Ctx, id: &IssueId, globs: &[String]) -> Result<Vec<i64>, AppError> {
+    let comments = ctx.store.comments(id)?;
+    let open = unanswered_questions(&comments);
+    let mut answered = Vec::new();
+    for q in comments
+        .iter()
+        .filter(|c| open.contains(&c.id) && c.body.trim_start().starts_with(SCOPE_REQUEST_PREFIX))
+    {
+        ctx.store.add_comment(&NewComment {
+            issue_id: id.clone(),
+            author: ctx.author(),
+            kind: CommentType::Answer,
+            to_lane: id.to_string(),
+            body: format!("scope extended: {}", globs.join(", ")),
+            reply_to: Some(q.id),
+        })?;
+        answered.push(q.id);
+    }
+    Ok(answered)
 }

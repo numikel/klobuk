@@ -132,6 +132,36 @@ fn pre_tool_denies_outside_scope_with_json_decision() {
 }
 
 #[test]
+fn pre_tool_deny_text_names_the_scope_request_command() {
+    let f = fixture(None);
+    let env = [("ASF_RUN", f.run_id.as_str())];
+    let (_, out, _) = hook(
+        &f.wt,
+        "pre-tool",
+        &env,
+        &pre_tool(&f.wt.join("Cargo.toml"), "Write"),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json decision");
+    let reason = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reason.contains(
+            "issue comment asf-1 --type QUESTION --to human --body \"SCOPE: <path> because <reason>\""
+        ),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("continue with other work and check `") && reason.contains("issue inbox`"),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("BLOCKER"),
+        "the scope request replaces the old BLOCKER advice: {reason}"
+    );
+}
+
+#[test]
 fn pre_tool_allows_in_scope_and_ignores_other_tools() {
     let f = fixture(None);
     let env = [("ASF_RUN", f.run_id.as_str())];

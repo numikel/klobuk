@@ -81,6 +81,21 @@ fn worker_brief_routes_non_blocking_questions_to_the_human() {
 }
 
 #[test]
+fn worker_brief_tells_how_to_ask_for_a_scope_extension() {
+    let b = worker_brief();
+    assert!(
+        b.contains(
+            "D:/bin/asf.exe issue comment asf-9 --type QUESTION --to human --body \"SCOPE: <path> because <reason>\""
+        ),
+        "{b}"
+    );
+    assert!(
+        b.contains("continue with other work and check `D:/bin/asf.exe issue inbox`"),
+        "{b}"
+    );
+}
+
+#[test]
 fn worker_brief_posts_deviations_as_decisions() {
     let b = worker_brief();
     assert!(

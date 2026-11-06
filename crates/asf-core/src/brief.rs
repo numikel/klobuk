@@ -123,6 +123,9 @@ pub fn render_brief(b: &BriefInput<'_>) -> String {
 - Questions: if you cannot proceed without an answer, ask it with the AskUserQuestion tool and wait. If the question does not \
 block you, post it and keep working: `{asf} issue comment {id} --type QUESTION --to human --body \"...\"`. `{asf} issue finish` \
 is refused while a QUESTION to human is unanswered, so resolve every one before finishing.\n\
+- Scope too narrow: when you need a file outside your scope, ask for it with \
+`{asf} issue comment {id} --type QUESTION --to human --body \"SCOPE: <path> because <reason>\"`, then continue with other work \
+and check `{asf} issue inbox`; an ANSWER `scope extended: ...` means your scope now covers it.\n\
 - Deviations: when you depart from the brief or settle a choice it left open, record it with \
 `{asf} issue comment {id} --type DECISION --to human --body \"...\"` (what, why).\n\
 - Hand results to a dependent issue with `{asf} issue handoff <issue> --to <issue> --body \"...\"`.\n\

@@ -300,3 +300,217 @@ fn finish_ignores_questions_that_are_not_to_human() {
     let done = r.ok(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
     assert_eq!(done["issue"]["status"], "in-review");
 }
+
+// ---- `asf issue scope add|rm` -----------------------------------------------------------------
+
+fn scope_of(r: &Repo, id: &str) -> serde_json::Value {
+    r.ok(&["issue", "show", id])["issue"]["file_scope"].clone()
+}
+
+fn comments_of(r: &Repo, id: &str) -> Vec<serde_json::Value> {
+    r.ok(&["issue", "show", id, "--dossier"])["comments"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn ask(r: &Repo, id: &str, to: &str, body: &str) -> String {
+    let q = r.ok(&[
+        "--lane", id, "issue", "comment", id, "--type", "QUESTION", "--to", to, "--body", body,
+    ]);
+    q["id"].as_i64().unwrap().to_string()
+}
+
+#[test]
+fn scope_add_appends_ignores_duplicates_and_reports_the_list() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--scope", "src/**"]);
+
+    let v = r.ok(&[
+        "issue",
+        "scope",
+        "add",
+        &a,
+        "docs/**",
+        "src/**",
+        "docs/**",
+        "Cargo.toml",
+    ]);
+    assert_eq!(v["id"], "asf-1");
+    assert_eq!(
+        v["file_scope"],
+        serde_json::json!(["src/**", "docs/**", "Cargo.toml"])
+    );
+    assert_eq!(v["changed"], serde_json::json!(["docs/**", "Cargo.toml"]));
+    assert_eq!(scope_of(&r, &a), v["file_scope"]);
+
+    // adding only known globs changes nothing
+    let again = r.ok(&["issue", "scope", "add", &a, "docs/**"]);
+    assert_eq!(again["file_scope"], v["file_scope"]);
+    assert_eq!(again["changed"], serde_json::json!([]));
+
+    let out = r
+        .asf()
+        .args(["issue", "scope", "add", &a, "tests/**"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("asf-1") && text.contains("src/** docs/** Cargo.toml tests/**"),
+        "{text}"
+    );
+}
+
+#[test]
+fn scope_add_to_an_issue_without_scope_starts_the_list() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &[]);
+    let v = r.ok(&["issue", "scope", "add", &a, "src/**"]);
+    assert_eq!(v["file_scope"], serde_json::json!(["src/**"]));
+}
+
+#[test]
+fn scope_add_rejects_invalid_globs_and_changes_nothing() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--scope", "src/**"]);
+    let (code, ecode, msg) = r.err(&["issue", "scope", "add", &a, "docs/**", "src/["]);
+    assert_eq!((code, ecode.as_str()), (1, "validation"));
+    assert!(msg.contains("src/["), "{msg}");
+    assert_eq!(
+        scope_of(&r, &a),
+        serde_json::json!(["src/**"]),
+        "valid globs of a failed call are not applied"
+    );
+    let (code, ecode, _) = r.err(&["issue", "scope", "add", "asf-9", "src/**"]);
+    assert_eq!((code, ecode.as_str()), (1, "not_found"));
+    r.asf().args(["issue", "scope", "add", &a]).assert().code(2);
+    r.asf().args(["issue", "scope", "rm", &a]).assert().code(2);
+}
+
+#[test]
+fn scope_rm_removes_listed_globs_and_ignores_unknown_ones() {
+    let r = Repo::initialised();
+    let a = r.create_issue(
+        "a",
+        &["--scope", "src/**", "--scope", "docs/**", "--scope", "Cargo.toml"],
+    );
+
+    let v = r.ok(&["issue", "scope", "rm", &a, "docs/**", "nope/**", "docs/**"]);
+    assert_eq!(v["file_scope"], serde_json::json!(["src/**", "Cargo.toml"]));
+    assert_eq!(v["changed"], serde_json::json!(["docs/**"]));
+    assert_eq!(scope_of(&r, &a), v["file_scope"]);
+
+    let out = r
+        .asf()
+        .args(["issue", "scope", "rm", &a, "Cargo.toml"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("src/**"),
+        "text shows the remaining list"
+    );
+
+    // the last glob may go; an empty scope means "no restriction" and the text says so
+    let out = r
+        .asf()
+        .args(["issue", "scope", "rm", &a, "src/**"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no restriction"), "{text}");
+    assert_eq!(scope_of(&r, &a), serde_json::json!([]));
+}
+
+#[test]
+fn scope_commands_are_refused_inside_a_worker_run() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--scope", "src/**"]);
+    for args in [
+        ["issue", "scope", "add", a.as_str(), "docs/**"],
+        ["issue", "scope", "rm", a.as_str(), "src/**"],
+    ] {
+        let out = r
+            .asf()
+            .env("ASF_RUN", "01RUN")
+            .args(args)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["error"]["code"], "forbidden", "{v}");
+    }
+    assert_eq!(scope_of(&r, &a), serde_json::json!(["src/**"]), "scope untouched");
+}
+
+#[test]
+fn scope_add_answers_a_scope_question_and_releases_the_finish_guard() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready", "--scope", "src/**"]);
+    let report = report_file(&r, "report.md");
+    let qid = ask(
+        &r,
+        &a,
+        "human",
+        "SCOPE: Cargo.toml because a new dependency is needed",
+    );
+
+    let (code, _, _) = r.err(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(code, 3, "the open SCOPE question blocks finish");
+
+    let v = r.ok(&["issue", "scope", "add", &a, "Cargo.toml"]);
+    assert_eq!(v["answered"], serde_json::json!([qid.parse::<i64>().unwrap()]));
+
+    let comments = comments_of(&r, &a);
+    let answer = comments
+        .iter()
+        .find(|c| c["type"] == "ANSWER")
+        .unwrap_or_else(|| panic!("no ANSWER in {comments:?}"));
+    assert_eq!(answer["body"], "scope extended: Cargo.toml");
+    assert_eq!(answer["reply_to"], qid.parse::<i64>().unwrap());
+    assert_eq!(answer["to_lane"], a.as_str());
+
+    let done = r.ok(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(done["issue"]["status"], "in-review");
+
+    // a second add does not answer the same question again
+    let v = r.ok(&["issue", "scope", "add", &a, "docs/**"]);
+    assert_eq!(v["answered"], serde_json::json!([]));
+    assert_eq!(
+        comments_of(&r, &a)
+            .iter()
+            .filter(|c| c["type"] == "ANSWER")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn scope_add_leaves_other_questions_unanswered() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready", "--scope", "src/**"]);
+    let b = r.create_issue("b", &["--ready"]);
+    let report = report_file(&r, "report.md");
+    ask(&r, &a, "human", "which crate?");
+    ask(&r, &a, &b, "SCOPE: Cargo.toml because a peer asked");
+
+    let v = r.ok(&["issue", "scope", "add", &a, "Cargo.toml"]);
+    assert_eq!(v["answered"], serde_json::json!([]));
+    assert!(comments_of(&r, &a).iter().all(|c| c["type"] != "ANSWER"));
+    let (code, _, _) = r.err(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(code, 3, "the ordinary question to human still blocks finish");
+}
+
+#[test]
+fn scope_rm_does_not_answer_scope_questions() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready", "--scope", "src/**", "--scope", "docs/**"]);
+    ask(&r, &a, "human", "SCOPE: Cargo.toml because x");
+    let v = r.ok(&["issue", "scope", "rm", &a, "docs/**"]);
+    assert!(v.get("answered").is_none() || v["answered"] == serde_json::json!([]));
+    assert!(comments_of(&r, &a).iter().all(|c| c["type"] != "ANSWER"));
+}

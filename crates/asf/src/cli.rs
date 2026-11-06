@@ -227,6 +227,27 @@ pub enum IssueCmd {
         #[arg(long)]
         body: String,
     },
+    /// Extend or shrink an issue's file scope (orchestrator only; refused inside a worker run).
+    Scope {
+        #[command(subcommand)]
+        cmd: ScopeCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScopeCmd {
+    /// Add globs to the file scope (duplicates ignored). Also answers an open `SCOPE:` QUESTION to `human`.
+    Add {
+        id: IssueId,
+        #[arg(required = true, num_args = 1..)]
+        globs: Vec<String>,
+    },
+    /// Remove globs from the file scope (globs that are not in it are ignored).
+    Rm {
+        id: IssueId,
+        #[arg(required = true, num_args = 1..)]
+        globs: Vec<String>,
+    },
 }
 
 #[derive(Args, Debug, Default)]
