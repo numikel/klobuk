@@ -54,19 +54,24 @@ fn commit_in(dir: &Path, rel: &str, content: &str) {
 
 /// Starts a worker on the fake runtime, commits `files` in the worktree, runs the finish ritual and `watch`.
 fn finished_run(f: &F, files: &[(&str, &str)]) {
-    f.repo.ok(&["run", "start", &f.issue]);
-    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    finished_run_of(f, &f.issue, files);
+}
+
+/// `finished_run` for any ready issue of the repo.
+fn finished_run_of(f: &F, issue: &str, files: &[(&str, &str)]) {
+    f.repo.ok(&["run", "start", issue]);
+    let wt = f.repo.path().join(".worktrees").join(issue);
     for (rel, content) in files {
         commit_in(&wt, rel, content);
     }
-    let report = wt.join(".factory").join("runs").join(&f.issue).join("report.md");
+    let report = wt.join(".factory").join("runs").join(issue).join("report.md");
     std::fs::write(&report, "# done\n").unwrap();
     f.repo.ok(&[
         "--lane",
-        &f.issue,
+        issue,
         "issue",
         "finish",
-        &f.issue,
+        issue,
         "--report",
         report.to_str().unwrap(),
     ]);
@@ -518,16 +523,37 @@ fn start_agents(f: &F) -> usize {
         .count()
 }
 
-fn review_id(f: &F) -> String {
-    let reviews = store(f)
+/// The review issues of `issue`, oldest first (a verdict closes one, the next round opens a new one).
+fn reviews_of(f: &F, issue: &str) -> Vec<Issue> {
+    store(f)
         .list_issues(&IssueFilter {
             kind: Some(IssueType::Review),
-            parent: Some(f.issue.parse().unwrap()),
+            parent: Some(issue.parse().unwrap()),
             ..IssueFilter::default()
         })
-        .unwrap();
-    assert_eq!(reviews.len(), 1, "exactly one review issue: {reviews:?}");
-    reviews[0].id.to_string()
+        .unwrap()
+}
+
+/// The newest review issue of `issue`: the one of the round in progress.
+fn review_of(f: &F, issue: &str) -> String {
+    reviews_of(f, issue)
+        .last()
+        .expect("a review issue exists")
+        .id
+        .to_string()
+}
+
+fn review_id(f: &F) -> String {
+    review_of(f, &f.issue)
+}
+
+/// Active runs per `asf run plan`: (workers, reviewers).
+fn running(f: &F) -> (u64, u64) {
+    let plan = f.repo.ok(&["run", "plan"]);
+    (
+        plan["running"].as_u64().unwrap(),
+        plan["reviewers_running"].as_u64().unwrap(),
+    )
 }
 
 fn comment_count(f: &F) -> usize {
@@ -793,22 +819,21 @@ fn events_of(f: &F, kind: &str) -> Vec<Event> {
         .collect()
 }
 
-/// An item approved by its reviewer whose fast-forward then failed because main moved on in between:
-/// `failed`, ready for `merge retry`.
+/// An item approved by its reviewer whose fast-forward then could not happen because main moved on in
+/// between: back to `queued` (no failure, no error), so the next tick rebases and gates it again.
 fn approved_but_main_moved() -> F {
     let f = reviewing();
     let rid = review_id(&f);
     decide_as(&f, &rid, "approve");
     commit_in(f.repo.path(), "README.txt", "main moved\n");
     let res = f.repo.ok(&["merge", "tick", "--once"]);
-    assert_eq!(res["items"][0]["state"], "failed", "{res}");
-    assert!(
-        res["items"][0]["last_error"]
-            .as_str()
-            .unwrap()
-            .contains("fast-forward"),
-        "{res}"
-    );
+    assert_eq!(res["items"][0]["state"], "queued", "{res}");
+    assert!(res["items"][0]["last_error"].is_null(), "{res}");
+    assert!(!main_has(&f, "src/greet.rs"), "nothing merged on the stale base");
+    assert_eq!(status_of(&f, &f.issue), "validating", "the issue is not blocked");
+    let requeued = events_of(&f, "merge.requeued");
+    assert_eq!(requeued.len(), 1, "{requeued:?}");
+    assert_eq!(requeued[0].payload["reason"], "main_moved");
     f
 }
 
@@ -829,7 +854,6 @@ fn an_identical_patch_after_a_rebase_onto_moved_main_skips_the_review() {
     let rounds = events_of(&f, "merge.review_started").len();
     assert_eq!(rounds, 1);
 
-    f.repo.ok(&["merge", "retry", &f.issue]);
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "merged", "{res}");
     assert!(main_has(&f, "src/greet.rs") && main_has(&f, "README.txt"));
@@ -849,7 +873,6 @@ fn a_whitespace_only_change_gets_a_different_fingerprint_and_a_new_review_round(
     // the same added line, only indented: a whitespace-stripping patch-id would call this patch identical
     commit_in(&wt, "src/greet.rs", "    pub fn hello() {}\n");
 
-    f.repo.ok(&["merge", "retry", &f.issue]);
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
     assert!(
@@ -881,7 +904,6 @@ fn a_changed_patch_after_the_retry_starts_a_new_review_round() {
     let wt = f.repo.path().join(".worktrees").join(&f.issue);
     commit_in(&wt, "src/extra.rs", "pub fn extra() {}\n");
 
-    f.repo.ok(&["merge", "retry", &f.issue]);
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
     assert!(
@@ -910,4 +932,181 @@ fn a_changed_patch_after_the_retry_starts_a_new_review_round() {
         .collect();
     assert_eq!(ids.len(), 2);
     assert_ne!(ids[0], ids[1], "the two patches have different fingerprints");
+}
+
+// ---- reviewers have a limit of their own; a verdict closes its review at once -------------------
+
+/// `[review] max_parallel = n`, committed so main stays clean.
+fn review_limit(f: &F, n: u32) {
+    set_config(
+        f,
+        "required = true",
+        &format!("required = true\nmax_parallel = {n}"),
+    );
+}
+
+fn close_workspaces(f: &F) -> usize {
+    FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
+        .log()
+        .iter()
+        .filter(|e| e.op == "close_workspace")
+        .count()
+}
+
+#[test]
+fn a_full_reviewer_limit_leaves_the_next_verified_item_queued_until_a_reviewer_is_free() {
+    let f = setup();
+    require_review(&f);
+    review_limit(&f, 1);
+    let second = f.repo.create_issue("docs", &["--ready", "--scope", "docs/**"]);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    finished_run_of(&f, &second, &[("docs/a.md", "# a\n")]);
+    let second_id: IssueId = second.parse().unwrap();
+    let comments_before = store(&f).comments(&second_id).unwrap().len();
+    let agents = start_agents(&f);
+
+    // FIFO: the first item gets the only reviewer, the second one is left exactly as it was
+    let res = f.repo.ok(&["merge", "tick"]);
+    assert_eq!(res["processed"], 1, "{res}");
+    assert_eq!(res["items"][0]["issue_id"], f.issue.as_str(), "{res}");
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(start_agents(&f), agents + 1);
+    let q = store(&f).merge_queue().unwrap();
+    assert_eq!(q[0].state, MergeState::Reviewing);
+    assert_eq!(q[1].state, MergeState::Queued, "waits, does not fail: {:?}", q[1]);
+    assert_eq!(q[1].attempts, 0, "not even rebased yet");
+    assert!(q[1].last_error.is_none(), "{:?}", q[1]);
+    assert_eq!(
+        store(&f).comments(&second_id).unwrap().len(),
+        comments_before,
+        "the wait is silent"
+    );
+    assert_eq!(running(&f), (0, 1));
+
+    // while the reviewer is busy later ticks change nothing
+    assert_eq!(f.repo.ok(&["merge", "tick"])["processed"], 0);
+    assert_eq!(start_agents(&f), agents + 1);
+    assert_eq!(store(&f).merge_queue().unwrap()[1].state, MergeState::Queued);
+
+    // the verdict frees the reviewer in the same tick: the first item merges, the second one's review starts
+    decide_as(&f, &review_id(&f), "approve");
+    let res = f.repo.ok(&["merge", "tick"]);
+    let states: Vec<&str> = res["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["merged", "reviewing"], "{res}");
+    assert!(main_has(&f, "src/greet.rs"));
+    assert_eq!(start_agents(&f), agents + 2);
+    assert_eq!(running(&f), (0, 1), "one reviewer at a time");
+    assert_eq!(status_of(&f, &review_of(&f, &second)), "in-progress");
+}
+
+#[test]
+fn a_reviewer_limit_of_two_runs_two_reviewers_at_once() {
+    let f = setup();
+    require_review(&f);
+    let second = f.repo.create_issue("docs", &["--ready", "--scope", "docs/**"]);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    finished_run_of(&f, &second, &[("docs/a.md", "# a\n")]);
+    let res = f.repo.ok(&["merge", "tick"]);
+    assert_eq!(res["processed"], 2, "the default limit is 2: {res}");
+    assert_eq!(running(&f), (0, 2));
+}
+
+#[test]
+fn a_running_reviewer_does_not_take_a_worker_slot() {
+    let f = reviewing();
+    set_config(&f, "max_parallel = 3 ", "max_parallel = 1 ");
+    let other = f.repo.create_issue("other", &["--ready", "--scope", "docs/**"]);
+    assert_eq!(running(&f), (0, 1), "a reviewer, no worker");
+    let plan = f.repo.ok(&["run", "plan"]);
+    assert_eq!(plan["capacity"], 1);
+    let slots: Vec<&str> = plan["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["issue"].as_str().unwrap())
+        .collect();
+    assert_eq!(slots, [other.as_str()], "the only worker slot is free: {plan}");
+}
+
+#[test]
+fn an_approve_verdict_closes_the_review_issue_its_claim_and_run_even_when_the_merge_is_parked() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    assert_eq!(running(&f), (0, 1));
+    decide_as(&f, &rid, "approve");
+    std::fs::write(f.repo.path().join("src/lib.rs"), "dirty\n").unwrap();
+    let closed = close_workspaces(&f);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["processed"], 0, "parked behind the dirty main: {res}");
+    assert_eq!(store(&f).merge_queue().unwrap()[0].state, MergeState::Reviewing);
+    assert_eq!(
+        status_of(&f, &rid),
+        "done",
+        "closed as soon as the verdict was read"
+    );
+    assert!(
+        !store(&f)
+            .active_claims()
+            .unwrap()
+            .iter()
+            .any(|c| c.issue_id.to_string() == rid),
+        "the review claim is released"
+    );
+    let run = store(&f)
+        .runs(Some(&rid.parse().unwrap()), false)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(
+        close_workspaces(&f),
+        closed + 1,
+        "the reviewer's workspace is closed"
+    );
+    assert_eq!(running(&f), (0, 0));
+
+    // the parked item is looked at again; closing twice is harmless
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["processed"], 0, "{res}");
+    git(f.repo.path(), &["checkout", "--", "src/lib.rs"]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(status_of(&f, &rid), "done");
+}
+
+#[test]
+fn a_changes_verdict_closes_the_review_at_once_and_the_next_round_gets_a_fresh_review() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no test");
+    let closed = close_workspaces(&f);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(status_of(&f, &rid), "done");
+    assert!(
+        !store(&f)
+            .active_claims()
+            .unwrap()
+            .iter()
+            .any(|c| c.issue_id.to_string() == rid),
+        "the review claim is released"
+    );
+    assert_eq!(close_workspaces(&f), closed + 1);
+    assert_eq!(running(&f), (0, 0), "no reviewer left holding a slot");
+
+    // a retry opens the next round with a new review issue and a new reviewer
+    let agents = start_agents(&f);
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(start_agents(&f), agents + 1);
+    let next = review_id(&f);
+    assert_ne!(next, rid, "a new review issue for the new round");
+    assert_eq!(status_of(&f, &next), "in-progress");
+    assert_eq!(running(&f), (0, 1));
 }

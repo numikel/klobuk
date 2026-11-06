@@ -1018,3 +1018,86 @@ fn verification_reuses_a_branch_that_is_already_in_the_merge_queue() {
     assert_eq!(q[0].state, MergeState::Queued);
     assert_eq!(issue_status(&f), "validating");
 }
+
+// ---- capacity: worker slots count active runs, claims only block scopes ---------------------------
+
+fn plan_reasons(plan: &serde_json::Value) -> Vec<(String, String)> {
+    plan["deferred"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["issue"].as_str().unwrap().to_string(),
+                d["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn plan_counts_active_worker_runs_not_held_claims_and_shows_both_limits() {
+    let f = setup();
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("max_parallel = 3 ", "max_parallel = 1 ");
+    std::fs::write(&cfg, s).unwrap();
+    let clash = f
+        .repo
+        .create_issue("clashes with asf-1", &["--ready", "--scope", "src/**"]);
+    let apart = f
+        .repo
+        .create_issue("touches other files", &["--ready", "--scope", "docs/x.md"]);
+
+    // a working run takes the only worker slot: the disjoint issue waits for a slot, the other one for the scope
+    f.repo.ok(&["run", "start", &f.issue]);
+    let plan = f.repo.ok(&["run", "plan"]);
+    assert_eq!(
+        (plan["capacity"].as_u64(), plan["running"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(
+        (
+            plan["review_capacity"].as_u64(),
+            plan["reviewers_running"].as_u64()
+        ),
+        (Some(2), Some(0))
+    );
+    assert!(plan["slots"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(
+        plan_reasons(&plan),
+        [
+            (clash.clone(), "scope_conflict".to_string()),
+            (apart.clone(), "slots_full".to_string())
+        ]
+    );
+    let text =
+        String::from_utf8_lossy(&f.repo.asf().args(["run", "plan"]).output().unwrap().stdout).to_string();
+    assert!(
+        text.contains("workers 1/1 running, reviewers 0/2 running"),
+        "{text}"
+    );
+
+    // the worker finishes and is verified: the issue waits in validating and keeps its claim,
+    // but no run is active any more, so the slot is free while the scope stays taken
+    worker_finishes(&f);
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(issue_status(&f), "validating");
+    assert_eq!(store(&f).active_claims().unwrap().len(), 1, "the claim is held");
+    let plan = f.repo.ok(&["run", "plan"]);
+    assert_eq!(plan["running"], 0, "{plan}");
+    let slots: Vec<&str> = plan["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["issue"].as_str().unwrap())
+        .collect();
+    assert_eq!(slots, [apart.as_str()], "{plan}");
+    assert_eq!(plan_reasons(&plan), [(clash, "scope_conflict".to_string())]);
+    assert_eq!(plan["deferred"][0]["detail"], f.issue.as_str());
+    let text =
+        String::from_utf8_lossy(&f.repo.asf().args(["run", "plan"]).output().unwrap().stdout).to_string();
+    assert!(text.contains("workers 0/1 running"), "{text}");
+}

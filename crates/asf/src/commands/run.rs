@@ -1,6 +1,6 @@
 //! `asf run …` — allocation plan and worker lifecycle.
 
-use asf_core::scheduler::{self, AllocationPlan, SchedulerInput};
+use asf_core::scheduler::{self, AllocationPlan, RunCounts, SchedulerInput};
 use asf_core::{IssueFilter, IssueStore};
 use serde::Serialize;
 
@@ -14,10 +14,14 @@ use crate::worker::{self, Worker};
 struct PlanView {
     #[serde(flatten)]
     plan: AllocationPlan,
-    /// `max_parallel` from config.
+    /// `[scheduler] max_parallel` from config.
     capacity: usize,
-    /// Claims counted against capacity.
+    /// Active worker runs (they use up `capacity`; a claim without an active run does not).
     running: usize,
+    /// `[review] max_parallel` from config.
+    review_capacity: usize,
+    /// Active reviewer runs (they use up `review_capacity`, never worker slots).
+    reviewers_running: usize,
 }
 
 pub fn run(cli: &Cli, cmd: &RunCmd) -> Result<Rendered, AppError> {
@@ -101,19 +105,30 @@ pub fn run(cli: &Cli, cmd: &RunCmd) -> Result<Rendered, AppError> {
     }
 }
 
+/// Active runs of the current store snapshot, workers apart from reviewers.
+pub fn active_run_counts(ctx: &Ctx) -> Result<RunCounts, AppError> {
+    let issues = ctx.store.list_issues(&IssueFilter::default())?;
+    let runs = ctx.store.runs(None, true)?;
+    Ok(scheduler::count_active_runs(&issues, &runs))
+}
+
 /// The allocation plan for the current store snapshot (also used by `run start --approve`).
+///
+/// Claims decide scope conflicts; only active worker runs use up `[scheduler] max_parallel`.
 pub fn current_plan(ctx: &Ctx) -> Result<AllocationPlan, AppError> {
     scheduler::validate_scope(&ctx.config.scheduler.hotspots)
         .map_err(|e| AppError::validation(format!("scheduler.hotspots: {e}")))?;
     let issues = ctx.store.list_issues(&IssueFilter::default())?;
     let deps = ctx.store.deps()?;
     let claims = ctx.store.active_claims()?;
+    let runs = ctx.store.runs(None, true)?;
     let tracked = git::tracked_files(&ctx.root)?;
     let input = SchedulerInput {
         issues: &issues,
         deps: &deps,
         claims: &claims,
         tracked_files: &tracked,
+        active_workers: scheduler::count_active_runs(&issues, &runs).workers,
         max_parallel: ctx.config.scheduler.max_parallel,
         hotspots: &ctx.config.scheduler.hotspots,
     };
@@ -122,16 +137,18 @@ pub fn current_plan(ctx: &Ctx) -> Result<AllocationPlan, AppError> {
 
 fn plan(ctx: &Ctx) -> Result<Rendered, AppError> {
     let plan = current_plan(ctx)?;
-    let running = ctx.store.active_claims()?.len();
+    let counts = active_run_counts(ctx)?;
     let view = PlanView {
         capacity: ctx.config.scheduler.max_parallel,
-        running,
+        running: counts.workers,
+        review_capacity: ctx.config.review.max_parallel as usize,
+        reviewers_running: counts.reviewers,
         plan,
     };
 
     let mut text = format!(
-        "plan {} — capacity {} (running {})\n",
-        view.plan.inputs_hash, view.capacity, view.running
+        "plan {} — workers {}/{} running, reviewers {}/{} running\n",
+        view.plan.inputs_hash, view.running, view.capacity, view.reviewers_running, view.review_capacity
     );
     if view.plan.slots.is_empty() {
         text.push_str("slots: none\n");

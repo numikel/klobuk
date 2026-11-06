@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::ids::IssueId;
 use crate::model::{Claim, Dep, Issue, IssueType, Status};
+use crate::run::{Run, RunState};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SchedulerError {
@@ -65,10 +66,59 @@ pub struct AllocationPlan {
 pub struct SchedulerInput<'a> {
     pub issues: &'a [Issue],
     pub deps: &'a [Dep],
+    /// Every claimed issue. Claims decide scope conflicts, whether or not a worker is running:
+    /// an issue waiting in `validating` still has an unmerged branch.
     pub claims: &'a [Claim],
     pub tracked_files: &'a [String],
+    /// Worker runs that are active right now (see [`count_active_runs`]); only these use up
+    /// `max_parallel`.
+    pub active_workers: usize,
     pub max_parallel: usize,
     pub hotspots: &'a [String],
+}
+
+/// Active runs, split by the kind of issue they work on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCounts {
+    /// Runs on issues that are not reviews; they count against `[scheduler] max_parallel`.
+    pub workers: usize,
+    /// Runs on review issues; they count against `[review] max_parallel`.
+    pub reviewers: usize,
+}
+
+/// Whether a run occupies a slot: it is starting, working, blocked, finishing or verifying.
+fn run_is_active(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Starting
+            | RunState::Working
+            | RunState::Blocked
+            | RunState::Finishing
+            | RunState::Verifying
+    )
+}
+
+/// Counts the active runs, workers apart from reviewers. A claim without an active run (an issue in
+/// `validating`, a run that already succeeded) is not counted. A run whose issue is unknown counts
+/// as a worker.
+pub fn count_active_runs(issues: &[Issue], runs: &[Run]) -> RunCounts {
+    let reviews: HashSet<&IssueId> = issues
+        .iter()
+        .filter(|i| i.kind == IssueType::Review)
+        .map(|i| &i.id)
+        .collect();
+    let mut counts = RunCounts {
+        workers: 0,
+        reviewers: 0,
+    };
+    for r in runs.iter().filter(|r| run_is_active(r.state)) {
+        if reviews.contains(&r.issue_id) {
+            counts.reviewers += 1;
+        } else {
+            counts.workers += 1;
+        }
+    }
+    counts
 }
 
 /// Validates the dependency graph and returns a topological order (dependencies first).
@@ -273,6 +323,7 @@ fn inputs_hash(input: &SchedulerInput<'_>) -> String {
     for c in input.claims {
         (c.issue_id.as_str(), c.worker.as_str()).hash(&mut h);
     }
+    input.active_workers.hash(&mut h);
     input.max_parallel.hash(&mut h);
     input.hotspots.hash(&mut h);
     input.tracked_files.hash(&mut h);
@@ -328,7 +379,8 @@ pub fn plan(input: &SchedulerInput<'_>, worktrees_dir: &str) -> Result<Allocatio
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let capacity = input.max_parallel.saturating_sub(input.claims.len());
+    // only active worker runs use up slots; `occupied` below still holds every claim for conflicts
+    let capacity = input.max_parallel.saturating_sub(input.active_workers);
     let mut occupied: Vec<(&IssueId, &[String])> = input
         .claims
         .iter()
@@ -415,6 +467,7 @@ pub fn plan(input: &SchedulerInput<'_>, worktrees_dir: &str) -> Result<Allocatio
 mod tests {
     use super::*;
     use crate::model::*;
+    use crate::run::{Run, RunState};
     use proptest::prelude::*;
 
     fn id(s: &str) -> IssueId {
@@ -465,6 +518,7 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Every claim in these tests stands for an active worker run, unless a test says otherwise.
     fn input<'a>(
         issues: &'a [Issue],
         deps: &'a [Dep],
@@ -478,8 +532,159 @@ mod tests {
             deps,
             claims,
             tracked_files: tracked,
+            active_workers: claims.len(),
             max_parallel,
             hotspots,
+        }
+    }
+
+    fn run_of(i: &str, state: RunState) -> Run {
+        Run {
+            id: format!("run-{i}-{state}"),
+            issue_id: id(i),
+            attempt: 1,
+            runtime: "fake".into(),
+            agent_name: None,
+            workspace_id: None,
+            pane_id: None,
+            claude_session_id: None,
+            transcript_path: None,
+            worktree: format!(".worktrees/{i}"),
+            branch: format!("feat/{i}"),
+            base_sha: "0".repeat(40),
+            state,
+            budget_usd: None,
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            turns: 0,
+            tool_calls: 0,
+            exit_reason: None,
+            report_path: None,
+            started_at: "2026-11-02T00:00:00Z".into(),
+            last_seen_at: None,
+            finished_at: None,
+            herdr_revision: None,
+        }
+    }
+
+    #[test]
+    fn held_claim_without_active_run_takes_no_slot() {
+        let issues = [
+            mk("asf-1", Status::Validating, &["src/a.rs"]),
+            mk("asf-2", Status::Ready, &["src/b.rs"]),
+            mk("asf-3", Status::Ready, &["src/c.rs"]),
+        ];
+        let t = strs(&["src/a.rs", "src/b.rs", "src/c.rs"]);
+        let claims = [claim("asf-1", "asf-1")];
+        let mut inp = input(&issues, &[], &claims, &t, 1, &[]);
+        inp.active_workers = 0;
+        let p = plan(&inp, ".worktrees").unwrap();
+        let slots: Vec<_> = p.slots.iter().map(|s| s.issue.to_string()).collect();
+        assert_eq!(slots, ["asf-2"], "the validating issue holds a claim, not a slot");
+        assert_eq!(p.deferred.len(), 1);
+        assert_eq!(p.deferred[0].issue, id("asf-3"));
+        assert_eq!(p.deferred[0].reason, DeferReason::SlotsFull);
+    }
+
+    #[test]
+    fn held_claim_still_blocks_a_conflicting_scope() {
+        let issues = [
+            mk("asf-1", Status::Validating, &["src/a.rs"]),
+            mk("asf-2", Status::Ready, &["src/a.rs"]),
+            mk("asf-3", Status::Ready, &["src/b.rs"]),
+        ];
+        let t = strs(&["src/a.rs", "src/b.rs"]);
+        let claims = [claim("asf-1", "asf-1")];
+        let mut inp = input(&issues, &[], &claims, &t, 3, &[]);
+        inp.active_workers = 0;
+        let p = plan(&inp, ".worktrees").unwrap();
+        let slots: Vec<_> = p.slots.iter().map(|s| s.issue.to_string()).collect();
+        assert_eq!(slots, ["asf-3"]);
+        assert_eq!(p.deferred.len(), 1);
+        assert_eq!(p.deferred[0].issue, id("asf-2"));
+        assert_eq!(p.deferred[0].reason, DeferReason::ScopeConflict(id("asf-1")));
+    }
+
+    #[test]
+    fn active_workers_use_up_the_capacity() {
+        let issues = [
+            mk("asf-1", Status::InProgress, &["src/a.rs"]),
+            mk("asf-2", Status::InProgress, &["src/b.rs"]),
+            mk("asf-3", Status::Ready, &["src/c.rs"]),
+        ];
+        let t = strs(&["src/a.rs", "src/b.rs", "src/c.rs"]);
+        let claims = [claim("asf-1", "asf-1"), claim("asf-2", "asf-2")];
+        let mut inp = input(&issues, &[], &claims, &t, 2, &[]);
+        inp.active_workers = 2;
+        let p = plan(&inp, ".worktrees").unwrap();
+        assert!(p.slots.is_empty());
+        assert_eq!(p.deferred[0].reason, DeferReason::SlotsFull);
+    }
+
+    #[test]
+    fn inputs_hash_follows_the_active_worker_count() {
+        let issues = [mk("asf-1", Status::Ready, &["a.rs"])];
+        let t = strs(&["a.rs"]);
+        let mut a = input(&issues, &[], &[], &t, 2, &[]);
+        let h0 = plan(&a, ".worktrees").unwrap().inputs_hash;
+        a.active_workers = 1;
+        let h1 = plan(&a, ".worktrees").unwrap().inputs_hash;
+        assert_ne!(h0, h1, "a stale plan must not be approved after a worker started");
+    }
+
+    #[test]
+    fn count_active_runs_splits_workers_from_reviewers() {
+        let mut review = mk("asf-9", Status::InProgress, &[]);
+        review.kind = IssueType::Review;
+        let issues = [
+            mk("asf-1", Status::InProgress, &["a.rs"]),
+            mk("asf-2", Status::Validating, &["b.rs"]),
+            mk("asf-3", Status::InProgress, &["c.rs"]),
+            review,
+        ];
+        let runs = [
+            run_of("asf-1", RunState::Working),
+            run_of("asf-1", RunState::Failed),
+            run_of("asf-2", RunState::Succeeded),
+            run_of("asf-3", RunState::Verifying),
+            run_of("asf-3", RunState::Stalled),
+            run_of("asf-9", RunState::Starting),
+            run_of("asf-9", RunState::Aborted),
+        ];
+        let c = count_active_runs(&issues, &runs);
+        assert_eq!(
+            c,
+            RunCounts {
+                workers: 2,
+                reviewers: 1
+            }
+        );
+        for s in [
+            RunState::Starting,
+            RunState::Working,
+            RunState::Blocked,
+            RunState::Finishing,
+            RunState::Verifying,
+        ] {
+            assert_eq!(
+                count_active_runs(&issues, &[run_of("asf-1", s)]).workers,
+                1,
+                "{s}"
+            );
+        }
+        for s in [
+            RunState::Succeeded,
+            RunState::Failed,
+            RunState::Aborted,
+            RunState::Stalled,
+            RunState::OverBudget,
+        ] {
+            assert_eq!(
+                count_active_runs(&issues, &[run_of("asf-1", s)]).workers,
+                0,
+                "{s}"
+            );
         }
     }
 

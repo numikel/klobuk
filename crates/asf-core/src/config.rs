@@ -275,6 +275,9 @@ pub struct ReviewCfg {
     pub model: String,
     /// Review rounds that may end in `changes` before the human is asked to decide.
     pub max_rounds: u32,
+    /// Reviewer runs that may be active at once; reviewers do not count against
+    /// `[scheduler] max_parallel`.
+    pub max_parallel: u32,
 }
 
 impl Default for ReviewCfg {
@@ -284,6 +287,7 @@ impl Default for ReviewCfg {
             on_labels: Vec::new(),
             model: "opus".into(),
             max_rounds: 2,
+            max_parallel: 2,
         }
     }
 }
@@ -364,6 +368,7 @@ required = false
 on_labels = []            # e.g. ["risky"]: labels that force a review worker before merge
 # model = "opus"          # model of the read-only reviewer
 # max_rounds = 2          # `changes` verdicts allowed before the human has to decide
+# max_parallel = 2        # reviewers running at once (own limit, not counted in [scheduler] max_parallel); >= 1
 
 [planner]
 runner = "claude"         # claude (headless `claude -p`, read-only tools) | fake (tests)
@@ -389,6 +394,9 @@ impl Config {
         }
         if self.scheduler.max_parallel == 0 {
             return Err(ConfigError::Invalid("scheduler.max_parallel must be >= 1".into()));
+        }
+        if self.review.max_parallel == 0 {
+            return Err(ConfigError::Invalid("review.max_parallel must be >= 1".into()));
         }
         if self.repo.default_branch.trim().is_empty() {
             return Err(ConfigError::Invalid(
@@ -557,6 +565,26 @@ mod tests {
         assert!(c.merge.require_clean_main);
         assert!(!c.merge.verify_main_after, "off unless asked for");
         assert!(!c.review.required);
+    }
+
+    #[test]
+    fn review_max_parallel_defaults_to_two_and_rejects_zero() {
+        assert_eq!(Config::from_toml("").unwrap().review.max_parallel, 2);
+        let c = Config::from_toml("[review]\nmax_parallel = 1\n").unwrap();
+        assert_eq!(c.review.max_parallel, 1);
+        assert_eq!(c.review.max_rounds, 2, "other review defaults survive");
+        let e = Config::from_toml("[review]\nmax_parallel = 0\n").unwrap_err();
+        assert!(
+            matches!(e, ConfigError::Invalid(ref m) if m.contains("review.max_parallel")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn template_documents_review_max_parallel() {
+        let t = Config::default_toml();
+        assert!(t.contains("# max_parallel = 2"), "commented line in [review]");
+        assert_eq!(Config::from_toml(t).unwrap().review.max_parallel, 2);
     }
 
     #[test]

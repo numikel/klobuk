@@ -144,6 +144,10 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
         .filter(|m| matches!(m.state, MergeState::Queued | MergeState::Reviewing))
     {
         let done = if next.state == MergeState::Queued {
+            // every reviewer slot is taken: the item stays queued, untouched, and is looked at again later
+            if waits_for_reviewer(ctx, next)? {
+                continue;
+            }
             process(ctx, next)?
         } else {
             match poll_review(ctx, next)? {
@@ -485,16 +489,60 @@ fn integrate(
             );
         }
         Err(e) => {
+            // main moved on after the rebase (another item merged first): nothing is wrong with the
+            // branch, so it goes back to the queue to be rebased and gated again
+            if !matches!(e, VcsError::Dirty(_)) && main_moved_since_rebase(ctx, item) {
+                return requeue_main_moved(ctx, item);
+            }
             return fail(
                 ctx,
                 item,
                 MergeState::Failed,
                 format!("fast-forward failed: {e}"),
                 None,
-            )
+            );
         }
     };
     finalize_merged(ctx, item, run, new_head)
+}
+
+/// Whether the default branch of the main checkout is no longer at the commit the item was rebased
+/// onto. `item` may be a stale snapshot, so `rebased_onto` is read from the store.
+fn main_moved_since_rebase(ctx: &Ctx, item: &MergeItem) -> bool {
+    let Ok(queue) = ctx.store.merge_queue() else {
+        return false;
+    };
+    let Some(base) = queue
+        .into_iter()
+        .find(|m| m.id == item.id)
+        .and_then(|m| m.rebased_onto)
+    else {
+        return false;
+    };
+    GitCli.head(&ctx.root).is_ok_and(|head| head != base)
+}
+
+/// Puts an approved item whose fast-forward lost the race with another merge back to `queued`; no
+/// failure, no comment. The next tick rebases it, re-runs the gates and, when the patch is unchanged,
+/// skips the review thanks to the recorded approval.
+fn requeue_main_moved(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
+    let updated = set(
+        ctx,
+        item.id,
+        MergePatch {
+            state: Some(MergeState::Queued),
+            last_error: Some(None),
+            ..MergePatch::default()
+        },
+    )?;
+    ctx.store.append_event(&NewEvent {
+        kind: "merge.requeued".into(),
+        issue_id: Some(item.issue_id.clone()),
+        run_id: item.run_id.clone(),
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload: serde_json::json!({ "reason": "main_moved", "branch": item.branch }),
+    })?;
+    Ok(updated)
 }
 
 /// Whether `[review] required` or one of the issue's labels in `on_labels` asks for a reviewer.
@@ -634,6 +682,27 @@ fn record_approval(ctx: &Ctx, item: &MergeItem) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Whether a queued item has to wait for a reviewer slot: a review is wanted, it would really start a
+/// reviewer (the patch is not approved yet, `max_rounds` is not used up) and `[review] max_parallel`
+/// reviewer runs are active already. Nothing is written for such an item, so it is no failure and
+/// leaves no comment; the next tick asks again, in FIFO order of the merge item id.
+///
+/// Asked before the rebase because the queue has no state for an item whose gates are green and
+/// whose review has not started: a held item keeps `queued` and its gates run once a reviewer is free.
+fn waits_for_reviewer(ctx: &Ctx, item: &MergeItem) -> Result<bool, AppError> {
+    if !review_wanted(ctx, &item.issue_id)? {
+        return Ok(false);
+    }
+    let limit = ctx.config.review.max_parallel as usize;
+    if super::run::active_run_counts(ctx)?.reviewers < limit {
+        return Ok(false);
+    }
+    if changes_rounds(ctx, &item.issue_id)? >= ctx.config.review.max_rounds as usize {
+        return Ok(false); // `enter_review` asks the human; no reviewer is needed for that
+    }
+    Ok(approved_patch(ctx, item)?.is_none())
+}
+
 /// Review rounds of `id` that ended in `changes`.
 fn changes_rounds(ctx: &Ctx, id: &IssueId) -> Result<usize, AppError> {
     Ok(verdicts(ctx, id)?
@@ -735,6 +804,16 @@ fn poll_review(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppErro
     else {
         return Ok(None);
     };
+    // the reviewer is done once its verdict is read, whatever happens to the item next: free its
+    // claim, run and reviewer slot now, not after a merge that may never come
+    close_reviews(
+        ctx,
+        &item.issue_id,
+        match verdict {
+            Verdict::Approve => "review verdict read: approve",
+            Verdict::Changes(_) => "review verdict read: changes",
+        },
+    );
     match verdict {
         Verdict::Approve => {
             let (run, worktree_rel, wt) = locate(ctx, item)?;
@@ -798,9 +877,10 @@ fn request_changes(ctx: &Ctx, item: &MergeItem, findings: &[String]) -> Result<M
     Ok(updated)
 }
 
-/// After a merge: the review issues of `id` are closed `done`, their claims released, their runs and
-/// workspaces closed. Their worktrees stay for `asf lane clean`.
-fn close_reviews(ctx: &Ctx, id: &IssueId) {
+/// The review issues of `id` are closed `done`, their claims released, their active runs and
+/// workspaces closed (`reason` becomes the runs' exit reason). Their worktrees stay for `asf lane clean`.
+/// Called when a verdict is read and again after a merge; a second call finds nothing left to close.
+fn close_reviews(ctx: &Ctx, id: &IssueId, reason: &str) {
     let Ok(children) = review_children(ctx, id) else {
         return;
     };
@@ -814,7 +894,7 @@ fn close_reviews(ctx: &Ctx, id: &IssueId) {
                 &r.id,
                 &RunPatch {
                     state: Some(RunState::Succeeded),
-                    exit_reason: Some("review approved, branch merged".into()),
+                    exit_reason: Some(reason.into()),
                     finished_at: Some(now_rfc3339()),
                     ..RunPatch::default()
                 },
@@ -846,7 +926,7 @@ fn finalize_merged(
     ctx.store
         .set_status(&item.issue_id, Status::Done, LANE_ORCHESTRATOR)?;
     let _ = ctx.store.release(&item.issue_id);
-    close_reviews(ctx, &item.issue_id);
+    close_reviews(ctx, &item.issue_id, "review approved, branch merged");
     if let Some(r) = run {
         if let Some(ws) = &r.workspace_id {
             if let Ok(rt) = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root) {
