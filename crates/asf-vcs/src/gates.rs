@@ -13,8 +13,23 @@ const TAIL_LINES: usize = 40;
 /// `link.exe` cannot open a just-written test executable while the AV scanner holds it.
 const LINKER_LOCK_MARKER: &str = "LNK1104";
 const LINKER_LOCK_ATTEMPTS: u32 = 5;
-/// Pause before rerun `n` is `n - 1` times this (2 s, 4 s, 6 s, 8 s): the scanner needs a moment.
-const LINKER_LOCK_PAUSE: Duration = Duration::from_secs(2);
+/// Pauses before reruns 1..=4 when a locked file exists and is moved aside (2 s, 4 s, 6 s, 8 s):
+/// the scanner needs a moment before the file can be touched.
+const LINKER_LOCK_PAUSES_MOVED: [Duration; 4] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(6),
+    Duration::from_secs(8),
+];
+/// Pauses before reruns 1..=4 when the file named by the linker does not exist (or no path could be
+/// read): the scanner holds the name of a just-deleted executable, nothing can be moved, so only
+/// time helps.
+const LINKER_LOCK_PAUSES_ABSENT: [Duration; 4] = [
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(60),
+];
 /// How long to keep trying to move a locked file aside (1 s between tries).
 const LINKER_LOCK_MOVE_TRIES: u32 = 10;
 
@@ -167,28 +182,72 @@ fn move_locked_aside(output: &str) -> (Vec<String>, Vec<String>) {
     (moved, stuck)
 }
 
+/// How long to wait before each rerun after a linker lock; index `n - 1` is the pause before rerun
+/// `n`, the last entry repeats if a schedule is shorter than the number of reruns.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkerLockPauses<'a> {
+    /// Used when a locked file exists and is moved aside.
+    pub moved: &'a [Duration],
+    /// Used when the file named by the linker does not exist (or no path could be read).
+    pub absent: &'a [Duration],
+}
+
+impl LinkerLockPauses<'static> {
+    /// The real schedules that [`run_gates`] uses.
+    pub const DEFAULT: Self = Self {
+        moved: &LINKER_LOCK_PAUSES_MOVED,
+        absent: &LINKER_LOCK_PAUSES_ABSENT,
+    };
+}
+
+fn pause_before_rerun(schedule: &[Duration], rerun: u32) -> Duration {
+    let i = (rerun as usize).saturating_sub(1);
+    schedule
+        .get(i)
+        .or_else(|| schedule.last())
+        .copied()
+        .unwrap_or_default()
+}
+
 /// Runs one gate, rerunning it (up to [`LINKER_LOCK_ATTEMPTS`] times in total) when the only
 /// evidence of failure is a Windows linker lock (`LNK1104`), which is the AV scanner holding a
-/// freshly written test executable, not the code. The locked file is moved aside before each rerun.
-fn run_gate_with_retry(spec: &GateSpec, cwd: &Path) -> GateResult {
+/// freshly written test executable, not the code. A locked file that exists is moved aside before
+/// each rerun after a short pause; when the linker names no existing file there is nothing to move
+/// and the rerun waits out the longer `absent` schedule instead.
+fn run_gate_with_retry(spec: &GateSpec, cwd: &Path, pauses: &LinkerLockPauses) -> GateResult {
     let started = Instant::now();
     let mut r = run_gate(spec, cwd);
     let mut attempt = 1;
     let mut notes: Vec<String> = Vec::new();
     while !r.ok && attempt < LINKER_LOCK_ATTEMPTS && r.tail.contains(LINKER_LOCK_MARKER) {
+        let named = locked_files(&r.tail);
+        let exists = named.iter().any(|p| p.exists());
         // let the scanner finish before touching anything
-        thread::sleep(LINKER_LOCK_PAUSE * attempt);
+        let pause = pause_before_rerun(if exists { pauses.moved } else { pauses.absent }, attempt);
+        thread::sleep(pause);
         let (moved, stuck) = move_locked_aside(&r.tail);
         attempt += 1;
-        notes.push(format!(
-            "[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); moved aside [{}]{}; rerun attempt {attempt}/{LINKER_LOCK_ATTEMPTS}",
-            spec.name,
-            moved.join(", "),
-            if stuck.is_empty() {
-                String::new()
+        let what = if moved.is_empty() && stuck.is_empty() {
+            let why = if named.is_empty() {
+                "no file path in the linker message"
             } else {
-                format!("; still locked [{}]", stuck.join(", "))
-            }
+                "the file does not exist yet"
+            };
+            format!("nothing to move aside ({why}); waiting {} s", pause.as_secs())
+        } else {
+            format!(
+                "moved aside [{}]{}",
+                moved.join(", "),
+                if stuck.is_empty() {
+                    String::new()
+                } else {
+                    format!("; still locked [{}]", stuck.join(", "))
+                }
+            )
+        };
+        notes.push(format!(
+            "[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); {what}; rerun attempt {attempt}/{LINKER_LOCK_ATTEMPTS}",
+            spec.name,
         ));
         r = run_gate(spec, cwd);
     }
@@ -201,9 +260,14 @@ fn run_gate_with_retry(spec: &GateSpec, cwd: &Path) -> GateResult {
 
 /// Runs gates in order and stops at the first failure. The returned vector holds every gate that ran.
 pub fn run_gates(specs: &[GateSpec], cwd: &Path) -> Vec<GateResult> {
+    run_gates_with_pauses(specs, cwd, &LinkerLockPauses::DEFAULT)
+}
+
+/// [`run_gates`] with the linker-lock pause schedules injected (tests use millisecond pauses).
+pub fn run_gates_with_pauses(specs: &[GateSpec], cwd: &Path, pauses: &LinkerLockPauses) -> Vec<GateResult> {
     let mut results = Vec::new();
     for spec in specs {
-        let r = run_gate_with_retry(spec, cwd);
+        let r = run_gate_with_retry(spec, cwd, pauses);
         let ok = r.ok;
         results.push(r);
         if !ok {

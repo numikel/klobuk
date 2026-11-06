@@ -1,5 +1,15 @@
+use std::time::Duration;
+
 use asf_core::GateSpec;
+use asf_vcs::gates::{run_gates_with_pauses, LinkerLockPauses};
 use asf_vcs::run_gates;
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// Pauses so long that a test using them by mistake would visibly hang.
+const HUGE: [Duration; 4] = [Duration::from_secs(600); 4];
 
 fn spec(name: &str, cmd: &[&str], timeout_s: u64) -> GateSpec {
     GateSpec {
@@ -95,8 +105,12 @@ fn retries_a_gate_that_failed_on_a_linker_lock() {
     let dir = tempfile::tempdir().unwrap();
     let code = "import os, sys; e = os.path.exists('locked.once'); open('locked.once', 'w').close(); \
 print('tests ok' if e else 'LINK : fatal error LNK1104: cannot open file foo.exe'); sys.exit(0 if e else 101)";
+    let pauses = LinkerLockPauses {
+        moved: &HUGE,
+        absent: &[ms(300); 4],
+    };
     let start = std::time::Instant::now();
-    let results = run_gates(&[spec("test", &py(code), 30)], dir.path());
+    let results = run_gates_with_pauses(&[spec("test", &py(code), 30)], dir.path(), &pauses);
     assert!(results[0].ok, "{}", results[0].tail);
     assert_eq!(results[0].exit_code, Some(0));
     assert!(results[0].tail.contains("tests ok"), "{}", results[0].tail);
@@ -106,7 +120,7 @@ print('tests ok' if e else 'LINK : fatal error LNK1104: cannot open file foo.exe
         results[0].tail
     );
     assert!(results[0].tail.contains("attempt 2"), "{}", results[0].tail);
-    assert!(start.elapsed().as_secs() >= 2, "waits before the rerun");
+    assert!(start.elapsed() >= ms(300), "waits before the rerun");
 }
 
 #[test]
@@ -115,7 +129,11 @@ fn gives_up_on_a_permanent_linker_lock_after_five_attempts() {
     let code = "import sys\n\
 with open('runs.log', 'a') as f: f.write('x')\n\
 print('LINK : fatal error LNK1104: cannot open file foo.exe'); sys.exit(101)";
-    let results = run_gates(&[spec("test", &py(code), 30)], dir.path());
+    let pauses = LinkerLockPauses {
+        moved: &HUGE,
+        absent: &[ms(10); 4],
+    };
+    let results = run_gates_with_pauses(&[spec("test", &py(code), 30)], dir.path(), &pauses);
     assert!(!results[0].ok);
     assert_eq!(results[0].exit_code, Some(101));
     assert_eq!(
@@ -168,6 +186,160 @@ sys.exit(0 if not e else 101)",
         "duration covers every attempt: {}",
         results[0].duration_ms
     );
+}
+
+/// A gate that fails with LNK1104 naming `missing` (a file that never exists) until its `pass_on`-th
+/// run, counted in `n.txt`. Every run is also appended to `runs.log`.
+fn missing_file_gate(missing: &std::path::Path, pass_on: u32) -> String {
+    format!(
+        "import os, sys\n\
+n = int(open('n.txt').read()) + 1 if os.path.exists('n.txt') else 1\n\
+open('n.txt', 'w').write(str(n))\n\
+with open('runs.log', 'a') as f: f.write('x')\n\
+if n >= {pass_on}: print('tests ok'); sys.exit(0)\n\
+print('LINK : fatal error LNK1104: cannot open file \"' + {:?} + '\"'); sys.exit(101)",
+        missing.to_string_lossy().replace('\\', "/")
+    )
+}
+
+/// The AV scanner keeps the name of a just-deleted executable, so the linker cannot create it and
+/// there is nothing to move aside: the only remedy is time, taken from the longer schedule.
+#[test]
+fn a_lock_on_a_file_that_does_not_exist_waits_the_longer_schedule_and_reruns() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("deps").join("asf_vcs-8cd7fc69d49f91f7.exe");
+    let code = missing_file_gate(&missing, 3);
+    let pauses = LinkerLockPauses {
+        moved: &HUGE,
+        absent: &[ms(150), ms(250), ms(900), ms(900)],
+    };
+    let start = std::time::Instant::now();
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &pauses);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert!(tail.contains("tests ok"), "{tail}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("runs.log")).unwrap(),
+        "xxx",
+        "passes on the third run"
+    );
+    assert!(tail.contains("attempt 3"), "{tail}");
+    assert!(start.elapsed() >= ms(400), "waited 150 ms + 250 ms");
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "the huge `moved` schedule was not used"
+    );
+}
+
+#[test]
+fn the_note_says_nothing_could_be_moved_aside_and_how_long_it_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("deps").join("asf_vcs-8cd7fc69d49f91f7.exe");
+    let code = missing_file_gate(&missing, 2);
+    let pauses = LinkerLockPauses {
+        moved: &HUGE,
+        absent: &[Duration::from_secs(1); 4],
+    };
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &pauses);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert!(
+        tail.contains("nothing to move aside (the file does not exist yet); waiting 1 s"),
+        "{tail}"
+    );
+    assert!(!tail.contains("moved aside []"), "{tail}");
+    assert!(tail.contains("rerun attempt 2/5"), "{tail}");
+}
+
+#[test]
+fn a_lock_message_without_a_file_path_is_explained_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "import os, sys\n\
+if os.path.exists('once'): print('tests ok'); sys.exit(0)\n\
+open('once', 'w').close()\n\
+print('LINK : fatal error LNK1104: cannot open file foo.exe'); sys.exit(101)";
+    let pauses = LinkerLockPauses {
+        moved: &HUGE,
+        absent: &[ms(10); 4],
+    };
+    let results = run_gates_with_pauses(&[spec("test", &py(code), 30)], dir.path(), &pauses);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert!(
+        tail.contains("nothing to move aside (no file path in the linker message)"),
+        "{tail}"
+    );
+    assert!(!tail.contains("moved aside []"), "{tail}");
+}
+
+#[test]
+fn a_permanent_lock_on_a_missing_file_uses_all_four_longer_pauses_and_five_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("deps").join("never.exe");
+    let code = missing_file_gate(&missing, u32::MAX);
+    let pauses = LinkerLockPauses {
+        moved: &HUGE,
+        absent: &[ms(100), ms(200), ms(300), ms(400)],
+    };
+    let start = std::time::Instant::now();
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &pauses);
+    assert!(!results[0].ok);
+    assert_eq!(results[0].exit_code, Some(101));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("runs.log")).unwrap(),
+        "xxxxx"
+    );
+    assert!(start.elapsed() >= ms(1000), "100 + 200 + 300 + 400 ms");
+    assert!(results[0].tail.contains("attempt 5"), "{}", results[0].tail);
+    assert!(results[0].duration_ms >= 1000, "{}", results[0].duration_ms);
+}
+
+/// A locked file that exists is handled as before: moved aside after the short pause, the longer
+/// schedule is never consulted.
+#[test]
+fn a_lock_on_an_existing_file_still_moves_it_aside_with_the_short_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("cli_tui-b05e1b3ffcdc1251.exe");
+    std::fs::write(&locked, "old").unwrap();
+    let code = format!(
+        "import os, sys; p = {:?}; e = os.path.exists(p); \
+print('tests ok' if not e else 'LINK : fatal error LNK1104: cannot open file \"' + p + '\"'); \
+sys.exit(0 if not e else 101)",
+        locked.to_string_lossy().replace('\\', "/")
+    );
+    let pauses = LinkerLockPauses {
+        moved: &[ms(50); 4],
+        absent: &HUGE,
+    };
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &pauses);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert!(!locked.exists());
+    assert!(dir
+        .path()
+        .join("cli_tui-b05e1b3ffcdc1251.exe.locked.old")
+        .exists());
+    assert!(
+        tail.contains("moved aside [") && tail.contains("cli_tui"),
+        "{tail}"
+    );
+    assert!(!tail.contains("nothing to move aside"), "{tail}");
+}
+
+#[test]
+fn a_failure_without_lnk1104_is_not_rerun_whatever_the_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "import sys\n\
+with open('runs.log', 'a') as f: f.write('x')\n\
+print('assertion failed'); sys.exit(101)";
+    let pauses = LinkerLockPauses {
+        moved: &HUGE,
+        absent: &HUGE,
+    };
+    let results = run_gates_with_pauses(&[spec("test", &py(code), 30)], dir.path(), &pauses);
+    assert!(!results[0].ok);
+    assert_eq!(std::fs::read_to_string(dir.path().join("runs.log")).unwrap(), "x");
+    assert!(!results[0].tail.contains("linker lock"), "{}", results[0].tail);
 }
 
 mod stages {
