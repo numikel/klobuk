@@ -2027,8 +2027,9 @@ fn running_rows_show_state_title_cost_over_budget_and_elapsed_reviewers_the_mode
     ] {
         assert!(w.contains(part), "{part:?} missing in {w:?}");
     }
+    assert!(w.contains("$0.50 / $10 "), "a whole budget has no cents: {w:?}");
     let r = row_of(&t, "asf-31");
-    for part in ["◆ asf-31", "review", "opus · round 1", "$0.21 / $10", "1 min"] {
+    for part in ["◆ asf-31", "review", "opus · round 1", "$0.21 / $10 ", "1 min"] {
         assert!(r.contains(part), "{part:?} missing in {r:?}");
     }
     assert!(

@@ -267,6 +267,61 @@ fn store(repo: &Repo) -> SqliteStore {
 }
 
 #[test]
+fn the_verify_and_retry_children_print_the_fields_the_now_view_summarises() {
+    let repo = fake_repo();
+    let a = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
+    repo.ok(&["run", "start", &a]);
+    let s = store(&repo);
+    let id: asf_core::IssueId = a.parse().unwrap();
+    let run = s.runs(Some(&id), false).unwrap().pop().unwrap();
+    s.update_run(
+        &run.id,
+        &RunPatch {
+            state: Some(RunState::Failed),
+            ..RunPatch::default()
+        },
+    )
+    .unwrap();
+
+    // `v`: `asf run verify <id> --json`; the TUI prints issue_id, from -> to and the detail's first line
+    let (verify, code) = child_envelope(&repo, &["run", "verify", &a]);
+    assert_eq!(code, 0, "{verify}");
+    assert_eq!(verify["ok"], true, "{verify}");
+    let r = &verify["result"];
+    assert_eq!(r["issue_id"], a.as_str(), "{verify}");
+    assert_eq!(r["from"], "failed", "{verify}");
+    assert!(r["to"].is_string() && r["detail"].is_string(), "{verify}");
+
+    // `r`: `asf merge retry <id> --json`; the TUI prints issue_id and the queue item number
+    let item = s.enqueue_merge(&id, None, &format!("feat/{a}")).unwrap();
+    s.update_merge(
+        item.id,
+        &MergePatch {
+            state: Some(MergeState::Failed),
+            last_error: Some(Some("gate failed".into())),
+            ..MergePatch::default()
+        },
+    )
+    .unwrap();
+    let (retry, code) = child_envelope(&repo, &["merge", "retry", &a]);
+    assert_eq!(code, 0, "{retry}");
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(retry["result"]["issue_id"], a.as_str(), "{retry}");
+    assert_eq!(retry["result"]["id"], item.id, "{retry}");
+
+    // retrying what is not failed is the error envelope the TUI shows as `✗ <message>`
+    let (again, code) = child_envelope(&repo, &["merge", "retry", &a]);
+    assert_ne!(code, 0);
+    assert_eq!(again["ok"], false, "{again}");
+    assert!(
+        again["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("only failed/blocked")),
+        "{again}"
+    );
+}
+
+#[test]
 fn tui_once_opens_on_the_now_view_and_view_now_shows_the_same_frame() {
     let repo = fake_repo();
     let first =
