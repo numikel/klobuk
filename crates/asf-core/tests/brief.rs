@@ -176,6 +176,36 @@ fn review_brief_verdict_command_addresses_the_reviewed_issue() {
     }
 }
 
+/// The fenced `changes:` example in the brief, exactly as a reviewer would copy it.
+fn example_changes_body(brief: &str) -> String {
+    let mut blocks = brief.split("```\n").skip(1).step_by(2);
+    blocks
+        .find(|b| b.starts_with("changes:"))
+        .unwrap_or_else(|| panic!("no fenced `changes:` example in the brief:\n{brief}"))
+        .to_string()
+}
+
+#[test]
+fn review_brief_example_changes_verdict_parses_to_exactly_one_finding() {
+    let b = review_brief();
+    let body = example_changes_body(&b);
+    assert!(body.lines().nth(1).unwrap().starts_with("Ran:"), "{body}");
+    assert_eq!(
+        parse_verdict(&body),
+        Some(Verdict::Changes(vec!["<file or criterion>: <finding>".into()])),
+        "{body}"
+    );
+}
+
+#[test]
+fn review_brief_puts_the_ran_line_right_after_the_verdict_line() {
+    let b = review_brief();
+    assert!(b.contains("right after the verdict line"), "{b}");
+    assert!(b.contains("before any bullet"), "{b}");
+    assert!(!b.contains("then the targeted commands you ran"), "{b}");
+    assert!(!b.contains("on the lines after the first one"), "{b}");
+}
+
 #[test]
 fn review_brief_says_the_full_gates_already_passed_and_must_not_be_rerun() {
     let b = review_brief();

@@ -221,7 +221,8 @@ or probe a suspicion: a single test, one test file or one package (a given `veri
 targeted). Anything wider than that is a rerun of the gates.\n\
 3. Look for what the criteria do not cover: out-of-scope files, missing tests, wrong error handling, \
 regressions of existing behaviour.\n\
-4. Remember to name in the verdict every command you ran, on the lines after the first one.\n\
+4. Remember to name in the verdict every command you ran, on one non-bullet `Ran:` line right after the verdict line, \
+before any bullet.\n\
 \n## Verdict\n\n\
 Finish by posting exactly one DECISION comment as the last thing you do. It is addressed to the reviewed issue \
 `{id}`:\n\n\
@@ -229,9 +230,17 @@ Finish by posting exactly one DECISION comment as the last thing you do. It is a
 or, with findings:\n\n\
 `{asf} issue comment {id} --type DECISION --to {id} --body \"changes: ...\"`\n\n\
 The first line of the body is the verdict, matched case-insensitively:\n\n\
-- `approve` — every criterion holds and you found nothing to fix. Add the targeted commands you ran on the following lines.\n\
-- `changes:` — followed by one bullet (`- ...`) per concrete finding the author must fix, each naming the file or \
-criterion, then the targeted commands you ran.\n\n\
+- `approve` — every criterion holds and you found nothing to fix. Put the `Ran:` line right after it.\n\
+- `changes:` — followed by the `Ran:` line, then one bullet (`- ...`) per concrete finding the author must fix, each \
+naming the file or criterion.\n\n\
+The `Ran:` line is one plain line (not a bullet) with the targeted commands you ran, placed right after the verdict \
+line and before any bullet. Anything after a bullet is read as part of a finding, and every bullet is sent to the \
+author as something to fix. Example body of a `changes:` verdict:\n\n\
+```\n\
+changes:\n\
+Ran: cargo test -p asf-core --test brief\n\
+- <file or criterion>: <finding>\n\
+```\n\n\
 Post exactly one DECISION comment. Any other first line is treated as no verdict.\n",
         base = r.base_sha,
         asf = r.asf_bin,
