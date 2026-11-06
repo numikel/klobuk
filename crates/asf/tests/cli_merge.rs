@@ -819,6 +819,27 @@ fn events_of(f: &F, kind: &str) -> Vec<Event> {
         .collect()
 }
 
+/// How many `issue.status` events the issue `id` has in the log.
+fn status_events_of(f: &F, id: &str) -> usize {
+    store(f)
+        .events_since(0, 10_000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            e.kind == "issue.status" && e.issue_id.as_ref().map(ToString::to_string).as_deref() == Some(id)
+        })
+        .count()
+}
+
+/// The `closed_at` stamp of issue `id`.
+fn closed_at_of(f: &F, id: &str) -> Option<String> {
+    store(f)
+        .get_issue(&id.parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .closed_at
+}
+
 /// An item approved by its reviewer whose fast-forward then could not happen because main moved on in
 /// between: back to `queued` (no failure, no error), so the next tick rebases and gates it again.
 fn approved_but_main_moved() -> F {
@@ -1070,13 +1091,29 @@ fn an_approve_verdict_closes_the_review_issue_its_claim_and_run_even_when_the_me
     );
     assert_eq!(running(&f), (0, 0));
 
-    // the parked item is looked at again; closing twice is harmless
+    // the parked item is looked at again; a review that is already closed is left alone: no new
+    // `issue.status` event and no moved `closed_at`
+    let status_events = status_events_of(&f, &rid);
+    let closed_at = closed_at_of(&f, &rid);
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["processed"], 0, "{res}");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["processed"], 0, "{res}");
+    assert_eq!(
+        status_events_of(&f, &rid),
+        status_events,
+        "parked ticks add no issue.status event"
+    );
     git(f.repo.path(), &["checkout", "--", "src/lib.rs"]);
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "merged", "{res}");
     assert_eq!(status_of(&f, &rid), "done");
+    assert_eq!(
+        status_events_of(&f, &rid),
+        status_events,
+        "the merge adds no issue.status event either"
+    );
+    assert_eq!(closed_at_of(&f, &rid), closed_at, "closed_at stays put");
 }
 
 #[test]

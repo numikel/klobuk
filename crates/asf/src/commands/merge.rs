@@ -879,13 +879,24 @@ fn request_changes(ctx: &Ctx, item: &MergeItem, findings: &[String]) -> Result<M
 
 /// The review issues of `id` are closed `done`, their claims released, their active runs and
 /// workspaces closed (`reason` becomes the runs' exit reason). Their worktrees stay for `asf lane clean`.
-/// Called when a verdict is read and again after a merge; a second call finds nothing left to close.
+/// Called when a verdict is read (on every tick while an approved item is parked) and again after a
+/// merge. A review issue that is already terminal is skipped untouched: `set_status(done -> done)`
+/// would rewrite `closed_at` and append a junk `issue.status` event each time.
 fn close_reviews(ctx: &Ctx, id: &IssueId, reason: &str) {
     let Ok(children) = review_children(ctx, id) else {
         return;
     };
     let rt = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root).ok();
     for rid in children {
+        if ctx
+            .store
+            .get_issue(&rid)
+            .ok()
+            .flatten()
+            .is_some_and(|i| i.status.is_terminal())
+        {
+            continue;
+        }
         for r in ctx.store.runs(Some(&rid), true).unwrap_or_default() {
             if let (Some(rt), Some(ws)) = (&rt, &r.workspace_id) {
                 let _ = rt.close_workspace(ws);
