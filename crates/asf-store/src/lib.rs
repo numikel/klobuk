@@ -755,32 +755,6 @@ impl IssueStore for SqliteStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The rebuild switches `foreign_keys` OFF on the shared connection; it must come back ON, or every
-    /// later write on this store would silently skip referential checks.
-    #[test]
-    fn foreign_keys_are_on_again_after_migrating_a_v1_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f.db");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(include_str!("../tests/fixtures/schema_v1.sql"))
-            .unwrap();
-        let store = SqliteStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        let on: i64 = store
-            .read(|c| {
-                c.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-                    .map_err(backend)
-            })
-            .unwrap();
-        assert_eq!(on, 1);
-    }
-}
-
 /// The author name whose comments a lane never sees in its own inbox.
 fn inbox_own_author(lane: &str) -> String {
     if lane == LANE_ORCHESTRATOR {
@@ -806,4 +780,30 @@ fn advance_cursors(tx: &Transaction<'_>, lane: &str, items: &[Comment]) -> Resul
         .map_err(backend)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rebuild switches `foreign_keys` OFF on the shared connection; it must come back ON, or every
+    /// later write on this store would silently skip referential checks.
+    #[test]
+    fn foreign_keys_are_on_again_after_migrating_a_v1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(include_str!("../tests/fixtures/schema_v1.sql"))
+            .unwrap();
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let on: i64 = store
+            .read(|c| {
+                c.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                    .map_err(backend)
+            })
+            .unwrap();
+        assert_eq!(on, 1);
+    }
 }
