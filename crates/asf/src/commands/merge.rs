@@ -21,8 +21,8 @@ use crate::worker::Worker;
 /// comment at that moment, so verdicts of earlier rounds are never read again.
 const REVIEW_STARTED: &str = "merge.review_started";
 
-/// Event the queue appends when a reviewer approves; its `patch_id` is the `git patch-id --stable`
-/// fingerprint of the approved branch. Approvals never expire: a later review of an identical patch is skipped.
+/// Event the queue appends when a reviewer approves; its `patch_id` is the `git patch-id --verbatim`
+/// fingerprint of the approved branch (whitespace counts). Approvals never expire: a later review of an identical patch is skipped.
 const REVIEW_APPROVED: &str = "merge.review_approved";
 
 /// Event the queue appends when a review is skipped because the patch matches an earlier approval.

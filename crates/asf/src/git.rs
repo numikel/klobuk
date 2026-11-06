@@ -23,12 +23,13 @@ fn run(cwd: &Path, args: &[&str]) -> Result<String, AppError> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// `git diff <base>...<branch>` piped into `git patch-id --stable`: a fingerprint of what the branch
+/// `git diff <base>...<branch>` piped into `git patch-id --verbatim`: a fingerprint of what the branch
 /// changes relative to its merge-base with `base`, independent of commit SHAs, line offsets and of
 /// where `base` has moved to. `None` when the branch changes nothing (`patch-id` prints no line).
 ///
-/// The diff is passed on byte-for-byte (no trimming): `patch-id` hashes it, and `--stable` makes the
-/// result independent of the order of files in the diff.
+/// The diff is passed on byte-for-byte (no trimming). `--verbatim` treats whitespace as significant,
+/// so a whitespace-only edit yields a different id; it implies the stable algorithm (file order does
+/// not matter) and needs git 2.39+, otherwise this errors and callers fall back to a normal review.
 pub fn patch_id(cwd: &Path, base: &str, branch: &str) -> Result<Option<String>, AppError> {
     let range = format!("{base}...{branch}");
     let diff = Command::new("git")
@@ -44,7 +45,7 @@ pub fn patch_id(cwd: &Path, base: &str, branch: &str) -> Result<Option<String>, 
         )));
     }
     let mut child = Command::new("git")
-        .args(["patch-id", "--stable"])
+        .args(["patch-id", "--verbatim"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -64,7 +65,7 @@ pub fn patch_id(cwd: &Path, base: &str, branch: &str) -> Result<Option<String>, 
     let _ = feeder.join();
     if !out.status.success() {
         return Err(AppError::not_found(format!(
-            "git patch-id --stable failed for {range}: {}",
+            "git patch-id --verbatim failed for {range}: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }

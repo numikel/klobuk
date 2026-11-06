@@ -843,6 +843,38 @@ fn an_identical_patch_after_a_rebase_onto_moved_main_skips_the_review() {
 }
 
 #[test]
+fn a_whitespace_only_change_gets_a_different_fingerprint_and_a_new_review_round() {
+    let f = approved_but_main_moved();
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    // the same added line, only indented: a whitespace-stripping patch-id would call this patch identical
+    commit_in(&wt, "src/greet.rs", "    pub fn hello() {}\n");
+
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert!(
+        !main_has(&f, "src/greet.rs"),
+        "nothing merged without a fresh approval"
+    );
+    assert_eq!(
+        events_of(&f, "merge.review_started").len(),
+        2,
+        "a second round began"
+    );
+
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "approve");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    let ids: Vec<String> = events_of(&f, "merge.review_approved")
+        .iter()
+        .map(|e| e.payload["patch_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "indentation alone changes the fingerprint");
+}
+
+#[test]
 fn a_changed_patch_after_the_retry_starts_a_new_review_round() {
     let f = approved_but_main_moved();
     let agents = start_agents(&f);
