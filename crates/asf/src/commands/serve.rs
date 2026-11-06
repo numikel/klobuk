@@ -3,7 +3,11 @@
 //! → (with `--dispatch`) start workers for the planned slots → sleep.
 //!
 //! `--until-done` also checks after each tick whether to stop (`all_done`, `stuck`, `max_ticks`)
-//! and prints a final `{ticks, reason, open, runs}` summary.
+//! and prints a final `{ticks, reason, open, runs, questions_waiting}` summary.
+//!
+//! The config is re-read at the start of every tick (see `ConfigWatch`), so edits take effect
+//! without restarting the loop. Tick reports and the summary carry `questions_waiting`: the
+//! unanswered QUESTIONs to the human plus the runs in `blocked`, i.e. what waits for the operator.
 
 use std::io::Write;
 use std::time::Duration;
@@ -13,8 +17,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::cli::{Cli, ServeArgs};
-use crate::ctx::Ctx;
+use crate::ctx::{ConfigWatch, Ctx};
 use crate::output::{print_ok, AppError, Rendered};
+use crate::tui::app::unanswered_questions;
 use crate::worker::{self, WatchResult, Worker};
 
 use super::merge::{tick_all, TickResult};
@@ -27,6 +32,36 @@ pub struct TickReport {
     pub merge: TickResult,
     pub started: Vec<IssueId>,
     pub start_errors: Vec<serde_json::Value>,
+    /// Unanswered QUESTIONs to the human plus runs in `blocked`; always present, `0` when none.
+    pub questions_waiting: usize,
+}
+
+fn blocked_runs(states: impl IntoIterator<Item = RunState>) -> usize {
+    states.into_iter().filter(|s| *s == RunState::Blocked).count()
+}
+
+/// What waits for the operator: QUESTIONs to `human` nobody has answered (on issues that are not
+/// finished) plus runs in `blocked` (an agent sitting on a prompt).
+fn questions_waiting(ctx: &Ctx) -> Result<usize, AppError> {
+    let mut n = 0;
+    for issue in ctx
+        .store
+        .list_issues(&IssueFilter::default())?
+        .iter()
+        .filter(|i| !i.status.is_terminal())
+    {
+        n += unanswered_questions(&ctx.store.comments(&issue.id)?).len();
+    }
+    Ok(n + blocked_runs(ctx.store.runs(None, true)?.iter().map(|r| r.state)))
+}
+
+/// The line that tells the operator something needs them; empty when nothing does.
+fn waiting_line(n: usize) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!("\n{n} waiting for you")
+    }
 }
 
 /// Order matters: merges close issues, and only then can their dependents be promoted.
@@ -56,6 +91,7 @@ fn tick(ctx: &Ctx, dispatch: bool) -> Result<TickReport, AppError> {
         merge,
         started,
         start_errors,
+        questions_waiting: questions_waiting(ctx)?,
     })
 }
 
@@ -87,6 +123,7 @@ fn text(t: &TickReport) -> String {
     for e in &t.start_errors {
         s.push_str(&format!("\nstart failed {}: {}", e["issue"], e["message"]));
     }
+    s.push_str(&waiting_line(t.questions_waiting));
     s
 }
 
@@ -127,6 +164,8 @@ struct Assessment {
     /// This serve will start a worker next tick: `--dispatch` is on and the allocation plan has a
     /// slot. Without `--dispatch` nothing here ever starts work, so a plan slot is no progress.
     can_start: bool,
+    /// See `questions_waiting`.
+    questions_waiting: usize,
 }
 
 fn run_is_busy(s: RunState) -> bool {
@@ -175,6 +214,7 @@ fn assess(ctx: &Ctx, dispatch: bool) -> Result<Assessment, AppError> {
             .collect(),
         busy,
         can_start,
+        questions_waiting: questions_waiting(ctx)?,
     })
 }
 
@@ -200,6 +240,7 @@ pub struct Summary {
     pub reason: StopReason,
     pub open: Vec<IssueId>,
     pub runs: Vec<RunBrief>,
+    pub questions_waiting: usize,
 }
 
 fn summary_text(s: &Summary) -> String {
@@ -218,6 +259,7 @@ fn summary_text(s: &Summary) -> String {
             out.push_str(&format!("\nrun {} {}", r.issue, r.state));
         }
     }
+    out.push_str(&waiting_line(s.questions_waiting));
     out
 }
 
@@ -229,6 +271,7 @@ fn finish(cli: &Cli, ticks: u64, reason: StopReason, a: Assessment) -> Result<Re
         reason,
         open: a.open,
         runs: a.runs,
+        questions_waiting: a.questions_waiting,
     };
     let rendered = Rendered::new(&summary, summary_text(&summary))?;
     if reason == StopReason::Stuck {
@@ -240,7 +283,7 @@ fn finish(cli: &Cli, ticks: u64, reason: StopReason, a: Assessment) -> Result<Re
 }
 
 pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
-    let ctx = Ctx::load(cli)?;
+    let mut ctx = Ctx::load(cli)?;
     if a.once {
         let t = tick(&ctx, a.dispatch)?;
         return Rendered::new(&t, text(&t));
@@ -250,9 +293,13 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         a.interval,
         if a.dispatch { " with dispatch" } else { "" }
     );
+    let mut watch = ConfigWatch::new(&ctx);
     let mut ticks: u64 = 0;
     loop {
         ticks += 1;
+        if let Some(warning) = watch.refresh(&mut ctx) {
+            eprintln!("asf serve: {warning}");
+        }
         let tick_ok = match tick(&ctx, a.dispatch) {
             Ok(t) => {
                 if !t.promoted.is_empty()
@@ -295,7 +342,24 @@ mod tests {
             runs: Vec::new(),
             busy,
             can_start,
+            questions_waiting: 0,
         }
+    }
+
+    #[test]
+    fn only_blocked_runs_wait_for_the_operator() {
+        assert_eq!(blocked_runs(RunState::ALL.iter().copied()), 1);
+        assert_eq!(
+            blocked_runs([RunState::Blocked, RunState::Working, RunState::Blocked]),
+            2
+        );
+        assert_eq!(blocked_runs(Vec::new()), 0);
+    }
+
+    #[test]
+    fn the_waiting_line_is_silent_at_zero() {
+        assert_eq!(waiting_line(0), "");
+        assert_eq!(waiting_line(3), "\n3 waiting for you");
     }
 
     #[test]

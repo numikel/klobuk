@@ -281,3 +281,218 @@ fn until_done_flag_combinations_are_usage_errors() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
     }
 }
+
+/// Fake runtime and `max_parallel = 1`, committed (like `use_fake_runtime`).
+fn fake_runtime_one_slot(repo: &Repo) {
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("runtime = \"herdr\"", "runtime = \"fake\"")
+        .replace("max_parallel = 3", "max_parallel = 1");
+    std::fs::write(&cfg, s).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "cfg"]);
+}
+
+/// A running `asf serve ... --json` whose first stdout line has already been read, so the test can
+/// edit the config while the loop sleeps between ticks.
+struct LiveServe {
+    child: std::process::Child,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    first: serde_json::Value,
+}
+
+impl LiveServe {
+    fn start(repo: &Repo, args: &[&str]) -> LiveServe {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = repo
+            .asf()
+            .args(args)
+            .arg("--json")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let first = serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("first line {line:?}: {e}"));
+        LiveServe { child, stdout, first }
+    }
+
+    /// Waits for the process; returns the remaining stdout lines (JSON) and the whole stderr.
+    fn finish(mut self) -> (Vec<serde_json::Value>, String) {
+        use std::io::Read;
+        let mut rest = String::new();
+        self.stdout.read_to_string(&mut rest).unwrap();
+        let mut err = String::new();
+        self.child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        self.child.wait().unwrap();
+        let lines = rest.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        (lines, err)
+    }
+}
+
+#[test]
+fn serve_picks_up_a_config_edit_on_the_next_tick() {
+    let repo = Repo::initialised();
+    fake_runtime_one_slot(&repo);
+    let a = repo.create_issue("a", &["--ready", "--scope", "src/a.rs"]);
+    let b = repo.create_issue("b", &["--ready", "--scope", "src/b.rs"]);
+
+    let live = LiveServe::start(
+        &repo,
+        &[
+            "serve",
+            "--until-done",
+            "--dispatch",
+            "--max-ticks",
+            "3",
+            "--interval",
+            "2",
+        ],
+    );
+    assert_eq!(
+        live.first["result"]["started"],
+        serde_json::json!([a.clone()]),
+        "one slot"
+    );
+    // widen the capacity while the loop sleeps; the next tick must see it
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("max_parallel = 1"), "{s}");
+    std::fs::write(&cfg, s.replace("max_parallel = 1", "max_parallel = 2")).unwrap();
+
+    let (lines, stderr) = live.finish();
+    assert_eq!(lines.len(), 2, "tick 2 started b, then the summary: {lines:?}");
+    assert_eq!(
+        lines[0]["result"]["started"],
+        serde_json::json!([b.clone()]),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines[1]["result"]["runs"].as_array().unwrap().len(),
+        2,
+        "{lines:?}"
+    );
+    assert!(!stderr.contains("keeping the previous config"), "{stderr}");
+}
+
+#[test]
+fn serve_keeps_the_old_config_and_warns_once_per_distinct_invalid_content() {
+    let repo = Repo::initialised();
+    fake_runtime_one_slot(&repo);
+    let a = repo.create_issue("a", &["--ready", "--scope", "src/a.rs"]);
+    repo.create_issue("b", &["--ready", "--scope", "src/b.rs"]);
+
+    let live = LiveServe::start(
+        &repo,
+        &[
+            "serve",
+            "--until-done",
+            "--dispatch",
+            "--max-ticks",
+            "4",
+            "--interval",
+            "1",
+        ],
+    );
+    assert_eq!(live.first["result"]["started"], serde_json::json!([a.clone()]));
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    // a type error: the file no longer parses, for three ticks in a row
+    std::fs::write(&cfg, s.replace("max_parallel = 1", "max_parallel = \"many\"")).unwrap();
+
+    let (lines, stderr) = live.finish();
+    assert_eq!(lines.len(), 1, "no more starts, only the summary: {lines:?}");
+    let summary = &lines[0]["result"];
+    assert_eq!(summary["reason"], "max_ticks", "{lines:?}");
+    assert_eq!(summary["ticks"], 4, "{lines:?}");
+    // the old max_parallel = 1 still applies: b never got a slot (the default 3 would have given one)
+    assert_eq!(summary["runs"].as_array().unwrap().len(), 1, "{lines:?}");
+    assert_eq!(
+        stderr.matches("keeping the previous config").count(),
+        1,
+        "one warning for unchanged content, not one per tick: {stderr}"
+    );
+}
+
+/// `serve --until-done --json` prints a line per eventful tick, then the summary: parse the last.
+fn last_line_json(repo: &Repo, args: &[&str]) -> (serde_json::Value, i32) {
+    let out = repo.asf().args(args).arg("--json").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    (v, out.status.code().unwrap_or(-1))
+}
+
+fn ask_human(repo: &Repo, issue: &str, body: &str) -> i64 {
+    let q = repo.ok(&[
+        "--lane", issue, "issue", "comment", issue, "--type", "QUESTION", "--to", "human", "--body", body,
+    ]);
+    q["id"].as_i64().unwrap()
+}
+
+#[test]
+fn serve_once_reports_questions_waiting_in_json_and_text() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
+
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["questions_waiting"], 0, "always present, even at zero: {res}");
+    let quiet = repo.asf().args(["serve", "--once"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&quiet.stdout).contains("waiting for you"));
+
+    ask_human(&repo, &a, "which crate?");
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["questions_waiting"], 1, "{res}");
+    let human = repo.asf().args(["serve", "--once"]).output().unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("1 waiting for you"), "{text}");
+}
+
+#[test]
+fn until_done_summary_reports_questions_waiting_until_they_are_answered() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    // without --dispatch nothing is ever started: the loop is stuck after one tick
+    let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
+    let qid = ask_human(&repo, &a, "which crate?");
+
+    let (v, code) = last_line_json(&repo, &["serve", "--until-done"]);
+    assert_eq!(code, 3, "{v}");
+    assert_eq!(v["result"]["reason"], "stuck", "{v}");
+    assert_eq!(v["result"]["questions_waiting"], 1, "{v}");
+    let human = repo.asf().args(["serve", "--until-done"]).output().unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("1 waiting for you"), "{text}");
+
+    repo.ok(&[
+        "--lane",
+        "human",
+        "issue",
+        "comment",
+        &a,
+        "--type",
+        "ANSWER",
+        "--to",
+        &a,
+        "--reply-to",
+        &qid.to_string(),
+        "--body",
+        "asf-core",
+    ]);
+    let (v, _) = last_line_json(&repo, &["serve", "--until-done"]);
+    assert_eq!(
+        v["result"]["questions_waiting"], 0,
+        "an answered question stops counting: {v}"
+    );
+    let human = repo.asf().args(["serve", "--until-done"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&human.stdout).contains("waiting for you"));
+}
