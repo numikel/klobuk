@@ -21,6 +21,13 @@ use crate::worker::Worker;
 /// comment at that moment, so verdicts of earlier rounds are never read again.
 const REVIEW_STARTED: &str = "merge.review_started";
 
+/// Event the queue appends when a reviewer approves; its `patch_id` is the `git patch-id --stable`
+/// fingerprint of the approved branch. Approvals never expire: a later review of an identical patch is skipped.
+const REVIEW_APPROVED: &str = "merge.review_approved";
+
+/// Event the queue appends when a review is skipped because the patch matches an earlier approval.
+const REVIEW_SKIPPED: &str = "merge.review_skipped";
+
 /// Queues `feat/<id>` linked to the issue's latest run. Without `force` the latest run must be
 /// `succeeded` (independently verified): a worker cannot push its own branch into the queue.
 pub fn enqueue_checked(ctx: &Ctx, id: &IssueId, force: bool) -> Result<MergeItem, AppError> {
@@ -407,7 +414,18 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
 
     // 4. a review required by config or by label parks the item until the reviewer's verdict
     if review_wanted(ctx, &item.issue_id)? {
-        return enter_review(ctx, item, &run);
+        match approved_patch(ctx, item)? {
+            Some(patch_id) => {
+                ctx.store.append_event(&NewEvent {
+                    kind: REVIEW_SKIPPED.into(),
+                    issue_id: Some(item.issue_id.clone()),
+                    run_id: item.run_id.clone(),
+                    actor: Some(LANE_ORCHESTRATOR.into()),
+                    payload: serde_json::json!({ "patch_id": patch_id, "branch": item.branch }),
+                })?;
+            }
+            None => return enter_review(ctx, item, &run),
+        }
     }
 
     // 5. integrate
@@ -560,6 +578,62 @@ fn round_boundary(ctx: &Ctx, id: &IssueId) -> Result<i64, AppError> {
     Ok(boundary)
 }
 
+/// Patch-id fingerprint of what `item.branch` changes relative to the default branch. `None` when it
+/// cannot be computed or the branch changes nothing; the caller then falls back to a normal review.
+fn branch_patch_id(ctx: &Ctx, item: &MergeItem) -> Option<String> {
+    crate::git::patch_id(&ctx.root, &ctx.config.repo.default_branch, &item.branch)
+        .ok()
+        .flatten()
+}
+
+/// Every patch-id the reviewers approved for `id`, oldest first. Never expires and ignores review config.
+fn approved_patch_ids(ctx: &Ctx, id: &IssueId) -> Result<Vec<String>, AppError> {
+    let mut found = Vec::new();
+    let mut seq = 0;
+    loop {
+        let page = ctx.store.events_since(seq, 500)?;
+        let Some(last) = page.last() else { break };
+        seq = last.seq;
+        for e in &page {
+            if e.kind == REVIEW_APPROVED && e.issue_id.as_ref() == Some(id) {
+                if let Some(p) = e.payload["patch_id"].as_str() {
+                    found.push(p.to_string());
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The patch-id of `item.branch` when it equals one the reviewers already approved for this issue.
+fn approved_patch(ctx: &Ctx, item: &MergeItem) -> Result<Option<String>, AppError> {
+    let Some(current) = branch_patch_id(ctx, item) else {
+        return Ok(None);
+    };
+    Ok(approved_patch_ids(ctx, &item.issue_id)?
+        .contains(&current)
+        .then_some(current))
+}
+
+/// Records the approval together with the patch-id of the approved branch (once per distinct patch:
+/// an approved item parked behind a dirty main is looked at on every tick).
+fn record_approval(ctx: &Ctx, item: &MergeItem) -> Result<(), AppError> {
+    let Some(patch_id) = branch_patch_id(ctx, item) else {
+        return Ok(());
+    };
+    if approved_patch_ids(ctx, &item.issue_id)?.contains(&patch_id) {
+        return Ok(());
+    }
+    ctx.store.append_event(&NewEvent {
+        kind: REVIEW_APPROVED.into(),
+        issue_id: Some(item.issue_id.clone()),
+        run_id: item.run_id.clone(),
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload: serde_json::json!({ "patch_id": patch_id, "branch": item.branch }),
+    })?;
+    Ok(())
+}
+
 /// Review rounds of `id` that ended in `changes`.
 fn changes_rounds(ctx: &Ctx, id: &IssueId) -> Result<usize, AppError> {
     Ok(verdicts(ctx, id)?
@@ -674,6 +748,7 @@ fn poll_review(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppErro
                 )
                 .map(Some);
             }
+            record_approval(ctx, item)?;
             let done = integrate(ctx, item, &run, &wt, true)?;
             Ok((done.state != MergeState::Reviewing).then_some(done))
         }

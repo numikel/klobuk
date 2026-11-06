@@ -780,3 +780,102 @@ fn a_dirty_main_parks_an_approved_item_in_reviewing_until_it_is_clean() {
     assert_eq!(res["items"][0]["state"], "merged", "{res}");
     assert_eq!(status_of(&f, &rid), "done");
 }
+
+// ---- review approval survives a retry on an identical patch -------------------------------------
+
+/// Events of one kind for the issue, oldest first.
+fn events_of(f: &F, kind: &str) -> Vec<Event> {
+    store(f)
+        .events_since(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == kind && e.issue_id.as_ref().map(ToString::to_string) == Some(f.issue.clone()))
+        .collect()
+}
+
+/// An item approved by its reviewer whose fast-forward then failed because main moved on in between:
+/// `failed`, ready for `merge retry`.
+fn approved_but_main_moved() -> F {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "approve");
+    commit_in(f.repo.path(), "README.txt", "main moved\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert!(
+        res["items"][0]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("fast-forward"),
+        "{res}"
+    );
+    f
+}
+
+#[test]
+fn an_approval_is_recorded_with_a_patch_id_fingerprint() {
+    let f = approved_but_main_moved();
+    let approved = events_of(&f, "merge.review_approved");
+    assert_eq!(approved.len(), 1, "{approved:?}");
+    let fp = approved[0].payload["patch_id"].as_str().unwrap();
+    assert_eq!(fp.len(), 40, "a git patch-id is 40 hex digits: {fp}");
+    assert!(fp.chars().all(|c| c.is_ascii_hexdigit()), "{fp}");
+}
+
+#[test]
+fn an_identical_patch_after_a_rebase_onto_moved_main_skips_the_review() {
+    let f = approved_but_main_moved();
+    let agents = start_agents(&f);
+    let rounds = events_of(&f, "merge.review_started").len();
+    assert_eq!(rounds, 1);
+
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(main_has(&f, "src/greet.rs") && main_has(&f, "README.txt"));
+    assert_eq!(status_of(&f, &f.issue), "done");
+    assert_eq!(
+        events_of(&f, "merge.review_started").len(),
+        rounds,
+        "no new review round"
+    );
+    assert_eq!(start_agents(&f), agents, "no reviewer started");
+}
+
+#[test]
+fn a_changed_patch_after_the_retry_starts_a_new_review_round() {
+    let f = approved_but_main_moved();
+    let agents = start_agents(&f);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    commit_in(&wt, "src/extra.rs", "pub fn extra() {}\n");
+
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert!(
+        !main_has(&f, "src/greet.rs"),
+        "nothing merged without a fresh approval"
+    );
+    assert_eq!(
+        events_of(&f, "merge.review_started").len(),
+        2,
+        "a second round began"
+    );
+    assert_eq!(events_of(&f, "merge.review_approved").len(), 1);
+    assert!(start_agents(&f) >= agents);
+    // the old approval belongs to the old round: the new one waits for its own verdict
+    assert_eq!(f.repo.ok(&["merge", "tick", "--once"])["processed"], 0);
+
+    // the fresh approval fingerprints the new patch and merges it
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "approve");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(main_has(&f, "src/extra.rs"));
+    let ids: Vec<String> = events_of(&f, "merge.review_approved")
+        .iter()
+        .map(|e| e.payload["patch_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "the two patches have different fingerprints");
+}
