@@ -900,3 +900,115 @@ fn failed_gate_also_blocks_the_issue_and_archives_the_report() {
     assert_eq!(issue_status(&f), "blocked");
     assert!(archived_report(&f).is_file());
 }
+
+// ---- watch re-verification, verify-stage gates, queue reuse -----------------------------------
+
+/// The worker's second `issue finish` after a failed verification: commit the fix, finish again.
+fn worker_refinishes(f: &F) {
+    commit_in(&wt(f), "src/fixed.rs", "\n");
+    let report = wt(f)
+        .join(".factory")
+        .join("runs")
+        .join(&f.issue)
+        .join("report.md");
+    f.repo.ok(&[
+        "--lane",
+        &f.issue,
+        "issue",
+        "finish",
+        &f.issue,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+}
+
+#[test]
+fn watch_reverifies_a_failed_run_once_the_worker_finishes_again() {
+    let f = setup();
+    add_fixed_file_gate(&f);
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "failed", "{res}");
+    assert_eq!(issue_status(&f), "blocked");
+
+    // blocked and no new STATUS: nothing to do
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"].as_array().unwrap().len(), 0, "{res}");
+
+    // in-review, but the only STATUS is older than (or as old as) the failure: no loop
+    store(&f)
+        .set_status(&f.issue.parse().unwrap(), Status::InReview, "human")
+        .unwrap();
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"].as_array().unwrap().len(), 0, "{res}");
+    assert_eq!(active_run(&f).state, RunState::Failed);
+
+    // timestamps have one-second resolution: let the second STATUS land in a later second
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    worker_refinishes(&f);
+    assert_eq!(
+        active_run(&f).state,
+        RunState::Failed,
+        "finish does not touch a failed run"
+    );
+
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(
+        (
+            res["transitions"][0]["from"].as_str(),
+            res["transitions"][0]["to"].as_str()
+        ),
+        (Some("failed"), Some("succeeded")),
+        "{res}"
+    );
+    assert_eq!(active_run(&f).state, RunState::Succeeded);
+    assert_eq!(issue_status(&f), "validating");
+    assert_eq!(store(&f).merge_queue().unwrap().len(), 1);
+
+    // idempotent
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"].as_array().unwrap().len(), 0, "{res}");
+}
+
+#[test]
+fn verification_runs_only_the_gates_whose_when_includes_verify() {
+    let f = setup();
+    let log = f.repo.path().join("gate-log.txt");
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    // `v` records that it ran; `m` (merge stage only) would fail the run if verification ran it
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"v\"\nwhen = [\"verify\"]\ncmd = ['python', '-c', 'import sys; open(sys.argv[1], \"a\").write(\"v;\")', '{}']\n",
+        log.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+    ));
+    s.push_str(
+        "\n[[gate]]\nname = \"m\"\nwhen = [\"merge\"]\ncmd = ['python', '-c', 'import sys; sys.exit(2)']\n",
+    );
+    std::fs::write(&cfg, s).unwrap();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "v;");
+}
+
+#[test]
+fn verification_reuses_a_branch_that_is_already_in_the_merge_queue() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let run = active_run(&f);
+    let queued = store(&f)
+        .enqueue_merge(&f.issue.parse().unwrap(), Some(&run.id), &run.branch)
+        .unwrap();
+
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(active_run(&f).state, RunState::Succeeded);
+    let q = store(&f).merge_queue().unwrap();
+    assert_eq!(q.len(), 1, "no second item");
+    assert_eq!(q[0].id, queued.id, "the existing item is reused");
+    assert_eq!(q[0].state, MergeState::Queued);
+    assert_eq!(issue_status(&f), "validating");
+}

@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use asf_core::config::GateWhen;
 use asf_core::*;
+use asf_vcs::gates::stage_specs;
 use asf_vcs::{run_gates, GitCli};
 use serde::Serialize;
 use serde_json::json;
@@ -991,10 +993,53 @@ impl<'a> Worker<'a> {
                 _ => {}
             }
         }
+        let again = self.finished_again()?;
+        for (run, issue) in &again {
+            transitions.push(self.verify(run, issue)?);
+        }
         Ok(WatchResult {
-            checked: active.len(),
+            checked: active.len() + again.len(),
             transitions,
         })
+    }
+
+    /// Failed runs whose worker has finished again: the issue's latest run is `failed`, the issue is
+    /// `in-review` and a worker STATUS comment is newer than the run's `finished_at` (the latest
+    /// STATUS counts). `asf issue finish` only touches active runs, so without this the operator
+    /// would have to run `asf run verify` by hand. Timestamps have one-second resolution and the
+    /// comparison is strict: the STATUS that triggered the failed verification is never newer than it.
+    fn finished_again(&self) -> Result<Vec<(Run, Issue)>, AppError> {
+        let store = &self.ctx.store;
+        // runs come back ordered by start, so the last one per issue is its latest
+        let mut latest: Vec<Run> = Vec::new();
+        for run in store.runs(None, false)? {
+            match latest.iter_mut().find(|r| r.issue_id == run.issue_id) {
+                Some(slot) => *slot = run,
+                None => latest.push(run),
+            }
+        }
+        let mut again = Vec::new();
+        for run in latest.into_iter().filter(|r| r.state == RunState::Failed) {
+            let Some(finished_at) = run.finished_at.clone() else {
+                continue;
+            };
+            let Some(issue) = store.get_issue(&run.issue_id)? else {
+                continue;
+            };
+            if issue.status != Status::InReview {
+                continue;
+            }
+            let status_at = store
+                .comments(&run.issue_id)?
+                .into_iter()
+                .filter(|c| c.kind == CommentType::Status && c.author.starts_with("agent:"))
+                .map(|c| c.created_at)
+                .max();
+            if status_at.is_some_and(|at| at > finished_at) {
+                again.push((run, issue));
+            }
+        }
+        Ok(again)
     }
 
     /// Operator-triggered rerun of the verification `watch` performs. State checks come first and
@@ -1073,18 +1118,7 @@ impl<'a> Worker<'a> {
                 outside.join(", ")
             ));
         }
-        let specs: Vec<GateSpec> = self
-            .ctx
-            .config
-            .gates
-            .iter()
-            .map(|g| GateSpec {
-                name: g.name.clone(),
-                cmd: g.cmd.clone(),
-                timeout_s: g.timeout_s,
-                shell: g.shell.clone(),
-            })
-            .collect();
+        let specs = stage_specs(&self.ctx.config.gates, GateWhen::Verify);
         let results = run_gates(&specs, &wt_abs);
         for r in results.iter().filter(|r| !r.ok) {
             problems.push(format!(
@@ -1099,9 +1133,19 @@ impl<'a> Worker<'a> {
             self.ctx
                 .store
                 .set_status(&run.issue_id, Status::Validating, LANE_ORCHESTRATOR)?;
-            self.ctx
+            // A branch that is already queued (an earlier verification, or `merge enqueue` by hand) is
+            // reused: a second `enqueue_merge` would be a conflict that aborts the whole tick.
+            let queued = self
+                .ctx
                 .store
-                .enqueue_merge(&run.issue_id, Some(&run.id), &run.branch)?;
+                .merge_queue()?
+                .iter()
+                .any(|m| m.issue_id == run.issue_id && !m.state.is_terminal());
+            if !queued {
+                self.ctx
+                    .store
+                    .enqueue_merge(&run.issue_id, Some(&run.id), &run.branch)?;
+            }
             let _ = self.rt.notify(
                 &format!("asf {} verified", run.issue_id),
                 &format!("{} queued for merge", issue.title),
