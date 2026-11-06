@@ -820,6 +820,34 @@ fn overlay_renders_title_screen_and_hints() {
 }
 
 #[test]
+fn overlay_hint_line_and_typed_reply_stay_visible_in_short_panes() {
+    for height in [24u16, 20, 12] {
+        let mut a = open_overlay();
+        a.set_screen("Do you want to proceed?\n 1. Yes\n 2. No".into());
+        let keys = render_to_text(&a, 100, height);
+        assert!(
+            keys.contains("1-9 / Enter / Up / Down send keys") && keys.contains("t type text"),
+            "key hints hidden at height {height}:\n{keys}"
+        );
+        a.handle_key(key('t'));
+        for c in "go ahead".chars() {
+            a.handle_key(key(c));
+        }
+        let typed = render_to_text(&a, 100, height);
+        assert!(
+            typed.contains("reply: go ahead"),
+            "typed reply hidden at height {height}:\n{typed}"
+        );
+        // the footer keeps its own row under the popup
+        let last = typed.lines().last().unwrap_or("");
+        assert!(
+            last.contains("answering asf-2"),
+            "footer at height {height}: {last:?}"
+        );
+    }
+}
+
+#[test]
 fn digit_in_the_overlay_sends_keys_and_does_not_switch_views() {
     let mut a = open_overlay();
     assert_eq!(a.view, View::Agents);

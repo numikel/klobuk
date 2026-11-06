@@ -462,7 +462,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     };
     match &app.mode {
         Mode::Answer { id, screen, text } => {
-            answer_overlay(frame, area, id, screen, text.as_deref());
+            answer_overlay(frame, above_footer, id, screen, text.as_deref());
         }
         Mode::Comment { comment, scroll } => comment_modal(frame, above_footer, app, comment, *scroll),
         Mode::Help { scroll } => help_view(frame, above_footer, app, *scroll),
