@@ -1,5 +1,7 @@
 mod common;
 
+use asf_core::{now_rfc3339, IssueStore, MergePatch, MergeState, RunPatch, RunState};
+use asf_store::SqliteStore;
 use common::{git, Repo};
 
 fn fake_repo() -> Repo {
@@ -20,7 +22,11 @@ fn tui_once_prints_a_frame_with_board_and_running_issue() {
     let a = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
     repo.create_issue("docs", &["--scope", "docs/**"]);
     repo.ok(&["run", "start", &a]);
-    let out = repo.asf().args(["tui", "--once"]).output().unwrap();
+    let out = repo
+        .asf()
+        .args(["tui", "--once", "--view", "board"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("asf-1") && text.contains("asf-2"), "{text}");
@@ -86,15 +92,14 @@ fn tui_once_config_view_prints_every_editable_key() {
     for (key, _) in asf_core::config_edit::editable_keys() {
         assert!(text.contains(key), "missing {key} in:\n{text}");
     }
-    assert!(text.contains("[6] Config"), "{text}");
+    assert!(text.contains("[7] Config"), "{text}");
     assert!(text.contains("fake") || text.contains("local"), "{text}");
 }
 
 #[test]
 fn tui_once_board_has_a_validating_column() {
     let repo = fake_repo();
-    let out = repo.asf().args(["tui", "--once"]).output().unwrap();
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = tui_once_text(&repo);
     assert!(text.contains("validating"), "{text}");
 }
 
@@ -105,8 +110,17 @@ fn ask(repo: &Repo, issue: &str, body: &str) -> String {
     v["id"].as_i64().unwrap().to_string()
 }
 
+/// The Board frame (the banner and the Board footer live there; the first view is the Now desk).
 fn tui_once_text(repo: &Repo) -> String {
-    let out = repo.asf().args(["tui", "--once"]).output().unwrap();
+    tui_once_view(repo, "board")
+}
+
+fn tui_once_view(repo: &Repo, view: &str) -> String {
+    let out = repo
+        .asf()
+        .args(["tui", "--once", "--view", view])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).to_string()
 }
@@ -246,4 +260,124 @@ fn the_background_children_print_the_envelopes_the_tui_summarises() {
         again["error"]["message"].as_str().is_some_and(|m| !m.is_empty()),
         "{again}"
     );
+}
+
+fn store(repo: &Repo) -> SqliteStore {
+    SqliteStore::open(&repo.path().join(".factory/factory.db")).unwrap()
+}
+
+#[test]
+fn tui_once_opens_on_the_now_view_and_view_now_shows_the_same_frame() {
+    let repo = fake_repo();
+    let first =
+        String::from_utf8_lossy(&repo.asf().args(["tui", "--once"]).output().unwrap().stdout).to_string();
+    let lines: Vec<&str> = first.lines().collect();
+    assert!(
+        lines[1].contains("[1] Now") && lines[1].contains("[2] Board"),
+        "the tab bar starts with Now:\n{first}"
+    );
+    for needle in [
+        "NEEDS YOU (0)",
+        "Nothing needs you.",
+        "RUNNING (0)",
+        "No worker is running. Press Tab for the Board to start one.",
+        "UP NEXT (0)",
+        "DONE TODAY (0)",
+    ] {
+        assert!(first.contains(needle), "{needle:?}:\n{first}");
+    }
+    assert!(!first.contains("backlog 0"), "not the Board:\n{first}");
+    assert_eq!(first, tui_once_view(&repo, "now"));
+    assert_ne!(first, tui_once_view(&repo, "board"));
+    // the viewing keys of the footer are the ones of the Now view
+    let footer = first.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+    assert!(
+        footer.contains("a answer") && footer.contains("Enter open issue") && !footer.contains("s start"),
+        "{first}"
+    );
+}
+
+#[test]
+fn tui_once_now_lists_what_needs_you_what_runs_what_is_next_and_what_is_done() {
+    let repo = fake_repo();
+    let running = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
+    let failing = repo.create_issue("docs", &["--ready", "--scope", "docs/**"]);
+    let asking = repo.create_issue("parser", &[]);
+    let shipped = repo.create_issue("shipped", &["--ready"]);
+    let merging = repo.create_issue("lint", &[]);
+    repo.ok(&["run", "start", &running]);
+    repo.ok(&["run", "start", &failing]);
+
+    // a run that failed is not an active run; the desk still has to show it
+    let s = store(&repo);
+    let run = s
+        .runs(Some(&failing.parse().unwrap()), false)
+        .unwrap()
+        .pop()
+        .unwrap();
+    s.update_run(
+        &run.id,
+        &RunPatch {
+            state: Some(RunState::Failed),
+            exit_reason: Some("gate `test` failed\nsecond line".into()),
+            finished_at: Some(now_rfc3339()),
+            ..RunPatch::default()
+        },
+    )
+    .unwrap();
+    // a question to the human, a failed merge item and an issue closed today
+    ask(&repo, &asking, "Which crate owns the parser?\nsecond line");
+    let item = s
+        .enqueue_merge(&merging.parse().unwrap(), None, &format!("feat/{merging}"))
+        .unwrap();
+    s.update_merge(
+        item.id,
+        &MergePatch {
+            state: Some(MergeState::Failed),
+            last_error: Some(Some("gate `test` after rebase (2 tests)\nmore".into())),
+            ..MergePatch::default()
+        },
+    )
+    .unwrap();
+    repo.ok(&["issue", "status", &shipped, "done"]);
+
+    let text = tui_once_view(&repo, "now");
+    assert!(line_with(&text, 0).contains("3 waiting"), "{text}");
+    assert!(
+        text.contains("NEEDS YOU (3)") && text.contains("RUNNING (1)"),
+        "{text}"
+    );
+    for (id, parts) in [
+        (&failing, ["failed", "gate `test` failed", "v verify"]),
+        (&asking, ["question", "Which crate owns the parser?", "a answer"]),
+        (
+            &merging,
+            ["merge failed", "gate `test` after rebase (2 tests)", "r retry"],
+        ),
+    ] {
+        let row = line_with(&text, id);
+        for part in parts {
+            assert!(row.contains(part), "{id}: {part:?} in {row:?}");
+        }
+        assert!(row.contains("■") && row.contains("<1 min"), "{id}: {row:?}");
+        assert!(!row.contains("second line") && !row.contains("more"), "{row:?}");
+    }
+    let row = line_with(&text, format!("● {running}"));
+    for part in ["working", "greeting", "$0.00 / $5", "<1 min"] {
+        assert!(row.contains(part), "{part:?} in {row:?}");
+    }
+    assert!(text.contains(&format!("DONE TODAY (1)   ✓ {shipped}")), "{text}");
+    assert!(text.contains("UP NEXT (2)"), "{text}");
+}
+
+/// The first line of `text` containing `needle` (or line `n` when given a number-like index).
+fn line_with(text: &str, needle: impl std::fmt::Display) -> String {
+    let needle = needle.to_string();
+    if let Ok(n) = needle.parse::<usize>() {
+        return text.lines().nth(n).unwrap_or_default().to_string();
+    }
+    text.lines()
+        .find(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("no line with {needle:?}:\n{text}"))
+        .to_string()
 }

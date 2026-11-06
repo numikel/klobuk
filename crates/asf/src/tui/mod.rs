@@ -8,6 +8,8 @@
 
 pub mod app;
 pub mod keys;
+pub mod now;
+pub mod theme;
 pub mod view;
 
 #[cfg(test)]
@@ -23,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use asf_core::*;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
+use time::UtcOffset;
 
 use crate::ctx::{Ctx, CONFIG_FILE, FACTORY_DIR};
 use crate::output::AppError;
@@ -119,6 +122,10 @@ fn config_edit_status(
 pub(crate) enum BgKind {
     Tick,
     Start(IssueId),
+    /// `asf run verify <id>`: the Now view's `v`.
+    Verify(IssueId),
+    /// `asf merge retry <id>`: the Now view's `r`.
+    Retry(IssueId),
 }
 
 impl BgKind {
@@ -127,6 +134,8 @@ impl BgKind {
         match self {
             BgKind::Tick => "tick".into(),
             BgKind::Start(id) => format!("starting {id}"),
+            BgKind::Verify(id) => format!("verifying {id}"),
+            BgKind::Retry(id) => format!("retrying {id}"),
         }
     }
 
@@ -135,6 +144,8 @@ impl BgKind {
         match self {
             BgKind::Tick => "tick".into(),
             BgKind::Start(id) => format!("start {id}"),
+            BgKind::Verify(id) => format!("verify {id}"),
+            BgKind::Retry(id) => format!("retry {id}"),
         }
     }
 
@@ -142,8 +153,13 @@ impl BgKind {
         let mut a: Vec<OsString> = vec!["--repo".into(), root.as_os_str().to_owned()];
         match self {
             BgKind::Tick => a.extend(["serve", "--once", "--json"].map(OsString::from)),
-            BgKind::Start(id) => {
-                a.extend(["run", "start"].map(OsString::from));
+            BgKind::Start(id) | BgKind::Verify(id) | BgKind::Retry(id) => {
+                let (group, verb) = match self {
+                    BgKind::Verify(_) => ("run", "verify"),
+                    BgKind::Retry(_) => ("merge", "retry"),
+                    _ => ("run", "start"),
+                };
+                a.extend([group, verb].map(OsString::from));
                 a.push(id.as_str().into());
                 a.push("--json".into());
             }
@@ -182,6 +198,27 @@ pub(crate) fn bg_outcome(kind: &BgKind, stdout: &str, stderr: &str, code: Option
                     count_at(r, &["merge", "items"]),
                     count_at(r, &["promoted"]),
                     count_at(r, &["closed_epics"]),
+                ),
+                BgKind::Verify(id) => {
+                    let word = |k: &str| r[k].as_str().unwrap_or("?").to_string();
+                    let detail = r["detail"]
+                        .as_str()
+                        .and_then(|d| d.lines().map(str::trim).find(|l| !l.is_empty()))
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default();
+                    // The command succeeds even when the verification it ran does not.
+                    let mark = if word("to") == "failed" { '✗' } else { '✓' };
+                    format!(
+                        "{mark} verify {}: {} -> {}{detail}",
+                        r["issue_id"].as_str().unwrap_or(id.as_str()),
+                        word("from"),
+                        word("to")
+                    )
+                }
+                BgKind::Retry(id) => format!(
+                    "✓ {} re-queued (#{})",
+                    r["issue_id"].as_str().unwrap_or(id.as_str()),
+                    r["id"].as_i64().map_or("?".to_string(), |n| n.to_string())
                 ),
                 BgKind::Start(id) => {
                     let text = |p: &[&str]| {
@@ -316,17 +353,40 @@ pub fn load_snapshot(
     events.reverse();
     let issues = store.list_issues(&IssueFilter::default())?;
     // Unanswered questions are read from all comments, not the inbox: marking the inbox read must
-    // not hide a question that still blocks `asf issue finish`.
+    // not hide a question that still blocks `asf issue finish`. The newest BLOCKER of each live
+    // issue rides along: it quotes the screen of a blocked worker.
     let mut questions = Vec::new();
+    let mut blockers = Vec::new();
     for issue in issues
         .iter()
         .filter(|i| !matches!(i.status, Status::Done | Status::Cancelled))
     {
         let comments = store.comments(&issue.id)?;
         let open = unanswered_questions(&comments);
+        blockers.extend(
+            comments
+                .iter()
+                .filter(|c| c.kind == CommentType::Blocker)
+                .max_by_key(|c| c.id)
+                .cloned(),
+        );
         questions.extend(comments.into_iter().filter(|c| open.contains(&c.id)));
     }
     questions.sort_by(|a, b| (&a.created_at, a.id).cmp(&(&b.created_at, b.id)));
+    // `runs` is active-only, so a `failed` run is found among all runs: the newest run of a live
+    // issue, when it failed and no run of the issue is active.
+    let mut newest: BTreeMap<IssueId, Run> = BTreeMap::new();
+    for r in store.runs(None, false)? {
+        newest.insert(r.issue_id.clone(), r); // ordered by start: the last one wins
+    }
+    let failed_runs: Vec<Run> = issues
+        .iter()
+        .filter(|i| !matches!(i.status, Status::Done | Status::Cancelled))
+        .filter_map(|i| newest.remove(&i.id))
+        .filter(|r| r.state == RunState::Failed)
+        .collect();
+    // `time`'s local-offset support is enabled workspace-wide by ratatui; UTC when it cannot be read.
+    let utc_offset_secs = UtcOffset::current_local_offset().map_or(0, |o| o.whole_seconds());
     Ok(Snapshot {
         repo_name: ctx
             .root
@@ -349,7 +409,33 @@ pub fn load_snapshot(
             .collect(),
         events,
         config: config_rows(&read_config_text(&ctx.root).unwrap_or_default()),
+        now: now_rfc3339(),
+        utc_offset_secs,
+        failed_runs,
+        blockers,
+        deps: store.deps()?,
+        review_model: ctx.config.review.model.clone(),
     })
+}
+
+/// Posts the human's ANSWER to QUESTION comment `question` on `id` and returns the status line. It is
+/// the comment `asf issue comment --lane human --type ANSWER --reply-to <q>` writes: the worker finds
+/// it in its inbox, and the question stops blocking `asf issue finish`.
+pub(crate) fn post_answer(
+    store: &impl IssueStore,
+    id: &IssueId,
+    question: i64,
+    text: &str,
+) -> Result<String, AppError> {
+    store.add_comment(&NewComment {
+        issue_id: id.clone(),
+        author: LANE_HUMAN.to_string(),
+        kind: CommentType::Answer,
+        to_lane: id.to_string(),
+        body: text.to_string(),
+        reply_to: Some(question),
+    })?;
+    Ok(format!("answered #{question} on {id}"))
 }
 
 /// Executes one quick action; returns the status line to show. `Tick` and `Start` are slow and are
@@ -358,7 +444,8 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
     Ok(match action {
         // Peek is served by the event loop (it needs the app state); nothing to run here.
         Action::None | Action::Quit | Action::Refresh | Action::Peek(_) => None,
-        Action::Tick | Action::Start(_) => None,
+        Action::Tick | Action::Start(_) | Action::Verify(_) | Action::Retry(_) => None,
+        Action::Answer(id, question, text) => Some(post_answer(&ctx.store, &id, question, &text)?),
         Action::Focus(id) => {
             let run = worker.run_for(&id)?;
             if let (Some(pane), Some(name)) = (&run.pane_id, &run.agent_name) {
@@ -407,6 +494,7 @@ pub fn run_once(ctx: &Ctx, view: Option<View>) -> Result<String, AppError> {
     let rt = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root).ok();
     let snap = load_snapshot(ctx, rt.as_deref(), &BTreeMap::new())?;
     let mut app = App::new(snap);
+    app.color = !theme::no_color_from_env();
     if let Some(v) = view {
         app.view = v;
     }
@@ -416,6 +504,7 @@ pub fn run_once(ctx: &Ctx, view: Option<View>) -> Result<String, AppError> {
 pub fn run_interactive(ctx: &Ctx, view: Option<View>) -> Result<(), AppError> {
     let worker = Worker::new(ctx)?;
     let mut app = App::new(load_snapshot(ctx, Some(worker.rt.as_ref()), &BTreeMap::new())?);
+    app.color = !theme::no_color_from_env();
     if let Some(v) = view {
         app.view = v;
     }
@@ -457,6 +546,8 @@ fn event_loop(
                 let kind = match &action {
                     Action::Tick => Some(BgKind::Tick),
                     Action::Start(id) => Some(BgKind::Start(id.clone())),
+                    Action::Verify(id) => Some(BgKind::Verify(id.clone())),
+                    Action::Retry(id) => Some(BgKind::Retry(id.clone())),
                     _ => None,
                 };
                 if let Some(kind) = kind {

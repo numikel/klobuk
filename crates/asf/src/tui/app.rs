@@ -8,6 +8,8 @@ use asf_core::config_edit::editable_keys;
 use asf_core::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::now::{self, NeedSource, NowRow};
+
 /// How long a status message stays in the footer when no key is pressed.
 pub const STATUS_TTL: Duration = Duration::from_secs(4);
 
@@ -33,6 +35,18 @@ pub struct Snapshot {
     pub events: Vec<Event>,
     /// One row per editable config key, read from `.factory/config.toml`.
     pub config: Vec<ConfigRow>,
+    /// When the snapshot was taken, RFC 3339 UTC (the clock of the ages in the Now view).
+    pub now: String,
+    /// Seconds east of UTC of the local time zone, for "closed today" (0 when it cannot be read).
+    pub utc_offset_secs: i32,
+    /// The newest run of every live issue whose newest run `failed`; `runs` holds active ones only.
+    pub failed_runs: Vec<Run>,
+    /// The newest BLOCKER comment of every live issue (it carries the worker screen of a blocked run).
+    pub blockers: Vec<Comment>,
+    /// Every dependency edge, for "what the up-next issues wait for".
+    pub deps: Vec<Dep>,
+    /// `[review] model`: what a reviewer run is shown with.
+    pub review_model: String,
 }
 
 /// An editable config key with its current value.
@@ -112,6 +126,8 @@ impl Waiting {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum View {
+    /// The operator's desk: what needs the human, what runs, what is next. The first view.
+    Now,
     Board,
     Agents,
     Inbox,
@@ -121,7 +137,8 @@ pub enum View {
 }
 
 impl View {
-    pub const ALL: [View; 6] = [
+    pub const ALL: [View; 7] = [
+        View::Now,
         View::Board,
         View::Agents,
         View::Inbox,
@@ -132,6 +149,7 @@ impl View {
 
     pub fn title(&self) -> &'static str {
         match self {
+            View::Now => "Now",
             View::Board => "Board",
             View::Agents => "Agents",
             View::Inbox => "Inbox",
@@ -171,6 +189,12 @@ pub enum Action {
     UnsetConfig(String),
     /// Read the worker's pane so the answer overlay can show what it asks.
     Peek(IssueId),
+    /// Post an ANSWER comment from the human that replies to QUESTION comment `.1` on the issue.
+    Answer(IssueId, i64, String),
+    /// Rerun verification of the issue's run in the background (`asf run verify <id>`).
+    Verify(IssueId),
+    /// Re-queue the issue's failed or blocked merge item in the background (`asf merge retry <id>`).
+    Retry(IssueId),
 }
 
 /// What the input line is typing for.
@@ -178,6 +202,8 @@ pub enum Action {
 pub enum InputTarget {
     Reply(IssueId),
     Config(String),
+    /// An answer to QUESTION comment `.1` on the issue.
+    Answer(IssueId, i64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,12 +263,16 @@ pub struct App {
     /// Largest useful scroll of the open modal, written by the renderer (it alone knows the wrapped
     /// height), read when scrolling so `j` cannot run past the end.
     pub(crate) scroll_max: Cell<u16>,
+    /// Whether the renderer may use colours; the entry points clear it when `NO_COLOR` is set.
+    pub color: bool,
 }
 
 impl App {
+    /// A fresh app on the Now view, in colour (the entry points apply `NO_COLOR`).
     pub fn new(snap: Snapshot) -> App {
         App {
-            view: View::Board,
+            view: View::Now,
+            color: true,
             mode: Mode::Normal,
             sel: BTreeMap::new(),
             detail: true,
@@ -299,8 +329,20 @@ impl App {
         out
     }
 
+    /// The Now view's rows in selection order: NEEDS YOU, then RUNNING.
+    pub fn now_issues(&self) -> Vec<IssueId> {
+        let needs = now::needs(&self.snap);
+        let running = now::running(&self.snap);
+        needs
+            .into_iter()
+            .map(|n| n.issue)
+            .chain(running.into_iter().map(|r| r.issue))
+            .collect()
+    }
+
     pub fn rows(&self, view: View) -> usize {
         match view {
+            View::Now => self.now_issues().len(),
             View::Board => self.board_issues().len(),
             View::Agents => self.snap.runs.len(),
             View::Inbox => self.snap.inbox.len(),
@@ -321,6 +363,11 @@ impl App {
     pub fn selected_issue(&self) -> Option<&IssueId> {
         let i = self.selected(self.view);
         match self.view {
+            View::Now => self
+                .now_issues()
+                .get(i)
+                .and_then(|id| self.issue(id))
+                .map(|x| &x.id),
             View::Board => self.board_issues().get(i).map(|x| &x.id),
             View::Agents => self.snap.runs.get(i).map(|r| &r.issue_id),
             View::Inbox => self.snap.inbox.get(i).map(|c| &c.issue_id),
@@ -357,6 +404,117 @@ impl App {
         let mut all: Vec<Waiting> = runs.chain(questions).collect();
         all.sort_by(|a, b| a.since().cmp(b.since()));
         all
+    }
+
+    /// What the Now view's selection points at: the NEEDS YOU rows first, then the RUNNING rows.
+    pub fn selected_now_row(&self) -> Option<NowRow> {
+        let i = self.selected(View::Now);
+        let needs = now::needs(&self.snap);
+        let n = needs.len();
+        if i < n {
+            needs.into_iter().nth(i).map(NowRow::Need)
+        } else {
+            now::running(&self.snap)
+                .into_iter()
+                .nth(i - n)
+                .map(NowRow::Running)
+        }
+    }
+
+    fn selected_now_issue(&self) -> Option<IssueId> {
+        self.selected_now_row().map(|r| match r {
+            NowRow::Need(n) => n.issue,
+            NowRow::Running(r) => r.issue,
+        })
+    }
+
+    /// Switches to the Board with `id` selected (it stays where it was when the Board hides it).
+    fn open_on_board(&mut self, id: &IssueId) {
+        if let Some(at) = self.board_issues().iter().position(|i| &i.id == id) {
+            self.sel.insert(View::Board, at);
+        }
+        self.view = View::Board;
+    }
+
+    /// `a` on the Now view: a blocked worker gets the answer overlay, a QUESTION comment a typed answer.
+    fn now_answer(&mut self) -> Action {
+        match self.selected_now_row() {
+            Some(NowRow::Need(n)) => match n.source {
+                NeedSource::BlockedRun => {
+                    self.mode = Mode::Answer {
+                        id: n.issue.clone(),
+                        screen: String::new(),
+                        text: None,
+                    };
+                    Action::Peek(n.issue)
+                }
+                NeedSource::Question(question) => {
+                    self.mode = Mode::Input {
+                        prompt: format!("answer {} (#{question})", n.issue),
+                        buf: String::new(),
+                        target: InputTarget::Answer(n.issue, question),
+                    };
+                    Action::None
+                }
+                _ => {
+                    self.status = Some(format!(
+                        "{}: a answers a question; this row takes {}",
+                        n.issue,
+                        n.act.hint()
+                    ));
+                    Action::None
+                }
+            },
+            Some(NowRow::Running(r)) => {
+                self.status = Some(format!("{} is running; nothing to answer", r.issue));
+                Action::None
+            }
+            None => Action::None,
+        }
+    }
+
+    /// `v` on the Now view: rerun verification of a failed, stalled or over-budget run.
+    fn now_verify(&mut self) -> Action {
+        match self.selected_now_row() {
+            Some(NowRow::Need(n)) if matches!(n.source, NeedSource::Run(_)) => {
+                if self.busy_refusal() {
+                    Action::None
+                } else {
+                    Action::Verify(n.issue)
+                }
+            }
+            Some(row) => {
+                self.status = Some(format!(
+                    "{}: v verifies a failed, stalled or over-budget run; {}",
+                    row.issue(),
+                    row.advice()
+                ));
+                Action::None
+            }
+            None => Action::None,
+        }
+    }
+
+    /// `r` on the Now view: re-queue a failed or blocked merge item.
+    fn now_retry(&mut self) -> Action {
+        match self.selected_now_row() {
+            Some(NowRow::Need(n)) if matches!(n.source, NeedSource::Merge(_)) => {
+                if self.busy_refusal() {
+                    Action::None
+                } else {
+                    Action::Retry(n.issue)
+                }
+            }
+            Some(row) => {
+                self.status = Some(format!(
+                    "{}: r retries a failed or blocked merge; {}",
+                    row.issue(),
+                    row.advice()
+                ));
+                Action::None
+            }
+            None => Action::None,
+        }
     }
 
     /// Feeds the pane text read for the open answer overlay; anything else ignores it.
@@ -503,6 +661,7 @@ impl App {
                             match target {
                                 InputTarget::Reply(id) => Action::Reply(id, text),
                                 InputTarget::Config(key) => Action::SetConfig(key, text),
+                                InputTarget::Answer(id, question) => Action::Answer(id, question, text),
                             }
                         }
                     }
@@ -556,7 +715,7 @@ impl App {
                     Action::Tick
                 }
             }
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Char(c @ '1'..='7') => {
                 self.view = View::ALL[(c as u8 - b'1') as usize];
                 Action::None
             }
@@ -605,6 +764,19 @@ impl App {
                 }
                 Action::None
             }
+            KeyCode::Enter if self.view == View::Now => {
+                if let Some(id) = self.selected_now_issue() {
+                    self.open_on_board(&id);
+                }
+                Action::None
+            }
+            KeyCode::Char('a') if self.view == View::Now => self.now_answer(),
+            KeyCode::Char('v') if self.view == View::Now => self.now_verify(),
+            KeyCode::Char('r') if self.view == View::Now => self.now_retry(),
+            KeyCode::Char('f') if self.view == View::Now => self
+                .selected_now_issue()
+                .map(Action::Focus)
+                .unwrap_or(Action::None),
             KeyCode::Enter => match (self.view, self.selected_issue().cloned()) {
                 (View::Inbox, Some(_)) => {
                     if let Some(comment) = self.snap.inbox.get(self.selected(View::Inbox)).cloned() {

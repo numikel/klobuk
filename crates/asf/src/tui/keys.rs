@@ -9,6 +9,7 @@ use super::app::{Mode, View};
 pub enum Group {
     Global,
     Navigation,
+    Now,
     Board,
     Agents,
     Inbox,
@@ -18,9 +19,10 @@ pub enum Group {
 }
 
 impl Group {
-    pub const ALL: [Group; 8] = [
+    pub const ALL: [Group; 9] = [
         Group::Global,
         Group::Navigation,
+        Group::Now,
         Group::Board,
         Group::Agents,
         Group::Inbox,
@@ -33,6 +35,7 @@ impl Group {
         match self {
             Group::Global => "Global",
             Group::Navigation => "Navigation",
+            Group::Now => "Now",
             Group::Board => "Board",
             Group::Agents => "Agents",
             Group::Inbox => "Inbox",
@@ -143,6 +146,7 @@ use Slot::{Hint, Tail};
 
 const ANY: &[View] = &[];
 const NORMAL: &[ModeKind] = &[M::Normal];
+const NOW: &[View] = &[View::Now];
 const BOARD: &[View] = &[View::Board];
 const AGENTS: &[View] = &[View::Agents];
 const INBOX: &[View] = &[View::Inbox];
@@ -172,9 +176,9 @@ pub const BINDINGS: &[Binding] = &[
         Slot::None,
     ),
     b(
-        "1 - 6",
+        "1 - 7",
         "views",
-        "jump to a view: Board, Agents, Inbox, Queue, Log, Config",
+        "jump to a view: Now, Board, Agents, Inbox, Queue, Log, Config",
         Global,
         ANY,
         NORMAL,
@@ -340,6 +344,70 @@ pub const BINDINGS: &[Binding] = &[
         "jump to the last row",
         Navigation,
         ANY,
+        NORMAL,
+        Slot::None,
+    ),
+    // ---- Now ----
+    b(
+        "j / k",
+        "move",
+        "move through NEEDS YOU, then RUNNING",
+        Group::Now,
+        NOW,
+        NORMAL,
+        Hint,
+    ),
+    b(
+        "a",
+        "answer",
+        "answer a question or a worker that waits for you",
+        Group::Now,
+        NOW,
+        NORMAL,
+        Hint,
+    ),
+    b(
+        "f",
+        "focus pane",
+        "focus the selected worker's pane in Herdr",
+        Group::Now,
+        NOW,
+        NORMAL,
+        Hint,
+    ),
+    b(
+        "Enter",
+        "open issue",
+        "open the selected issue on the Board",
+        Group::Now,
+        NOW,
+        NORMAL,
+        Hint,
+    ),
+    b(
+        "Tab",
+        "next view",
+        "go to the next view (Shift+Tab: the previous one)",
+        Group::Now,
+        NOW,
+        NORMAL,
+        Hint,
+    ),
+    b(
+        "v",
+        "verify",
+        "rerun verification of a failed, stalled or over-budget run",
+        Group::Now,
+        NOW,
+        NORMAL,
+        Slot::None,
+    ),
+    b(
+        "r",
+        "retry",
+        "re-queue a failed or blocked merge item",
+        Group::Now,
+        NOW,
         NORMAL,
         Slot::None,
     ),

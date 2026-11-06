@@ -13,10 +13,50 @@ use ratatui::{Frame, Terminal};
 
 use super::app::{board_columns, App, Mode, View, Waiting};
 use super::keys::{footer_hints, help_lines, HelpLine, ModeKind};
+use super::now;
+use super::theme::{self, Mark};
+
+/// Smallest terminal the views are laid out for; below it one centred line says so.
+pub const MIN_WIDTH: u16 = 80;
+pub const MIN_HEIGHT: u16 = 20;
 
 /// Style of a waiting marker and of the row it sits on: bold red, never colour alone (the symbol differs too).
 fn blocked_style() -> Style {
     Style::default().red().bold()
+}
+
+/// Whether a run in `state` waits for the human or has gone wrong (the red `■`).
+fn run_needs_you(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Blocked | RunState::Stalled | RunState::OverBudget | RunState::Failed
+    )
+}
+
+/// The status symbol of a board card: a run decides first, then a failed or blocked merge item,
+/// then the issue's own status.
+fn issue_mark(app: &App, issue: &Issue) -> Mark {
+    if let Some(r) = app.run_for(&issue.id) {
+        return if run_needs_you(r.state) {
+            Mark::Needs
+        } else if issue.kind == IssueType::Review {
+            Mark::Review
+        } else {
+            Mark::Working
+        };
+    }
+    let failed_run = app.snap.failed_runs.iter().any(|r| r.issue_id == issue.id);
+    let failed_merge = app
+        .snap
+        .queue
+        .iter()
+        .any(|m| m.issue_id == issue.id && matches!(m.state, MergeState::Failed | MergeState::Blocked));
+    match issue.status {
+        _ if failed_run || failed_merge => Mark::Needs,
+        Status::Validating | Status::InReview => Mark::Review,
+        Status::Done => Mark::Done,
+        _ => Mark::Waiting,
+    }
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -48,7 +88,8 @@ fn header_line(app: &App) -> Line<'static> {
             s.queue.len()
         )),
     ];
-    let waiting = app.waiting().len();
+    // The same count as the Now view's NEEDS YOU section.
+    let waiting = now::needs(s).len();
     if waiting > 0 {
         spans.push(Span::raw(" · "));
         spans.push(Span::styled(
@@ -167,11 +208,13 @@ fn board(frame: &mut Frame, app: &App, area: Rect) {
         let list_items: Vec<ListItem> = items
             .iter()
             .map(|i| {
-                let marker = match app.run_for(&i.id) {
-                    Some(r) if r.state == RunState::Blocked => Span::styled("■ ? ", blocked_style()),
-                    Some(_) => Span::raw("▶ "),
-                    None => Span::raw(""),
-                };
+                let mark = issue_mark(app, i);
+                // A worker that sits on a prompt keeps its `?`: it is the one the `a` key answers.
+                let blocked = app.run_for(&i.id).is_some_and(|r| r.state == RunState::Blocked);
+                let marker = Span::styled(
+                    format!("{} {}", mark.glyph(), if blocked { "? " } else { "" }),
+                    mark.style(),
+                );
                 ListItem::new(Text::from(vec![
                     Line::from(vec![marker, Span::raw(i.id.to_string())]),
                     Line::from(format!("  {}", trunc(&i.title, width))),
@@ -263,9 +306,22 @@ fn agents(frame: &mut Frame, app: &App, area: Rect) {
                 .get(&r.issue_id)
                 .map(|a| a.state.to_string())
                 .unwrap_or_else(|| "?".into());
-            let blocked = r.state == RunState::Blocked;
+            let blocked = run_needs_you(r.state);
+            let mark = if blocked {
+                Mark::Needs
+            } else if app
+                .issue(&r.issue_id)
+                .is_some_and(|i| i.kind == IssueType::Review)
+            {
+                Mark::Review
+            } else {
+                Mark::Working
+            };
             let row = Row::new(vec![
-                Cell::from(format!("{}{}", if blocked { "■ " } else { "  " }, r.issue_id)),
+                Cell::from(Line::from(vec![
+                    Span::styled(format!("{} ", mark.glyph()), mark.style()),
+                    Span::raw(r.issue_id.to_string()),
+                ])),
                 Cell::from(r.state.to_string()),
                 Cell::from(agent),
                 Cell::from(format!("${:.2}", r.cost_usd)),
@@ -418,9 +474,37 @@ fn config(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut st);
 }
 
+/// Draws one frame: below [`MIN_WIDTH`]x[`MIN_HEIGHT`] only the too-small line, otherwise the view
+/// and its overlays; with `NO_COLOR` (`app.color == false`) every colour is stripped afterwards.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let waiting = app.waiting();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        let [_, middle, _] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Terminal too small (need {MIN_WIDTH}x{MIN_HEIGHT}, have {}x{}).",
+                area.width, area.height
+            ))
+            .centered(),
+            middle,
+        );
+    } else {
+        render_views(frame, app);
+    }
+    if !app.color {
+        theme::strip_colors(frame.buffer_mut());
+    }
+}
+
+fn render_views(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    // The Now view lists the waiters itself, so the one-line banner is for the other views.
+    let waiting = if app.view == View::Now {
+        Vec::new()
+    } else {
+        app.waiting()
+    };
     let show_detail = app.detail && app.view == View::Board && area.height >= 14;
     // The banner line exists only while something waits, so the layout is stable otherwise.
     let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
@@ -445,6 +529,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     let main = rows[next];
     match app.view {
+        View::Now => now::render(frame, app, main),
         View::Board => board(frame, app, main),
         View::Agents => agents(frame, app, main),
         View::Inbox => inbox(frame, app, main),
