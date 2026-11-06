@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 
 use asf_core::*;
+use std::time::Duration;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::app::{board_columns, config_rows, Action, App, Mode, Snapshot, View};
+use super::app::{board_columns, config_rows, Action, App, Mode, Snapshot, View, STATUS_TTL};
+use super::keys::{footer_hints, ModeKind, BINDINGS};
 use super::view::{render_to_buffer, render_to_text};
-use super::{config_set_status, config_unset_status, keys_status};
+use super::{bg_outcome, config_set_status, config_unset_status, keys_status, BgKind};
 
 fn id(s: &str) -> IssueId {
     s.parse().unwrap()
@@ -298,7 +301,10 @@ fn agents_and_inbox_views_select_their_own_issue() {
     assert_eq!(a.selected_issue().unwrap().as_str(), "asf-2");
     a.handle_key(key('3'));
     assert_eq!(a.selected_issue().unwrap().as_str(), "asf-2");
-    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::MarkRead(id("asf-2")));
+    // Enter only opens the comment now; marking read is `m` / `M`.
+    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::None);
+    assert!(matches!(a.mode, Mode::Comment { .. }));
+    a.handle_key(code(KeyCode::Esc));
     a.handle_key(key('4'));
     assert_eq!(a.selected_issue().unwrap().as_str(), "asf-1");
     a.handle_key(key('5'));
@@ -995,4 +1001,561 @@ fn refused_unset_leaves_the_file_byte_identical() {
     let msg = config_unset_status(dir.path(), "scheduler.max_parallel");
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert!(msg.starts_with("error"), "{msg}");
+}
+
+// ---------- asf-31: status expiry ----------
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+fn mods(c: char, m: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), m)
+}
+
+fn footer_line(a: &App, width: u16) -> String {
+    let t = render_to_text(a, width, 30);
+    t.lines().last().unwrap_or("").to_string()
+}
+
+#[test]
+fn status_expires_after_four_seconds_and_the_hints_come_back() {
+    let mut a = app();
+    a.advance(ms(1_000));
+    a.status = Some("started asf-3".into());
+    assert!(footer_line(&a, 100).contains("started asf-3"));
+    a.advance(ms(1_000)); // the first tick after the message stamps it
+    a.advance(ms(1_000) + STATUS_TTL - ms(1));
+    assert!(a.status.is_some(), "still within the 4 s");
+    a.advance(ms(1_000) + STATUS_TTL);
+    assert!(a.status.is_none());
+    let f = footer_line(&a, 100);
+    assert!(f.contains("? help") && !f.contains("started asf-3"), "{f:?}");
+}
+
+#[test]
+fn status_goes_away_on_the_next_key_press_but_a_key_may_set_a_new_one() {
+    let mut a = app();
+    a.status = Some("sent to asf-2".into());
+    a.handle_key(key('j'));
+    assert!(a.status.is_none());
+    a.handle_key(key('j')); // asf-2, in progress
+    a.handle_key(key('s'));
+    assert!(
+        a.status.as_deref().unwrap_or("").contains("only ready"),
+        "{:?}",
+        a.status
+    );
+    a.handle_key(key('k'));
+    assert!(a.status.is_none(), "cleared again by the following key");
+}
+
+// ---------- asf-31: Inbox open / mark read ----------
+
+fn inbox_app() -> App {
+    let mut a = app();
+    a.handle_key(key('3'));
+    a
+}
+
+#[test]
+fn enter_opens_the_comment_modal_and_changes_nothing_unread() {
+    let mut a = inbox_app();
+    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::None);
+    assert!(matches!(a.mode, Mode::Comment { .. }));
+    assert_eq!(a.rows(View::Inbox), 1, "unread count is untouched");
+    let t = render_to_text(&a, 100, 30);
+    assert!(
+        t.contains("#1 asf-2 [orchestrator] BLOCKER -> human"),
+        "header line:\n{t}"
+    );
+    assert!(
+        t.contains("Worker is waiting for input.") && t.contains("Screen: Allow rm?"),
+        "{t}"
+    );
+    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
+    assert!(matches!(a.mode, Mode::Normal));
+    assert_eq!(a.rows(View::Inbox), 1);
+}
+
+#[test]
+fn the_comment_modal_wraps_and_scrolls_with_j_and_k() {
+    let mut s = snapshot();
+    s.inbox[0].body = (1..=60)
+        .map(|n| format!("line {n:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut a = App::new(s);
+    a.handle_key(key('3'));
+    a.handle_key(code(KeyCode::Enter));
+    let top = render_to_text(&a, 100, 30);
+    assert!(top.contains("line 10") && !top.contains("line 40"), "{top}");
+    for _ in 0..30 {
+        a.handle_key(key('j'));
+    }
+    let mid = render_to_text(&a, 100, 30);
+    assert!(mid.contains("line 31") && !mid.contains("line 10"), "{mid}");
+    for _ in 0..200 {
+        a.handle_key(code(KeyCode::Down));
+    }
+    let end = render_to_text(&a, 100, 30);
+    assert!(end.contains("line 60"), "clamped at the end:\n{end}");
+    for _ in 0..200 {
+        a.handle_key(key('k'));
+    }
+    assert!(render_to_text(&a, 100, 30).contains("line 10"));
+    // a long single line is wrapped, not cut
+    let mut s = snapshot();
+    s.inbox[0].body = "word ".repeat(80);
+    let mut a = App::new(s);
+    a.handle_key(key('3'));
+    a.handle_key(code(KeyCode::Enter));
+    let t = render_to_text(&a, 60, 30);
+    assert_eq!(t.matches("word").count(), 80, "{t}");
+}
+
+#[test]
+fn m_marks_the_selected_issues_conversation_read_and_enter_does_not() {
+    let mut a = inbox_app();
+    assert_eq!(a.handle_key(key('m')), Action::MarkRead(id("asf-2")));
+    // on the Board `m` is still "merge"
+    let mut b = app();
+    b.handle_key(key('j'));
+    b.handle_key(key('j'));
+    assert_eq!(b.handle_key(key('m')), Action::Enqueue(id("asf-2")));
+    // nothing selected, nothing to mark
+    let mut e = App::new(Snapshot::default());
+    e.handle_key(key('3'));
+    assert_eq!(e.handle_key(key('m')), Action::None);
+    assert_eq!(e.handle_key(key('M')), Action::None);
+}
+
+#[test]
+fn capital_m_asks_before_marking_everything() {
+    let mut a = inbox_app();
+    assert_eq!(a.handle_key(key('M')), Action::None);
+    match &a.mode {
+        Mode::Confirm { what, .. } => assert_eq!(what, "mark all 1 read?"),
+        other => panic!("expected confirm, got {other:?}"),
+    }
+    assert!(render_to_text(&a, 100, 30).contains("mark all 1 read?"));
+    assert_eq!(a.handle_key(key('n')), Action::None);
+    assert!(matches!(a.mode, Mode::Normal));
+    a.handle_key(key('M'));
+    assert_eq!(a.handle_key(key('y')), Action::MarkAllRead);
+    assert!(matches!(a.mode, Mode::Normal));
+}
+
+// ---------- asf-31: background actions ----------
+
+#[test]
+fn a_second_background_request_answers_busy_and_runs_nothing() {
+    let mut a = app();
+    a.busy = Some("tick".into());
+    assert_eq!(a.handle_key(key('t')), Action::None);
+    assert_eq!(a.status.as_deref(), Some("busy: tick"));
+    a.handle_key(key('j')); // asf-3 is ready
+    assert_eq!(a.handle_key(key('s')), Action::None);
+    assert_eq!(a.status.as_deref(), Some("busy: tick"));
+    a.busy = None;
+    assert_eq!(a.handle_key(key('s')), Action::Start(id("asf-3")));
+}
+
+#[test]
+fn the_header_shows_a_spinner_and_label_while_busy_and_every_key_still_works() {
+    let mut a = app();
+    a.busy = Some("starting asf-25".into());
+    a.advance(ms(0));
+    let h = render_to_text(&a, 100, 30).lines().next().unwrap().to_string();
+    assert!(h.contains("⠋ starting asf-25…"), "{h:?}");
+    a.advance(ms(100));
+    let h = render_to_text(&a, 100, 30).lines().next().unwrap().to_string();
+    assert!(
+        h.contains("⠙ starting asf-25…"),
+        "the frame advances with the clock: {h:?}"
+    );
+    a.handle_key(key('2'));
+    assert_eq!(a.view, View::Agents, "views still switch while busy");
+    a.busy = None;
+    let h = render_to_text(&a, 100, 30).lines().next().unwrap().to_string();
+    assert!(!h.contains('⠙') && !h.contains('…'), "{h:?}");
+}
+
+#[test]
+fn child_output_becomes_a_check_or_a_cross_with_the_envelope_message() {
+    let tick = r#"{"ok":true,"result":{"promoted":["asf-3"],"closed_epics":[],"watch":{"checked":2,"transitions":[{"x":1}]},"merge":{"items":[{"id":1},{"id":2}]},"started":[],"start_errors":[]}}"#;
+    assert_eq!(
+        bg_outcome(&BgKind::Tick, tick, "", Some(0)),
+        "✓ tick: 1 transition(s), 2 merge item(s), 1 promoted, 0 epic(s) closed"
+    );
+    let start = r#"{"ok":true,"result":{"run":{"issue_id":"asf-25"},"workspace_id":"w1","pane_id":"p1","trusted":false}}"#;
+    assert_eq!(
+        bg_outcome(&BgKind::Start(id("asf-25")), start, "", Some(0)),
+        "✓ started asf-25 in w1 (pane p1)"
+    );
+    let err = r#"{"ok":false,"error":{"code":"conflict","message":"asf-25 is already claimed"}}"#;
+    assert_eq!(
+        bg_outcome(&BgKind::Start(id("asf-25")), err, "", Some(3)),
+        "✗ asf-25 is already claimed"
+    );
+    // a crash prints no envelope: say what we know
+    assert_eq!(
+        bg_outcome(&BgKind::Tick, "", "boom\nmore", Some(101)),
+        "✗ tick exited with 101: boom"
+    );
+    assert_eq!(bg_outcome(&BgKind::Tick, "", "", None), "✗ tick was terminated");
+}
+
+// ---------- asf-31: control keys ----------
+
+fn ctrl(c: char) -> KeyEvent {
+    mods(c, KeyModifiers::CONTROL)
+}
+
+#[test]
+fn ctrl_c_quits_from_every_mode() {
+    let mut input = app();
+    for c in ['j', 'j', 'r'] {
+        input.handle_key(key(c));
+    }
+    let mut confirm = app();
+    for c in ['j', 'j', 'x'] {
+        confirm.handle_key(key(c));
+    }
+    let mut text = open_overlay();
+    text.handle_key(key('t'));
+    let mut comment = inbox_app();
+    comment.handle_key(code(KeyCode::Enter));
+    let mut help = app();
+    help.handle_key(key('?'));
+    let modes = [
+        ("normal", app()),
+        ("input", input),
+        ("confirm", confirm),
+        ("answer", open_overlay()),
+        ("answer text", text),
+        ("comment", comment),
+        ("help", help),
+    ];
+    for (name, mut a) in modes {
+        assert_eq!(a.handle_key(ctrl('c')), Action::Quit, "{name}");
+    }
+}
+
+fn typing_app() -> App {
+    let mut a = app();
+    a.handle_key(key('j'));
+    a.handle_key(key('j'));
+    a.handle_key(key('r'));
+    a
+}
+
+fn buf_of(a: &App) -> String {
+    match &a.mode {
+        Mode::Input { buf, .. } => buf.clone(),
+        other => panic!("not in input mode: {other:?}"),
+    }
+}
+
+#[test]
+fn ctrl_w_deletes_the_last_word_and_ctrl_u_clears_the_line() {
+    let mut a = typing_app();
+    for c in "go on  now".chars() {
+        a.handle_key(key(c));
+    }
+    a.handle_key(ctrl('w'));
+    assert_eq!(buf_of(&a), "go on  ");
+    a.handle_key(ctrl('w'));
+    assert_eq!(buf_of(&a), "go ");
+    a.handle_key(ctrl('w'));
+    assert_eq!(buf_of(&a), "");
+    a.handle_key(ctrl('w')); // nothing to delete: no panic
+    for c in "abc".chars() {
+        a.handle_key(key(c));
+    }
+    a.handle_key(ctrl('u'));
+    assert_eq!(buf_of(&a), "");
+    // the same keys edit the free-text reply of the answer overlay
+    let mut o = open_overlay();
+    o.handle_key(key('t'));
+    for c in "use 2 please".chars() {
+        o.handle_key(key(c));
+    }
+    o.handle_key(ctrl('w'));
+    assert_eq!(
+        o.handle_key(code(KeyCode::Enter)),
+        Action::Reply(id("asf-2"), "use 2".into())
+    );
+    let mut o = open_overlay();
+    o.handle_key(key('t'));
+    o.handle_key(key('x'));
+    o.handle_key(ctrl('u'));
+    assert_eq!(
+        o.handle_key(code(KeyCode::Enter)),
+        Action::None,
+        "empty text is not sent"
+    );
+}
+
+#[test]
+fn modifier_chords_never_insert_a_character_or_trigger_a_binding() {
+    let mut a = typing_app();
+    a.handle_key(key('a'));
+    for k in [
+        mods('x', KeyModifiers::CONTROL),
+        mods('x', KeyModifiers::ALT),
+        mods('x', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        mods('b', KeyModifiers::ALT | KeyModifiers::SHIFT),
+    ] {
+        assert_eq!(a.handle_key(k), Action::None);
+    }
+    assert_eq!(buf_of(&a), "a", "chords left the line alone");
+    // Shift alone is just a capital letter
+    a.handle_key(mods('B', KeyModifiers::SHIFT));
+    assert_eq!(buf_of(&a), "aB");
+    // Windows reports AltGr (Polish ą ę ł) as Ctrl+Alt together; that is text, not a chord
+    a.handle_key(mods('ą', KeyModifiers::CONTROL | KeyModifiers::ALT));
+    assert_eq!(buf_of(&a), "aBą");
+    // in normal mode a chord is no binding: Alt+q does not quit, Ctrl+j does not move
+    let mut n = app();
+    assert_eq!(n.handle_key(mods('q', KeyModifiers::ALT)), Action::None);
+    assert_eq!(n.handle_key(ctrl('t')), Action::None);
+    n.handle_key(ctrl('j'));
+    assert_eq!(n.selected_issue().unwrap().as_str(), "asf-4");
+    let mut o = open_overlay();
+    assert_eq!(o.handle_key(ctrl('y')), Action::None);
+    assert!(matches!(o.mode, Mode::Answer { .. }));
+}
+
+// ---------- asf-31: footer, help, navigation ----------
+
+#[test]
+fn footer_fits_100_columns_in_every_view_and_ends_with_help_and_quit() {
+    let mut a = app();
+    let mut seen = Vec::new();
+    for c in '1'..='6' {
+        a.handle_key(key(c));
+        let hints = footer_hints(a.view, ModeKind::Normal);
+        assert!(hints.len() <= 7, "{:?}: {} hints", a.view, hints.len());
+        let f = footer_line(&a, 100);
+        assert!(f.trim_end().ends_with("? help  q quit"), "{:?}: {f:?}", a.view);
+        for h in &hints {
+            assert!(
+                f.contains(&format!("{} {}", h.key, h.label)),
+                "{:?} lacks {}: {f:?}",
+                a.view,
+                h.key
+            );
+        }
+        seen.push(f);
+    }
+    assert_ne!(seen[0], seen[5], "Board and Config show different hints");
+    assert!(
+        seen[0].contains("s start") && !seen[0].contains("d unset"),
+        "{}",
+        seen[0]
+    );
+    assert!(
+        seen[5].contains("d unset") && !seen[5].contains("s start"),
+        "{}",
+        seen[5]
+    );
+}
+
+#[test]
+fn no_view_and_mode_combination_advertises_more_than_seven_hints() {
+    for view in View::ALL {
+        for kind in ModeKind::ALL {
+            let n = footer_hints(view, kind).len();
+            assert!(n <= 7, "{view:?}/{kind:?}: {n} hints");
+        }
+    }
+}
+
+#[test]
+fn footer_keys_are_bold_and_their_actions_dim() {
+    let a = app();
+    let (_, key_mod) = cell_style(&a, "? help", "?");
+    assert!(key_mod.contains(Modifier::BOLD));
+    let (fg, _) = cell_style(&a, "? help", "help");
+    assert_eq!(fg, Color::DarkGray);
+}
+
+#[test]
+fn every_mode_has_a_footer_that_fits_100_columns() {
+    let mut comment = inbox_app();
+    comment.handle_key(code(KeyCode::Enter));
+    let mut help = app();
+    help.handle_key(key('?'));
+    let mut confirm = app();
+    for c in ['j', 'j', 'x'] {
+        confirm.handle_key(key(c));
+    }
+    let f = footer_line(&comment, 100);
+    assert!(f.contains("Esc close") && f.contains("j / k scroll"), "{f:?}");
+    for (name, a) in [
+        ("comment", comment),
+        ("help", help),
+        ("confirm", confirm),
+        ("input", typing_app()),
+    ] {
+        let f = footer_line(&a, 100);
+        assert!(!f.trim().is_empty(), "{name}: {f:?}");
+        assert!(!f.contains("q quit"), "{name}: q is not quit here: {f:?}");
+    }
+    let f = footer_line(&typing_app(), 100);
+    assert!(
+        f.contains("reply to asf-2") && f.contains("Ctrl+W del word"),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn question_mark_opens_the_help_view_and_nothing_else_is_bound_meanwhile() {
+    let mut a = app();
+    a.handle_key(key('2'));
+    assert_eq!(a.handle_key(key('?')), Action::None);
+    assert!(matches!(a.mode, Mode::Help { .. }));
+    for k in [
+        key('s'),
+        key('t'),
+        key('R'),
+        key('m'),
+        key('x'),
+        key('f'),
+        key('r'),
+        key('a'),
+        key('d'),
+        key('1'),
+        key('6'),
+        key('M'),
+        code(KeyCode::Enter),
+        code(KeyCode::Tab),
+        code(KeyCode::BackTab),
+    ] {
+        assert_eq!(a.handle_key(k), Action::None, "{k:?}");
+        assert!(
+            matches!(a.mode, Mode::Help { .. }),
+            "{k:?} must not leave the help view"
+        );
+        assert_eq!(a.view, View::Agents, "{k:?} must not change the view");
+    }
+    for closer in [code(KeyCode::Esc), key('?'), key('q')] {
+        let mut b = app();
+        b.handle_key(key('?'));
+        assert_eq!(
+            b.handle_key(closer),
+            Action::None,
+            "{closer:?} closes; q does not quit here"
+        );
+        assert!(matches!(b.mode, Mode::Normal), "{closer:?}");
+    }
+}
+
+#[test]
+fn help_lists_every_binding_in_plain_words_grouped_and_scrolls() {
+    let mut a = app();
+    a.handle_key(key('?'));
+    let t = render_to_text(&a, 100, 120);
+    let mut last = 0;
+    for g in [
+        "Global",
+        "Navigation",
+        "Board",
+        "Agents",
+        "Inbox",
+        "Queue",
+        "Config",
+        "Answer overlay",
+    ] {
+        let at = t
+            .find(&format!("\n {g}\n"))
+            .unwrap_or_else(|| panic!("no group heading {g}:\n{t}"));
+        assert!(at >= last, "groups are in order, {g}");
+        last = at;
+    }
+    for b in BINDINGS {
+        assert!(
+            b.help.chars().count() <= 62,
+            "keep help lines short: {:?}",
+            b.help
+        );
+        assert!(t.contains(b.key), "missing key {:?}:\n{t}", b.key);
+        assert!(t.contains(b.help), "missing help {:?}:\n{t}", b.help);
+    }
+    assert!(t.contains("mark this issue's messages as read"));
+    for needle in [
+        "answer a worker that waits",
+        "remove an optional key",
+        "send that number key",
+    ] {
+        assert!(t.contains(needle), "{needle}:\n{t}");
+    }
+    // on a short screen the tail is reached by scrolling
+    let short = render_to_text(&a, 100, 20);
+    assert!(!short.contains("send the typed reply"), "{short}");
+    for _ in 0..200 {
+        a.handle_key(key('j'));
+    }
+    let end = render_to_text(&a, 100, 20);
+    assert!(
+        end.contains("send the typed reply"),
+        "scrolled to the end:\n{end}"
+    );
+    a.handle_key(key('g'));
+    assert!(render_to_text(&a, 100, 20).contains("Global"));
+}
+
+#[test]
+fn tab_and_shift_tab_cycle_the_views_and_wrap() {
+    let mut a = app();
+    for expected in [
+        View::Agents,
+        View::Inbox,
+        View::Queue,
+        View::Log,
+        View::Config,
+        View::Board,
+    ] {
+        assert_eq!(a.handle_key(code(KeyCode::Tab)), Action::None);
+        assert_eq!(a.view, expected);
+    }
+    let back = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(a.handle_key(back), Action::None);
+    assert_eq!(a.view, View::Config, "Shift+Tab from the first view wraps");
+    a.handle_key(back);
+    assert_eq!(a.view, View::Log);
+    // some terminals send Tab + SHIFT instead of BackTab
+    a.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+    assert_eq!(a.view, View::Queue);
+}
+
+#[test]
+fn g_and_capital_g_jump_to_the_first_and_last_row() {
+    let mut a = app();
+    a.handle_key(key('G'));
+    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-1");
+    a.handle_key(key('g'));
+    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-4");
+    let mut c = app();
+    c.handle_key(key('6'));
+    c.handle_key(key('G'));
+    assert_eq!(c.selected(View::Config), c.rows(View::Config) - 1);
+    c.handle_key(key('g'));
+    assert_eq!(c.selected(View::Config), 0);
+    let mut empty = App::new(Snapshot::default());
+    empty.handle_key(key('G')); // no rows: no panic
+    empty.handle_key(key('g'));
+}
+
+#[test]
+fn escape_in_normal_mode_closes_the_board_detail_panel() {
+    let mut a = app();
+    assert!(a.detail);
+    assert!(render_to_text(&a, 100, 30).contains("┌ detail "));
+    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
+    assert!(!a.detail);
+    assert!(!render_to_text(&a, 100, 30).contains("┌ detail "));
+    a.handle_key(code(KeyCode::Enter));
+    assert!(a.detail, "Enter still toggles it back");
 }

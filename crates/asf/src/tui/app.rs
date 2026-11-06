@@ -1,10 +1,15 @@
 //! App state and key handling. Pure: no IO, no terminal, so every transition is unit-testable.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use asf_core::config_edit::editable_keys;
 use asf_core::*;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// How long a status message stays in the footer when no key is pressed.
+pub const STATUS_TTL: Duration = Duration::from_secs(4);
 
 /// Everything the TUI shows, loaded in one pass (`tui::load_snapshot`).
 #[derive(Debug, Clone, Default)]
@@ -156,7 +161,10 @@ pub enum Action {
     Keys(IssueId, Vec<String>),
     Enqueue(IssueId),
     Abort(IssueId),
+    /// Mark the human's unread comments on one issue as read.
     MarkRead(IssueId),
+    /// Mark the whole human inbox as read (confirmed with `y` first).
+    MarkAllRead,
     /// Write `value` to the dotted config `key` (`.factory/config.toml`).
     SetConfig(String, String),
     /// Remove the optional config `key` from `.factory/config.toml`.
@@ -191,6 +199,15 @@ pub enum Mode {
         screen: String,
         text: Option<String>,
     },
+    /// The Inbox modal with one comment in full, scrolled `scroll` lines down.
+    Comment {
+        comment: Comment,
+        scroll: u16,
+    },
+    /// The full-screen key reference.
+    Help {
+        scroll: u16,
+    },
 }
 
 /// Board columns, left to right: every status in `Status::ALL` order except `cancelled`, which is hidden.
@@ -207,8 +224,19 @@ pub struct App {
     pub mode: Mode,
     sel: BTreeMap<View, usize>,
     pub detail: bool,
+    /// Shown in the footer until [`STATUS_TTL`] passes (see [`App::advance`]) or the next key press.
     pub status: Option<String>,
     pub snap: Snapshot,
+    /// Label of the background action that is running (`tick`, `starting asf-25`); the header
+    /// spins next to it. The event loop sets and clears it; `handle_key` refuses a second request.
+    pub busy: Option<String>,
+    /// Time since the TUI started, as supplied by the event loop; the app never reads a clock.
+    pub clock: Duration,
+    /// The message the expiry timer is running for, and when it first appeared.
+    status_stamp: Option<(String, Duration)>,
+    /// Largest useful scroll of the open modal, written by the renderer (it alone knows the wrapped
+    /// height), read when scrolling so `j` cannot run past the end.
+    pub(crate) scroll_max: Cell<u16>,
 }
 
 impl App {
@@ -220,6 +248,29 @@ impl App {
             detail: true,
             status: None,
             snap,
+            busy: None,
+            clock: Duration::ZERO,
+            status_stamp: None,
+            scroll_max: Cell::new(u16::MAX),
+        }
+    }
+
+    /// Feeds the clock: expires a status message that has been on screen for [`STATUS_TTL`].
+    /// A message is stamped the first time it is seen here, so setting `status` needs no clock.
+    pub fn advance(&mut self, now: Duration) {
+        self.clock = now;
+        let Some(text) = &self.status else {
+            self.status_stamp = None;
+            return;
+        };
+        match &self.status_stamp {
+            Some((stamped, since)) if stamped == text => {
+                if now.saturating_sub(*since) >= STATUS_TTL {
+                    self.status = None;
+                    self.status_stamp = None;
+                }
+            }
+            _ => self.status_stamp = Some((text.clone(), now)),
         }
     }
 
@@ -340,14 +391,8 @@ impl App {
             return match key.code {
                 KeyCode::Esc => Action::None,
                 KeyCode::Enter if !buf.trim().is_empty() => Action::Reply(id, buf.trim().to_string()),
-                other => {
-                    match other {
-                        KeyCode::Backspace => {
-                            buf.pop();
-                        }
-                        KeyCode::Char(c) => buf.push(c),
-                        _ => {}
-                    }
+                _ => {
+                    edit_line(&mut buf, &key);
                     self.mode = Mode::Answer {
                         id,
                         screen,
@@ -358,6 +403,15 @@ impl App {
             };
         }
         match key.code {
+            // A chord is never an answer: Ctrl+3 must not send "3" to the worker.
+            _ if is_chord(&key) => {
+                self.mode = Mode::Answer {
+                    id,
+                    screen,
+                    text: None,
+                };
+                Action::None
+            }
             KeyCode::Esc => Action::None,
             KeyCode::Char(c @ '1'..='9') => keys(&c.to_string(), id.clone()),
             KeyCode::Char(c @ ('y' | 'n')) => keys(&c.to_string(), id.clone()),
@@ -383,7 +437,55 @@ impl App {
         }
     }
 
+    /// Jumps to the first (`last == false`) or last row of the current view.
+    fn jump(&mut self, last: bool) {
+        let n = self.rows(self.view);
+        if n > 0 {
+            self.sel.insert(self.view, if last { n - 1 } else { 0 });
+        }
+    }
+
+    /// Next (`step == 1`) or previous (`step == -1`) view, wrapping around.
+    fn cycle_view(&mut self, step: isize) {
+        let n = View::ALL.len() as isize;
+        let at = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0) as isize;
+        self.view = View::ALL[(at + step).rem_euclid(n) as usize];
+    }
+
+    /// New scroll offset after `key` in a scrollable modal, or `None` when the key does not scroll.
+    fn scrolled(&self, key: &KeyEvent, scroll: u16) -> Option<u16> {
+        if is_chord(key) {
+            return None;
+        }
+        let max = self.scroll_max.get();
+        Some(match key.code {
+            KeyCode::Char('j') | KeyCode::Down => scroll.saturating_add(1).min(max),
+            KeyCode::Char('k') | KeyCode::Up => scroll.saturating_sub(1),
+            KeyCode::PageDown => scroll.saturating_add(10).min(max),
+            KeyCode::PageUp => scroll.saturating_sub(10),
+            KeyCode::Char('g') | KeyCode::Home => 0,
+            KeyCode::Char('G') | KeyCode::End => max,
+            _ => return None,
+        })
+    }
+
+    /// A background action may only start when none runs; otherwise the status says which one does.
+    fn busy_refusal(&mut self) -> bool {
+        match &self.busy {
+            Some(label) => {
+                self.status = Some(format!("busy: {label}"));
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        // Any key press retires the status message; a key that has news sets a new one below.
+        self.status = None;
+        if is_ctrl_c(&key) {
+            return Action::Quit;
+        }
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Input {
                 prompt,
@@ -403,17 +505,8 @@ impl App {
                             }
                         }
                     }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                        self.mode = Mode::Input { prompt, buf, target };
-                        Action::None
-                    }
-                    KeyCode::Char(c) => {
-                        buf.push(c);
-                        self.mode = Mode::Input { prompt, buf, target };
-                        Action::None
-                    }
                     _ => {
+                        edit_line(&mut buf, &key);
                         self.mode = Mode::Input { prompt, buf, target };
                         Action::None
                     }
@@ -421,19 +514,57 @@ impl App {
             }
             Mode::Confirm { action, .. } => {
                 return match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => *action,
+                    KeyCode::Char('y') | KeyCode::Char('Y') if !is_chord(&key) => *action,
                     _ => Action::None,
                 };
             }
             Mode::Answer { id, screen, text } => return self.handle_answer_key(key, id, screen, text),
+            Mode::Comment { comment, scroll } => {
+                if key.code != KeyCode::Esc || is_chord(&key) {
+                    let scroll = self.scrolled(&key, scroll).unwrap_or(scroll);
+                    self.mode = Mode::Comment { comment, scroll };
+                }
+                return Action::None;
+            }
+            Mode::Help { scroll } => {
+                let closes = matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) && !is_chord(&key);
+                if !closes {
+                    let scroll = self.scrolled(&key, scroll).unwrap_or(scroll);
+                    self.mode = Mode::Help { scroll };
+                }
+                return Action::None;
+            }
             Mode::Normal => {}
+        }
+        // Ctrl/Alt chords are not bindings (and never text); Ctrl+C was handled above.
+        if is_chord(&key) {
+            return Action::None;
         }
         match key.code {
             KeyCode::Char('q') => Action::Quit,
+            KeyCode::Char('?') => {
+                self.scroll_max.set(u16::MAX);
+                self.mode = Mode::Help { scroll: 0 };
+                Action::None
+            }
             KeyCode::Char('R') => Action::Refresh,
-            KeyCode::Char('t') => Action::Tick,
+            KeyCode::Char('t') => {
+                if self.busy_refusal() {
+                    Action::None
+                } else {
+                    Action::Tick
+                }
+            }
             KeyCode::Char(c @ '1'..='6') => {
                 self.view = View::ALL[(c as u8 - b'1') as usize];
+                Action::None
+            }
+            KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.cycle_view(1);
+                Action::None
+            }
+            KeyCode::BackTab | KeyCode::Tab => {
+                self.cycle_view(-1);
                 Action::None
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -444,8 +575,43 @@ impl App {
                 self.move_sel(-1);
                 Action::None
             }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.jump(false);
+                Action::None
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.jump(true);
+                Action::None
+            }
+            KeyCode::Esc => {
+                if self.view == View::Board {
+                    self.detail = false;
+                }
+                Action::None
+            }
+            KeyCode::Char('m') if self.view == View::Inbox => self
+                .selected_issue()
+                .cloned()
+                .map(Action::MarkRead)
+                .unwrap_or(Action::None),
+            KeyCode::Char('M') if self.view == View::Inbox => {
+                let n = self.snap.inbox.len();
+                if n > 0 {
+                    self.mode = Mode::Confirm {
+                        what: format!("mark all {n} read?"),
+                        action: Box::new(Action::MarkAllRead),
+                    };
+                }
+                Action::None
+            }
             KeyCode::Enter => match (self.view, self.selected_issue().cloned()) {
-                (View::Inbox, Some(id)) => Action::MarkRead(id),
+                (View::Inbox, Some(_)) => {
+                    if let Some(comment) = self.snap.inbox.get(self.selected(View::Inbox)).cloned() {
+                        self.scroll_max.set(u16::MAX);
+                        self.mode = Mode::Comment { comment, scroll: 0 };
+                    }
+                    Action::None
+                }
                 (View::Config, _) => {
                     if let Some(row) = self.snap.config.get(self.selected(View::Config)) {
                         self.mode = Mode::Input {
@@ -456,13 +622,15 @@ impl App {
                     }
                     Action::None
                 }
-                _ => {
+                (View::Board, _) => {
                     self.detail = !self.detail;
                     Action::None
                 }
+                _ => Action::None,
             },
             KeyCode::Char('s') => match self.selected_issue().cloned() {
                 Some(id) => match self.issue(&id).map(|i| i.status) {
+                    Some(Status::Ready) if self.busy_refusal() => Action::None,
                     Some(Status::Ready) => Action::Start(id),
                     Some(st) => {
                         self.status = Some(format!("{id} is {st}; only ready issues can be started"));
@@ -541,5 +709,45 @@ impl App {
             }
             _ => Action::None,
         }
+    }
+}
+
+/// Ctrl+C (and only that, not the AltGr Ctrl+Alt+C of a Polish layout).
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+}
+
+/// A Ctrl or Alt chord: never text, never a plain binding.
+fn is_chord(key: &KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+/// Deletes the last word and the blanks after it, like readline's Ctrl+W.
+fn delete_word(buf: &mut String) {
+    while buf.ends_with(char::is_whitespace) {
+        buf.pop();
+    }
+    while buf.chars().last().is_some_and(|c| !c.is_whitespace()) {
+        buf.pop();
+    }
+}
+
+/// Applies one key to a single-line text buffer. Ctrl+U clears, Ctrl+W deletes a word, and a
+/// Ctrl or Alt chord never inserts its character. The one exception is Ctrl+Alt together: Windows
+/// reports AltGr (Polish ą ę ł ó ...) that way, and that is text.
+fn edit_line(buf: &mut String, key: &KeyEvent) {
+    let m = key.modifiers;
+    let (ctrl, alt) = (m.contains(KeyModifiers::CONTROL), m.contains(KeyModifiers::ALT));
+    match key.code {
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char('u') if ctrl && !alt => buf.clear(),
+        KeyCode::Char('w') if ctrl && !alt => delete_word(buf),
+        KeyCode::Char(c) if (!ctrl && !alt) || (ctrl && alt) => buf.push(c),
+        _ => {}
     }
 }

@@ -1,5 +1,7 @@
 //! Rendering of an `App` into a ratatui `Frame`. Pure function of the state; tested with `TestBackend`.
 
+use std::time::Duration;
+
 use asf_core::*;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -10,6 +12,7 @@ use ratatui::widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph,
 use ratatui::{Frame, Terminal};
 
 use super::app::{board_columns, App, Mode, View, Waiting};
+use super::keys::{footer_hints, help_lines, HelpLine, ModeKind};
 
 /// Style of a waiting marker and of the row it sits on: bold red, never colour alone (the symbol differs too).
 fn blocked_style() -> Style {
@@ -53,7 +56,21 @@ fn header_line(app: &App) -> Line<'static> {
             Style::default().cyan().bold(),
         ));
     }
+    if let Some(label) = &app.busy {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            format!("{} {label}…", spinner(app.clock)),
+            Style::default().cyan().bold(),
+        ));
+    }
     Line::from(spans)
+}
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The braille spinner frame for the app clock: one frame per 100 ms.
+fn spinner(clock: Duration) -> char {
+    SPINNER[(clock.as_millis() / 100) as usize % SPINNER.len()]
 }
 
 /// The one-line banner naming the oldest waiter, cut to `width` with ` (+K more)` always kept.
@@ -98,17 +115,38 @@ fn tabs(app: &App) -> Tabs<'static> {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
 }
 
+/// `key action` pairs, the key bold and the action dim, two blanks apart.
+fn hint_spans(view: View, kind: ModeKind) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, h) in footer_hints(view, kind).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(h.key, Style::default().bold()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(h.label, Style::default().dark_gray()));
+    }
+    spans
+}
+
 fn footer(app: &App) -> Paragraph<'static> {
-    let text = match &app.mode {
-        Mode::Input { prompt, buf, .. } => format!(" {prompt}: {buf}▏  (Enter send · Esc cancel)"),
-        Mode::Confirm { what, .. } => format!(" {what} (y/n)"),
-        Mode::Answer { id, .. } => format!(" answering {id}"),
+    let kind = app.mode.kind();
+    let lead = |text: String| {
+        let mut spans = vec![Span::raw(text)];
+        spans.extend(hint_spans(app.view, kind));
+        Line::from(spans)
+    };
+    let line = match &app.mode {
+        Mode::Input { prompt, buf, .. } => lead(format!(" {prompt}: {buf}▏  ")),
+        Mode::Confirm { what, .. } => lead(format!(" {what}  ")),
+        Mode::Answer { id, .. } => Line::from(format!(" answering {id}")),
+        Mode::Comment { .. } | Mode::Help { .. } => lead(" ".into()),
         Mode::Normal => match &app.status {
-            Some(s) => format!(" {s}"),
-            None => " 1-6 views · j/k move · Enter detail · s start · f focus · r reply · a answer · d unset · m merge · x abort · t tick · R refresh · q quit".into(),
+            Some(s) => Line::from(format!(" {s}")),
+            None => lead(" ".into()),
         },
     };
-    Paragraph::new(text)
+    Paragraph::new(line)
 }
 
 fn board(frame: &mut Frame, app: &App, area: Rect) {
@@ -288,7 +326,7 @@ fn inbox(frame: &mut Frame, app: &App, area: Rect) {
     st.select(Some(app.selected(View::Inbox)));
     let list = List::new(items)
         .block(Block::bordered().title(format!(
-            " inbox (human) {} unread · Enter = mark read ",
+            " inbox (human) {} unread · Enter open · m mark read · M mark all ",
             app.snap.inbox.len()
         )))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -417,10 +455,124 @@ pub fn render(frame: &mut Frame, app: &App) {
     if show_detail {
         detail(frame, app, rows[next + 1]);
     }
-    frame.render_widget(footer(app), rows[rows.len() - 1]);
-    if let Mode::Answer { id, screen, text } = &app.mode {
-        answer_overlay(frame, area, id, screen, text.as_deref());
+    // Overlays leave the footer row alone so the hints stay visible under them.
+    let above_footer = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    match &app.mode {
+        Mode::Answer { id, screen, text } => {
+            answer_overlay(frame, area, id, screen, text.as_deref());
+        }
+        Mode::Comment { comment, scroll } => comment_modal(frame, above_footer, app, comment, *scroll),
+        Mode::Help { scroll } => help_view(frame, above_footer, app, *scroll),
+        _ => {}
     }
+    frame.render_widget(footer(app), rows[rows.len() - 1]);
+}
+
+/// Greedy word wrap to `width` columns, so the scroll range is known exactly. Blank lines survive,
+/// leading indentation is kept, and a word longer than a line is split.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        if raw.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let indent = (raw.len() - raw.trim_start().len()).min(width / 2);
+        let mut cur = " ".repeat(indent);
+        let mut cur_len = indent;
+        let mut fresh = true; // no word on this line yet
+        for word in raw.split_whitespace() {
+            let chars: Vec<char> = word.chars().collect();
+            for piece in chars.chunks(width) {
+                let pl = piece.len();
+                if !fresh && cur_len + 1 + pl > width {
+                    out.push(std::mem::replace(&mut cur, " ".repeat(indent)));
+                    cur_len = indent;
+                    fresh = true;
+                }
+                if fresh && cur_len + pl > width {
+                    cur.clear(); // a full-width piece leaves no room for the indent
+                    cur_len = 0;
+                }
+                if !fresh {
+                    cur.push(' ');
+                    cur_len += 1;
+                }
+                cur.extend(piece);
+                cur_len += pl;
+                fresh = false;
+            }
+        }
+        if !fresh {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+/// Offset of the first visible line, clamped to the scrollable range; publishes the range to the
+/// app so that `j` stops at the end.
+fn clamp_scroll(app: &App, total: usize, visible: usize, scroll: u16) -> usize {
+    let max = total.saturating_sub(visible).min(u16::MAX as usize);
+    app.scroll_max.set(max as u16);
+    (scroll as usize).min(max)
+}
+
+/// The Inbox modal: header line fixed on top, the wrapped body scrolling below it.
+fn comment_modal(frame: &mut Frame, area: Rect, app: &App, c: &Comment, scroll: u16) {
+    let popup = area.centered(Constraint::Percentage(80), Constraint::Percentage(80));
+    let block = Block::bordered()
+        .title(" comment ")
+        .title_bottom(" j/k scroll · Esc close (nothing is marked read) ")
+        .border_style(Style::default().yellow().bold());
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let [head, _gap, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let header = format!(
+        "#{} {} [{}] {} -> {}",
+        c.id, c.issue_id, c.author, c.kind, c.to_lane
+    );
+    frame.render_widget(Paragraph::new(Line::from(header).bold()), head);
+    let lines = wrap_text(&c.body, body.width as usize);
+    let top = clamp_scroll(app, lines.len(), body.height as usize, scroll);
+    let shown: Vec<Line> = lines
+        .into_iter()
+        .skip(top)
+        .take(body.height as usize)
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Paragraph::new(shown), body);
+}
+
+/// The full-screen key reference, generated from the binding table.
+fn help_view(frame: &mut Frame, area: Rect, app: &App, scroll: u16) {
+    frame.render_widget(Clear, area);
+    let [title, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(" Keys · j/k scroll · Esc, ? or q close")
+            .style(Style::default().add_modifier(Modifier::REVERSED)),
+        title,
+    );
+    let lines: Vec<Line> = help_lines()
+        .into_iter()
+        .map(|l| match l {
+            HelpLine::Heading(g) => Line::styled(format!(" {g}"), Style::default().cyan().bold()),
+            HelpLine::Item { key, help } => Line::from(vec![
+                Span::styled(format!("  {key:<20}"), Style::default().bold()),
+                Span::raw(help),
+            ]),
+            HelpLine::Blank => Line::raw(""),
+        })
+        .collect();
+    let top = clamp_scroll(app, lines.len(), body.height as usize, scroll);
+    let shown: Vec<Line> = lines.into_iter().skip(top).take(body.height as usize).collect();
+    frame.render_widget(Paragraph::new(shown), body);
 }
 
 /// The centred answer modal: the last lines of the worker pane, with the key hints (or the reply

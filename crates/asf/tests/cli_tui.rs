@@ -176,3 +176,74 @@ fn tui_once_banner_shows_in_other_views_too() {
         );
     }
 }
+
+#[test]
+fn tui_once_shows_the_contextual_footer_for_each_view() {
+    let repo = fake_repo();
+    let board = tui_once_text(&repo);
+    let footer = board.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+    assert!(
+        footer.contains("s start") && footer.contains("? help  q quit"),
+        "{board}"
+    );
+    let out = repo
+        .asf()
+        .args(["tui", "--once", "--view", "config"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let footer = text.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+    assert!(
+        footer.contains("d unset") && !footer.contains("s start"),
+        "{text}"
+    );
+    assert!(footer.trim_end().ends_with("? help  q quit"), "{text}");
+}
+
+/// Runs `asf --repo <root> <args> --json` from an unrelated directory, as the TUI's children do.
+fn child_envelope(repo: &Repo, args: &[&str]) -> (serde_json::Value, i32) {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let root = repo.path().to_str().unwrap();
+    let out = repo
+        .asf_in(elsewhere.path())
+        .args(["--repo", root])
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("not json: {e}\n{stdout}"));
+    (v, out.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn the_background_children_print_the_envelopes_the_tui_summarises() {
+    let repo = fake_repo();
+    let a = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
+
+    let (tick, code) = child_envelope(&repo, &["serve", "--once"]);
+    assert_eq!(code, 0, "{tick}");
+    assert_eq!(tick["ok"], true, "{tick}");
+    for path in [
+        &tick["result"]["watch"]["transitions"],
+        &tick["result"]["merge"]["items"],
+        &tick["result"]["promoted"],
+        &tick["result"]["closed_epics"],
+    ] {
+        assert!(path.is_array(), "the TUI counts these arrays: {tick}");
+    }
+
+    let (start, code) = child_envelope(&repo, &["run", "start", &a]);
+    assert_eq!(code, 0, "{start}");
+    assert_eq!(start["result"]["run"]["issue_id"], a.as_str(), "{start}");
+    assert!(start["result"]["workspace_id"].is_string() && start["result"]["pane_id"].is_string());
+
+    // a second start is refused with an envelope the TUI shows as `✗ <message>`
+    let (again, code) = child_envelope(&repo, &["run", "start", &a]);
+    assert_ne!(code, 0);
+    assert_eq!(again["ok"], false, "{again}");
+    assert!(
+        again["error"]["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{again}"
+    );
+}
