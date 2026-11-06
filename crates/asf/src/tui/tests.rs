@@ -1932,13 +1932,13 @@ fn every_needs_you_source_has_its_row_with_label_first_line_age_and_key() {
             "a answer",
         ),
         ("asf-3", "failed", "gate `test` failed", "40 min", "v verify"),
-        ("asf-4", "stalled", "no output for 10 minutes", "1 h", "v verify"),
+        ("asf-4", "stalled", "no output for 10 minutes", "1 h", "a answer"),
         (
             "asf-5",
             "over_budget",
             "no exit reason recorded",
             "2 h",
-            "v verify",
+            "x abort",
         ),
         (
             "asf-6",
@@ -2413,20 +2413,49 @@ fn a_answers_a_blocked_worker_with_the_overlay_and_a_question_with_a_typed_answe
 }
 
 #[test]
-fn v_reruns_verification_of_a_failed_stalled_or_over_budget_run_in_the_background() {
-    for issue in ["asf-3", "asf-4", "asf-5"] {
-        let mut a = App::new(busy_desk());
-        select_need(&mut a, issue);
-        assert_eq!(a.handle_key(key('v')), Action::Verify(id(issue)), "{issue}");
-    }
+fn a_answers_a_stalled_worker_with_the_overlay_because_a_reply_moves_it_back_to_working() {
     let mut a = App::new(busy_desk());
-    for issue in ["asf-1", "asf-2", "asf-6"] {
+    select_need(&mut a, "asf-4");
+    assert_eq!(a.handle_key(key('a')), Action::Peek(id("asf-4")));
+    assert!(matches!(&a.mode, Mode::Answer { id: i, .. } if *i == id("asf-4")));
+    // the over-budget row does not take `a`: it says which key it does take
+    a.handle_key(code(KeyCode::Esc));
+    select_need(&mut a, "asf-5");
+    assert_eq!(a.handle_key(key('a')), Action::None);
+    assert!(matches!(a.mode, Mode::Normal));
+    assert!(
+        a.status.as_deref().unwrap_or("").contains("x abort"),
+        "{:?}",
+        a.status
+    );
+}
+
+#[test]
+fn v_reruns_verification_of_a_failed_run_in_the_background_and_of_nothing_else() {
+    let mut a = App::new(busy_desk());
+    select_need(&mut a, "asf-3");
+    assert_eq!(a.handle_key(key('v')), Action::Verify(id("asf-3")));
+    // `asf run verify` refuses a stalled or over-budget run (worker still active), so `v` never
+    // hands it one; the status names the key the row does take
+    for (issue, key_hint) in [
+        ("asf-4", "a answer"),
+        ("asf-5", "x abort"),
+        ("asf-1", "a answer"),
+        ("asf-2", "a answer"),
+        ("asf-6", "r retry"),
+    ] {
+        let mut a = App::new(busy_desk());
         select_need(&mut a, issue);
         assert_eq!(a.handle_key(key('v')), Action::None, "{issue}");
         let status = a.status.clone().unwrap_or_default();
-        assert!(status.starts_with(&format!("{issue}: v verifies")), "{status}");
+        assert!(
+            status.starts_with(&format!("{issue}: v verifies a failed run")),
+            "{status}"
+        );
+        assert!(status.contains(key_hint), "{issue}: {status}");
         assert!(matches!(a.mode, Mode::Normal));
     }
+    let mut a = App::new(busy_desk());
     // one background action at a time, like tick and start
     select_need(&mut a, "asf-3");
     a.busy = Some("tick".into());
@@ -2460,6 +2489,107 @@ fn r_requeues_a_failed_or_blocked_merge_item_in_the_background_and_never_opens_a
     a.busy = Some("verifying asf-3".into());
     assert_eq!(a.handle_key(key('r')), Action::None);
     assert_eq!(a.status.as_deref(), Some("busy: verifying asf-3"));
+}
+
+#[test]
+fn x_asks_before_aborting_an_over_budget_run_and_is_refused_on_every_other_row() {
+    let mut a = App::new(busy_desk());
+    select_need(&mut a, "asf-5");
+    assert_eq!(a.handle_key(key('x')), Action::None);
+    assert!(
+        matches!(&a.mode, Mode::Confirm { what, .. } if what == "abort asf-5?"),
+        "{:?}",
+        a.mode
+    );
+    // anything but `y` cancels; `y` aborts
+    assert_eq!(a.handle_key(key('n')), Action::None);
+    select_need(&mut a, "asf-5");
+    a.handle_key(key('x'));
+    assert_eq!(a.handle_key(key('y')), Action::Abort(id("asf-5")));
+
+    for issue in ["asf-1", "asf-2", "asf-3", "asf-4", "asf-6"] {
+        let mut a = App::new(busy_desk());
+        select_need(&mut a, issue);
+        assert_eq!(a.handle_key(key('x')), Action::None, "{issue}");
+        assert!(matches!(a.mode, Mode::Normal), "{issue}: {:?}", a.mode);
+        let status = a.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with(&format!("{issue}: x aborts an over-budget run")),
+            "{status}"
+        );
+    }
+    // a running worker is not a NEEDS YOU row
+    let mut r = App::new(full_desk());
+    r.handle_key(key('G'));
+    assert_eq!(r.handle_key(key('x')), Action::None);
+    assert!(matches!(r.mode, Mode::Normal));
+}
+
+/// The states each command behind a NEEDS YOU key accepts, copied from the commands themselves:
+/// `Worker::verify_issue` (`worker.rs`), `Worker::abort` and the `reply`/`keys` unblock path.
+fn accepted_by_the_command(act: now::Act, state: RunState) -> bool {
+    match act {
+        now::Act::Verify => matches!(
+            state,
+            RunState::Failed | RunState::Finishing | RunState::Verifying
+        ),
+        now::Act::Abort => !state.is_terminal(),
+        now::Act::Answer => matches!(state, RunState::Blocked | RunState::Stalled),
+        now::Act::Retry => false, // merge items, not runs
+    }
+}
+
+#[test]
+fn the_key_on_a_needs_you_row_is_never_one_the_command_behind_it_refuses() {
+    use RunState::*;
+    let states = [
+        Starting, Working, Blocked, Stalled, OverBudget, Finishing, Verifying, Succeeded, Failed, Aborted,
+    ];
+    let mut listed = Vec::new();
+    for state in states {
+        let mut s = desk(live(&["asf-1"]));
+        let mut r = run_at("asf-1", state, "2026-11-06T11:00:00Z");
+        r.exit_reason = Some("why".into());
+        if state == Failed {
+            s.failed_runs.push(r); // a failed run is not active
+        } else {
+            s.runs.push(r);
+        }
+        let Some(need) = now::needs(&s).into_iter().next() else {
+            continue;
+        };
+        listed.push(state);
+        assert!(
+            accepted_by_the_command(need.act, state),
+            "{state:?}: the row advertises `{}` but its command refuses that state",
+            need.act.hint()
+        );
+        // and pressing it does something: an action, an overlay or a confirmation
+        let mut a = App::new(s);
+        let action = a.handle_key(key(need.act.key()));
+        let did_something = action != Action::None || !matches!(a.mode, Mode::Normal);
+        assert!(did_something, "{state:?}: `{}` did nothing", need.act.hint());
+        assert!(a.status.is_none(), "{state:?}: {:?}", a.status);
+    }
+    // the states that need the human, nothing more and nothing less
+    assert_eq!(listed, [Blocked, Stalled, OverBudget, Failed]);
+}
+
+#[test]
+fn the_keys_of_each_run_state_are_verify_for_failed_answer_for_stalled_abort_for_over_budget() {
+    let acts: Vec<(String, now::Act)> = now::needs(&busy_desk())
+        .into_iter()
+        .filter(|n| matches!(n.source, now::NeedSource::Run(_)))
+        .map(|n| (n.label, n.act))
+        .collect();
+    assert_eq!(
+        acts,
+        [
+            ("over_budget".to_string(), now::Act::Abort),
+            ("stalled".to_string(), now::Act::Answer),
+            ("failed".to_string(), now::Act::Verify),
+        ]
+    );
 }
 
 #[test]
@@ -2602,13 +2732,18 @@ fn the_banner_is_for_the_other_views_the_footer_and_help_know_the_new_view() {
         f.trim(),
         "j / k move  a answer  f focus pane  Enter open issue  Tab next view  ? help  q quit"
     );
-    // v and r are in the help view, in a group of their own
+    // v, r and x are in the help view, in a group of their own
     a.handle_key(key('?'));
     let help = render_to_text(&a, 100, 150);
+    assert!(
+        !help.contains("stalled or over-budget"),
+        "v is for failed runs only:\n{help}"
+    );
     for needle in [
         "\n Now\n",
-        "rerun verification of a failed",
+        "rerun verification of a failed run",
         "re-queue a failed or blocked merge item",
+        "abort an over-budget worker (asks first)",
         "jump to a view: Now, Board, Agents, Inbox, Queue, Log, Config",
     ] {
         assert!(help.contains(needle), "{needle:?}:\n{help}");

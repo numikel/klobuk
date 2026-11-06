@@ -396,7 +396,16 @@ pub const BINDINGS: &[Binding] = &[
     b(
         "v",
         "verify",
-        "rerun verification of a failed, stalled or over-budget run",
+        "rerun verification of a failed run",
+        Group::Now,
+        NOW,
+        NORMAL,
+        Slot::None,
+    ),
+    b(
+        "x",
+        "abort",
+        "abort an over-budget worker (asks first)",
         Group::Now,
         NOW,
         NORMAL,

@@ -28,12 +28,14 @@ const UP_NEXT_IDS: usize = 3;
 /// The one key that acts on a NEEDS YOU row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
-    /// `a`: the answer overlay (blocked worker) or a typed answer (QUESTION comment).
+    /// `a`: the answer overlay (blocked or stalled worker) or a typed answer (QUESTION comment).
     Answer,
-    /// `v`: rerun verification of the run.
+    /// `v`: rerun verification of a failed run.
     Verify,
     /// `r`: re-queue the merge item.
     Retry,
+    /// `x`: abort an over-budget worker (after a confirmation).
+    Abort,
 }
 
 impl Act {
@@ -42,6 +44,7 @@ impl Act {
             Act::Answer => 'a',
             Act::Verify => 'v',
             Act::Retry => 'r',
+            Act::Abort => 'x',
         }
     }
 
@@ -50,6 +53,7 @@ impl Act {
             Act::Answer => "answer",
             Act::Verify => "verify",
             Act::Retry => "retry",
+            Act::Abort => "abort",
         }
     }
 
@@ -191,13 +195,21 @@ pub fn needs(snap: &Snapshot) -> Vec<Need> {
                     act: Act::Answer,
                 });
             }
+            // The key on a row is one that the command behind it accepts for that state:
+            // `asf run verify` refuses a worker that is still active (stalled, over budget),
+            // a reply moves a stalled run back to working, and `asf run abort` takes any
+            // run that is not finished.
             RunState::Failed | RunState::Stalled | RunState::OverBudget => out.push(Need {
                 issue: run.issue_id.clone(),
                 source: NeedSource::Run(run.state),
                 label: run.state.to_string(),
                 text: reason(),
                 since: state_since(snap, run),
-                act: Act::Verify,
+                act: match run.state {
+                    RunState::Failed => Act::Verify,
+                    RunState::Stalled => Act::Answer,
+                    _ => Act::Abort,
+                },
             }),
             _ => {}
         }

@@ -436,11 +436,12 @@ impl App {
         self.view = View::Board;
     }
 
-    /// `a` on the Now view: a blocked worker gets the answer overlay, a QUESTION comment a typed answer.
+    /// `a` on the Now view: a blocked or stalled worker gets the answer overlay (a reply moves a
+    /// stalled run back to working), a QUESTION comment a typed answer.
     fn now_answer(&mut self) -> Action {
         match self.selected_now_row() {
             Some(NowRow::Need(n)) => match n.source {
-                NeedSource::BlockedRun => {
+                NeedSource::BlockedRun | NeedSource::Run(RunState::Stalled) => {
                     self.mode = Mode::Answer {
                         id: n.issue.clone(),
                         screen: String::new(),
@@ -473,10 +474,11 @@ impl App {
         }
     }
 
-    /// `v` on the Now view: rerun verification of a failed, stalled or over-budget run.
+    /// `v` on the Now view: rerun verification of a failed run. `asf run verify` refuses a worker
+    /// that is still active (stalled, over budget), so those rows never get here.
     fn now_verify(&mut self) -> Action {
         match self.selected_now_row() {
-            Some(NowRow::Need(n)) if matches!(n.source, NeedSource::Run(_)) => {
+            Some(NowRow::Need(n)) if n.source == NeedSource::Run(RunState::Failed) => {
                 if self.busy_refusal() {
                     Action::None
                 } else {
@@ -485,7 +487,29 @@ impl App {
             }
             Some(row) => {
                 self.status = Some(format!(
-                    "{}: v verifies a failed, stalled or over-budget run; {}",
+                    "{}: v verifies a failed run; {}",
+                    row.issue(),
+                    row.advice()
+                ));
+                Action::None
+            }
+            None => Action::None,
+        }
+    }
+
+    /// `x` on the Now view: abort an over-budget worker, after a confirmation (the Board's `x`).
+    fn now_abort(&mut self) -> Action {
+        match self.selected_now_row() {
+            Some(NowRow::Need(n)) if n.source == NeedSource::Run(RunState::OverBudget) => {
+                self.mode = Mode::Confirm {
+                    what: format!("abort {}?", n.issue),
+                    action: Box::new(Action::Abort(n.issue)),
+                };
+                Action::None
+            }
+            Some(row) => {
+                self.status = Some(format!(
+                    "{}: x aborts an over-budget run; {}",
                     row.issue(),
                     row.advice()
                 ));
@@ -773,6 +797,7 @@ impl App {
             KeyCode::Char('a') if self.view == View::Now => self.now_answer(),
             KeyCode::Char('v') if self.view == View::Now => self.now_verify(),
             KeyCode::Char('r') if self.view == View::Now => self.now_retry(),
+            KeyCode::Char('x') if self.view == View::Now => self.now_abort(),
             KeyCode::Char('f') if self.view == View::Now => self
                 .selected_now_issue()
                 .map(Action::Focus)
