@@ -155,13 +155,48 @@ fn review_brief_lists_the_gate_commands() {
 #[test]
 fn review_brief_states_the_single_final_decision_rule() {
     let b = review_brief();
-    assert!(
-        b.contains("D:/bin/asf.exe issue comment asf-9 --type DECISION --to human"),
-        "{b}"
-    );
     assert!(b.contains("exactly one DECISION"), "{b}");
     assert!(b.contains("`approve`"), "{b}");
     assert!(b.contains("`changes:`"), "{b}");
+}
+
+#[test]
+fn review_brief_verdict_command_addresses_the_reviewed_issue() {
+    let b = review_brief();
+    assert!(
+        b.contains("D:/bin/asf.exe issue comment asf-9 --type DECISION --to asf-9 --body \"approve\""),
+        "{b}"
+    );
+    assert!(b.contains("--body \"changes:"), "{b}");
+    for wrong in ["--to human", "--to orchestrator"] {
+        assert!(
+            !b.contains(wrong),
+            "verdict must not be addressed with {wrong:?}:\n{b}"
+        );
+    }
+}
+
+#[test]
+fn review_brief_says_the_full_gates_already_passed_and_must_not_be_rerun() {
+    let b = review_brief();
+    assert!(
+        b.contains("already passed in the merge queue on this commit"),
+        "{b}"
+    );
+    assert!(b.contains("after the rebase"), "{b}");
+    assert!(b.contains("Do not rerun the whole suite"), "{b}");
+    assert!(b.contains("read the diff"), "{b}");
+    assert!(!b.contains("Run the gates from the worktree"), "{b}");
+}
+
+#[test]
+fn review_brief_asks_for_targeted_commands_and_naming_them_in_the_verdict() {
+    let b = review_brief();
+    assert!(b.contains("targeted"), "{b}");
+    assert!(b.contains("a single test"), "{b}");
+    assert!(b.contains("one test file"), "{b}");
+    assert!(b.contains("one package"), "{b}");
+    assert!(b.contains("name in the verdict"), "{b}");
 }
 
 #[test]

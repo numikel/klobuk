@@ -149,7 +149,8 @@ pub struct ReviewInput<'a> {
     pub base_sha: &'a str,
     pub worktree: &'a str,
     pub branch: &'a str,
-    /// Gate commands (fmt, clippy, tests, ...) the reviewer runs verbatim.
+    /// Gate commands (fmt, clippy, tests, ...) that already passed in the merge queue on this
+    /// commit; listed so the reviewer knows what not to rerun.
     pub gates: &'a [String],
     pub asf_bin: &'a str,
 }
@@ -202,10 +203,7 @@ and never change git state. Your only write is the final DECISION comment below.
     let _ = writeln!(
         out,
         "\n## Review steps\n\n\
-1. Read the change: `git diff {base}...HEAD` (base_sha is `{base}`), plus `git log {base}..HEAD`.\n\
-2. Check every acceptance criterion above against the diff and, where a `verify` command is given, by running it.\n\
-3. Run the gates from the worktree and record which passed:",
-        base = r.base_sha
+The full gates already passed in the merge queue on this commit after the rebase:"
     );
     if r.gates.is_empty() {
         let _ = writeln!(out, "   - (no gates configured)");
@@ -215,15 +213,27 @@ and never change git state. Your only write is the final DECISION comment below.
     }
     let _ = writeln!(
         out,
-        "4. Look for what the criteria do not cover: out-of-scope files, missing tests, wrong error handling, \
+        "\nDo not rerun the whole suite, and do not rebuild the project just to re-check formatting or lints. \
+Your job is to read the diff against the issue text and every acceptance criterion.\n\n\
+1. Read the change: `git diff {base}...HEAD` (base_sha is `{base}`), plus `git log {base}..HEAD`.\n\
+2. Check every acceptance criterion above against the diff. Run only targeted commands, and only to prove a criterion \
+or probe a suspicion: a single test, one test file or one package (a given `verify` command counts when it is \
+targeted). Anything wider than that is a rerun of the gates.\n\
+3. Look for what the criteria do not cover: out-of-scope files, missing tests, wrong error handling, \
 regressions of existing behaviour.\n\
+4. Remember to name in the verdict every command you ran, on the lines after the first one.\n\
 \n## Verdict\n\n\
-Finish by posting exactly one DECISION comment as the last thing you do:\n\n\
-`{asf} issue comment {id} --type DECISION --to human --body \"...\"`\n\n\
+Finish by posting exactly one DECISION comment as the last thing you do. It is addressed to the reviewed issue \
+`{id}`:\n\n\
+`{asf} issue comment {id} --type DECISION --to {id} --body \"approve\"`\n\n\
+or, with findings:\n\n\
+`{asf} issue comment {id} --type DECISION --to {id} --body \"changes: ...\"`\n\n\
 The first line of the body is the verdict, matched case-insensitively:\n\n\
-- `approve` — every criterion holds and every gate is green. Nothing else is needed.\n\
-- `changes:` — followed by one bullet (`- ...`) per concrete finding the author must fix, each naming the file or criterion.\n\n\
+- `approve` — every criterion holds and you found nothing to fix. Add the targeted commands you ran on the following lines.\n\
+- `changes:` — followed by one bullet (`- ...`) per concrete finding the author must fix, each naming the file or \
+criterion, then the targeted commands you ran.\n\n\
 Post exactly one DECISION comment. Any other first line is treated as no verdict.\n",
+        base = r.base_sha,
         asf = r.asf_bin,
         id = i.id
     );
