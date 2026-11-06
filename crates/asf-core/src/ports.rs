@@ -97,6 +97,9 @@ pub trait IssueStore: Send + Sync {
     /// Unread comments relevant to `lane` (see crate docs for the relevance rule).
     /// `peek` leaves the read cursor untouched; `all` ignores relevance but still honours the cursor.
     fn inbox(&self, lane: &str, peek: bool, all: bool) -> Result<Vec<Comment>, StoreError>;
+    /// Marks the unread comments of `issue` that are relevant to `lane` as read (advances that one
+    /// cursor, nothing else) and returns how many there were.
+    fn mark_read(&self, lane: &str, issue: &IssueId) -> Result<usize, StoreError>;
 
     fn append_event(&self, e: &NewEvent) -> Result<u64, StoreError>;
     fn events_since(&self, seq: u64, limit: usize) -> Result<Vec<Event>, StoreError>;

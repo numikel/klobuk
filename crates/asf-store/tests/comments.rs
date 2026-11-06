@@ -212,3 +212,30 @@ fn orchestrator_sees_all_and_own_comments_are_excluded() {
         "own comment excluded, `to: all` included"
     );
 }
+
+#[test]
+fn mark_read_advances_only_the_cursor_of_that_issue_and_lane() {
+    let (_d, s) = open();
+    let a = ready_issue(&s, "a");
+    let b = ready_issue(&s, "b");
+    comment(&s, &a.id, "agent:asf-1", CommentType::Question, "human", "a1");
+    comment(&s, &a.id, "agent:asf-1", CommentType::Status, "human", "a2");
+    comment(&s, &b.id, "agent:asf-2", CommentType::Question, "human", "b1");
+    assert_eq!(s.inbox("human", true, false).unwrap().len(), 3);
+
+    assert_eq!(
+        s.mark_read("human", &a.id).unwrap(),
+        2,
+        "both unread comments of a"
+    );
+    let left = s.inbox("human", true, false).unwrap();
+    assert_eq!(left.len(), 1, "b stays unread");
+    assert_eq!(left[0].body, "b1");
+    assert_eq!(s.mark_read("human", &a.id).unwrap(), 0, "nothing left on a");
+
+    // a later comment on the same issue is unread again; other lanes are untouched
+    comment(&s, &a.id, "agent:asf-1", CommentType::Status, "human", "a3");
+    assert_eq!(s.inbox("human", true, false).unwrap().len(), 2);
+    assert_eq!(s.inbox(LANE_ORCHESTRATOR, true, false).unwrap().len(), 4);
+    assert!(s.mark_read("  ", &a.id).is_err(), "empty lane is refused");
+}

@@ -680,31 +680,29 @@ impl IssueStore for SqliteStore {
         if lane.is_empty() {
             return Err(StoreError::Validation("lane must not be empty".into()));
         }
-        let own_author = if lane == LANE_ORCHESTRATOR {
-            LANE_ORCHESTRATOR.to_string()
-        } else {
-            format!("agent:{lane}")
-        };
+        let own_author = inbox_own_author(lane);
         let items = self.read(|c| row::inbox(c, lane, &own_author, all || lane == LANE_ORCHESTRATOR))?;
         if !peek && !items.is_empty() {
-            self.with_tx(|tx| {
-                let mut last: std::collections::BTreeMap<&IssueId, i64> = std::collections::BTreeMap::new();
-                for it in &items {
-                    let e = last.entry(&it.issue_id).or_insert(it.id);
-                    *e = (*e).max(it.id);
-                }
-                for (issue, id) in last {
-                    tx.execute(
-                        "INSERT INTO cursors (lane, issue_id, last_comment_id) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(lane, issue_id) DO UPDATE SET last_comment_id = max(last_comment_id, excluded.last_comment_id)",
-                        params![lane, issue.as_str(), id],
-                    )
-                    .map_err(backend)?;
-                }
-                Ok(())
-            })?;
+            self.with_tx(|tx| advance_cursors(tx, lane, &items))?;
         }
         Ok(items)
+    }
+
+    fn mark_read(&self, lane: &str, issue: &IssueId) -> Result<usize, StoreError> {
+        let lane = lane.trim();
+        if lane.is_empty() {
+            return Err(StoreError::Validation("lane must not be empty".into()));
+        }
+        let own_author = inbox_own_author(lane);
+        // Read and write in one transaction so a comment added in between is not marked unseen-as-read.
+        self.with_tx(|tx| {
+            let items: Vec<Comment> = row::inbox(tx, lane, &own_author, lane == LANE_ORCHESTRATOR)?
+                .into_iter()
+                .filter(|c| &c.issue_id == issue)
+                .collect();
+            advance_cursors(tx, lane, &items)?;
+            Ok(items.len())
+        })
     }
 
     fn append_event(&self, e: &NewEvent) -> Result<u64, StoreError> {
@@ -781,4 +779,31 @@ mod tests {
             .unwrap();
         assert_eq!(on, 1);
     }
+}
+
+/// The author name whose comments a lane never sees in its own inbox.
+fn inbox_own_author(lane: &str) -> String {
+    if lane == LANE_ORCHESTRATOR {
+        LANE_ORCHESTRATOR.to_string()
+    } else {
+        format!("agent:{lane}")
+    }
+}
+
+/// Moves the per-issue read cursor of `lane` up to the newest comment of `items` (never backwards).
+fn advance_cursors(tx: &Transaction<'_>, lane: &str, items: &[Comment]) -> Result<(), StoreError> {
+    let mut last: std::collections::BTreeMap<&IssueId, i64> = std::collections::BTreeMap::new();
+    for it in items {
+        let e = last.entry(&it.issue_id).or_insert(it.id);
+        *e = (*e).max(it.id);
+    }
+    for (issue, id) in last {
+        tx.execute(
+            "INSERT INTO cursors (lane, issue_id, last_comment_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(lane, issue_id) DO UPDATE SET last_comment_id = max(last_comment_id, excluded.last_comment_id)",
+            params![lane, issue.as_str(), id],
+        )
+        .map_err(backend)?;
+    }
+    Ok(())
 }
