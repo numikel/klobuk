@@ -296,7 +296,7 @@ fn symbols_differ_per_state_and_carry_their_colours() {
     for (issue, glyph) in [("asf-24", '●'), ("asf-31", '◆'), ("asf-5", '■')] {
         let row = t
             .lines()
-            .find(|l| l.contains('│') && l.contains(&format!("{issue} ")))
+            .find(|l| l.contains(&format!("{issue} ")) && (l.contains("worker") || l.contains("reviewer")))
             .unwrap_or_else(|| panic!("no agents row for {issue}:\n{t}"));
         assert!(row.contains(glyph), "{issue}: {row:?}");
     }

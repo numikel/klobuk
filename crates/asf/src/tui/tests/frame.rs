@@ -125,8 +125,10 @@ fn the_answer_overlay_is_a_centred_accent_box_with_the_worker_screen_and_the_moc
         assert!(cell_style(&a, "1-4 choose", "move").1.contains(Modifier::DIM));
         // centred: the same margin on both sides of the box, and the chrome rows stay visible
         let top = t.lines().find(|l| l.contains("┌ answer")).unwrap();
-        let left = top.chars().take_while(|c| *c == ' ').count();
-        let box_w = top.trim().chars().count();
+        // measured from the corners: the view behind the box may print text left and right of it
+        let chars: Vec<char> = top.chars().collect();
+        let left = chars.iter().position(|c| *c == '┌').unwrap();
+        let box_w = chars.iter().rposition(|c| *c == '┐').unwrap() + 1 - left;
         assert_eq!(left * 2 + box_w, width as usize, "{width}: {top:?}");
         assert!(t.lines().last().unwrap().contains("answering asf-2"));
         assert!(t.lines().next().unwrap().contains("asf · hello"));

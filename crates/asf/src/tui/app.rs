@@ -162,6 +162,9 @@ pub struct App {
     /// The detail in the snapshot was carried over a store refresh and may be out of date: a comment
     /// or a dependency status can have changed under the selection. Cleared by [`App::set_detail`].
     detail_stale: bool,
+    /// The pane preview in the snapshot was carried over a store refresh; [`App::peek_wanted`] asks
+    /// for it again. Cleared by [`App::set_pane_preview`].
+    pane_stale: bool,
 }
 
 impl App {
@@ -186,6 +189,7 @@ impl App {
             scroll_max: Cell::new(u16::MAX),
             theme: Theme::default(),
             detail_stale: false,
+            pane_stale: false,
         }
     }
 
@@ -224,6 +228,7 @@ impl App {
         }
         if snap.pane_preview.is_none() {
             snap.pane_preview = self.snap.pane_preview.take();
+            self.pane_stale = snap.pane_preview.is_some();
         }
         snap.derive();
         self.snap = snap;
@@ -254,6 +259,18 @@ impl App {
             .filter(|id| self.detail_stale || self.snap.detail_of(id).is_none())
     }
 
+    /// The issue whose pane the Agents view wants read: the selected run's, while that view is open and
+    /// the snapshot holds another pane or one from before the last store refresh. Never while the
+    /// runtime is down (the read would fail and be asked for again on every pass). The event loop
+    /// turns it into a read.
+    pub fn peek_wanted(&self) -> Option<IssueId> {
+        if self.view != View::Agents || self.snap.runtime_ok == Some(false) {
+            return None;
+        }
+        agents::selected_issue(&self.snap, &self.agents)
+            .filter(|id| self.pane_stale || self.snap.preview_of(id).is_none())
+    }
+
     /// Keeps a freshly loaded Board detail in the snapshot.
     pub fn set_detail(&mut self, detail: IssueDetail) {
         self.snap.detail = Some(detail);
@@ -277,6 +294,7 @@ impl App {
     /// Keeps the last lines read from `issue`'s pane for the views (`Snapshot::pane_preview`).
     pub fn set_pane_preview(&mut self, issue: IssueId, text: String) {
         self.snap.pane_preview = Some(PanePreview { issue, text });
+        self.pane_stale = false;
     }
 
     /// Next (`step == 1`) or previous (`step == -1`) view, wrapping around.

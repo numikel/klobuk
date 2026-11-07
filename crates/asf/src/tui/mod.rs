@@ -529,5 +529,11 @@ fn event_loop(
         if let Some(id) = app.detail_wanted() {
             load_detail_into(app, ctx, &id);
         }
+        // The Agents view shows the pane of the selected run: read it when the view opens and after
+        // every store refresh, not only when a key asks for it.
+        if let Some(id) = app.peek_wanted() {
+            let text = peek_screen(worker, &id);
+            app.set_pane_preview(id, text);
+        }
     }
 }
