@@ -177,23 +177,31 @@ asf run show mp-3       # run state, cost, tool calls, live agent state
 asf issue inbox         # unread comments addressed to you (`human`) or to all
 ```
 
-When a worker asks a question or hits a permission prompt, its run becomes `blocked` and a
-BLOCKER comment with the last screen lines lands in your inbox. Answer from the TUI (`r` reply,
-`y`/`n` keys) or from the shell:
+When a worker asks a question (AskUserQuestion in its pane) or hits a permission prompt, its run
+becomes `blocked`, a BLOCKER comment with the last screen lines lands in your inbox, and every TUI
+view shows a banner `asf-N is waiting for your answer`. A non-blocking question is a QUESTION
+comment addressed to `human`; `asf issue finish` refuses until it has an ANSWER. Answer from the
+TUI (`a` opens the question with its options: `1`–`4` choose, `t` type, `Esc` close) or from the
+shell:
 
 ```bash
 asf run reply mp-3 "Use the existing Tokenizer; do not add a dependency."
-asf run keys mp-3 y
+asf run keys mp-3 Enter                     # submit the highlighted option of a dialog
+asf issue scope add mp-3 src/other.rs       # grant a SCOPE: request and answer it in one go
+asf issue comment mp-3 --type ANSWER --to mp-3 --reply-to 12 --body "Keep the alias."
 asf run nudge mp-3      # remind the worker about the finish ritual
 asf run abort mp-3      # stop the worker, release the claim, keep the worktree
 ```
 
-TUI keys: `1`–`6` views (Board, Agents, Inbox, Queue, Log, Config), `j`/`k` move, `Enter`
-details, `s` start the selected ready issue, `m` enqueue for merge, `f` focus the worker's pane,
-`r` reply, `y`/`n` quick keys, `x` abort, `t` tick, `R` refresh, `q` quit. The Config view lists
-the editable settings (models per role, budgets, parallelism, merge target, reviewer); `Enter`
-edits one in place, with validation, and writes it to `.factory/config.toml`. A running
-`asf serve` reads the configuration at start, so restart it after a change.
+TUI keys: `1`–`7` views (Now, Board, Agents, Inbox, Queue, Log, Config), `Tab`/`Shift+Tab` cycle,
+`j`/`k` move, `g`/`G` jump, `Enter` details, `a` answer, `s` start the selected ready issue,
+`m` enqueue for merge (in the Inbox: mark one issue read, `M` all), `f` focus the worker's pane,
+`v` re-verify a failed run, `x` abort, `t` tick, `?` every binding, `q` quit. The Now view is the
+operator's desk: NEEDS YOU lists questions, blocked or stalled runs and failed merges, oldest
+first, each with its age and the one key that acts on it; RUNNING shows workers and reviewers
+with cost and elapsed time. Tick and worker start run in the background with a spinner. The
+Config view lists the editable settings; `Enter` edits one in place, with validation, and writes
+it to `.factory/config.toml`. A running `asf serve` reloads the configuration on every tick.
 
 ### 6. Verification and merge
 
@@ -219,9 +227,16 @@ With `[review] required = true` (or a label from `[review] on_labels`) the queue
 stage after the gates: a second worker with a clean context, running on `[review] model` (default
 `opus`), gets a detached checkout of the branch in `.worktrees/<review-id>`, read-only tools and a
 brief with the diff and the acceptance criteria. It never edits; it ends with one DECISION comment
-on the issue: `approve` lets the merge continue, `changes:` with findings fails the item, blocks the
-issue and sends the findings back to the original worker. After `[review] max_rounds` rounds of
-`changes` the queue stops and asks you to decide.
+on the issue. `approve` lets the merge continue. `changes:` with findings writes them to
+`.factory/runs/<id>/review-<n>.md` in the worker's worktree, prompts the worker with one line and
+reopens its run; the worker fixes, runs the gates and finishes again, and the same queue item is
+re-queued without an operator command. Only when the worker cannot be reached do you get a BLOCKER
+with the findings and `asf merge retry <id>`. The review issue and its run are closed as soon as
+the verdict is read, so reviewers never hold worker slots; at most `[review] max_parallel`
+reviewers run at once. An approved branch whose fast-forward fails only because `main` moved goes
+back to `queued`; after the rebase and the gates the review is skipped when the patch fingerprint
+(`git patch-id --verbatim`) is unchanged. After `[review] max_rounds` rounds of `changes` the queue
+stops and asks you to decide.
 
 ```bash
 asf merge list
@@ -299,7 +314,7 @@ default_branch = "main"
 worktrees_dir = ".worktrees"
 
 [scheduler]
-max_parallel = 3          # concurrent workers
+max_parallel = 2          # workers running at the same time (reviewers and issues waiting in validating do not count)
 hotspots = []             # globs that are never edited in parallel, e.g. ["Cargo.toml", "Cargo.lock"]
 
 [store]
@@ -355,6 +370,7 @@ required = false          # a read-only reviewer with a clean context before eve
 on_labels = []            # e.g. ["risky"]: labels that force a review worker before merge
 model = "opus"            # model the reviewer runs on
 max_rounds = 2            # `changes` verdicts allowed before the human decides
+max_parallel = 2          # reviewers running at once; the next verified item waits without failing
 
 [planner]
 runner = "claude"         # claude (headless `claude -p`, read-only tools) | fake (tests)
@@ -418,7 +434,8 @@ reported and never fatal.
 | `asf issue dep add\|rm <id> <on>` | Dependency edges |
 | `asf issue claim\|release <id>` | Atomic claim (exit 3 if taken) / release |
 | `asf issue finish <id> --report <file>` | Worker ritual: `in-review` plus a STATUS comment |
-| `asf issue comment <id> --type T [--to lane] --body b` / `asf issue handoff <id> --to lane …` | Typed comments |
+| `asf issue comment <id> --type T [--to lane] [--reply-to n] --body b` / `asf issue handoff <id> --to lane …` | Typed comments; an ANSWER with `--reply-to` resolves a QUESTION |
+| `asf issue scope add\|rm <id> <glob>…` | Grow or shrink the file scope; `add` answers an open `SCOPE:` question |
 | `asf issue inbox [--peek] [--all]` | Unread comments for the current lane |
 | `asf plan new --from <idea.md> [--slug s] [--dry-run] [--no-epic]` | Idea → PRD → issues with the active methodology |
 | `asf plan import <file> [--format auto\|md-tasks\|spec-kit] [--dry-run] [--no-epic]` | Import a task list |
