@@ -221,6 +221,34 @@ fn the_board_asks_for_the_detail_of_the_issue_it_lands_on() {
 }
 
 #[test]
+fn cancelled_issues_are_not_rows_so_the_selection_never_runs_past_the_last_card() {
+    use crate::tui::views::board;
+    let mut s = snapshot();
+    // the loader reads cancelled issues too; the Board does not list them
+    for n in 90..93 {
+        s.issues
+            .push(issue(&format!("asf-{n}"), "Dropped", Status::Cancelled));
+    }
+    let mut a = board_app(s);
+    let cards = board::ordered(&a.snap);
+    assert!(cards.len() >= 2 && cards.len() < a.snap.issues.len());
+    let last = cards.len() - 1;
+    let (second_to_last, final_card) = (cards[last - 1].id.clone(), cards[last].id.clone());
+
+    assert_eq!(board::rows(&a.snap), cards.len(), "rows are the cards on screen");
+    a.handle_key(key('G'));
+    a.handle_key(key('j')); // already at the bottom: nothing moves
+    assert_eq!(a.board.selected, last, "G stops at the last card");
+    assert_eq!(board::selected_issue(&a.snap, &a.board), Some(final_card));
+    assert_eq!(
+        a.handle_key(key('k')),
+        Action::LoadDetail(second_to_last.clone()),
+        "one k moves to the second-to-last card"
+    );
+    assert_eq!(board::selected_issue(&a.snap, &a.board), Some(second_to_last));
+}
+
+#[test]
 fn a_peek_keeps_the_pane_in_the_snapshot_for_the_views() {
     let mut a = open_overlay();
     a.set_pane_preview(id("asf-2"), "line 1\nline 2".into());

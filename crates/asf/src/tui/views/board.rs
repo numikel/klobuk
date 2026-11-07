@@ -136,8 +136,10 @@ pub fn selected_issue(snap: &Snapshot, state: &State) -> Option<IssueId> {
     ordered(snap).get(selected(snap, state)).map(|i| i.id.clone())
 }
 
+/// The cards on screen: what [`ordered`] lists, not every issue the loader read (cancelled ones are
+/// loaded but have no column), so navigation can never run past the last card.
 pub fn rows(snap: &Snapshot) -> usize {
-    snap.issues.len()
+    ordered(snap).len()
 }
 
 /// Moves the selection to `id` (it stays where it was when the Board does not list it).
