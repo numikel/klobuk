@@ -393,6 +393,60 @@ fn answer_without_reply_to_only_looks_at_the_addressed_lane() {
     assert_eq!(ans["reply_to"].as_i64().unwrap().to_string(), qa, "{ans}");
 }
 
+fn question_of<'a>(comments: &'a [serde_json::Value], qid: &str) -> &'a serde_json::Value {
+    comments
+        .iter()
+        .find(|c| c["id"].as_i64().unwrap().to_string() == qid)
+        .unwrap_or_else(|| panic!("no comment #{qid} in {comments:?}"))
+}
+
+#[test]
+fn answer_with_reply_to_sets_resolved_at_on_the_question() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let q1 = ask(&r, &a, "human", "first");
+    let q2 = ask(&r, &a, "human", "second");
+    assert!(question_of(&comments_of(&r, &a), &q1)["resolved_at"].is_null());
+
+    r.ok(&answer_args(&a, &a, &["--reply-to", &q1], "one"));
+    let comments = comments_of(&r, &a);
+    assert!(
+        question_of(&comments, &q1)["resolved_at"].is_string(),
+        "{comments:?}"
+    );
+    assert!(
+        question_of(&comments, &q2)["resolved_at"].is_null(),
+        "the other question stays open"
+    );
+}
+
+#[test]
+fn auto_linked_answer_sets_resolved_at_and_a_second_answer_keeps_the_first_time() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let q = ask(&r, &a, "human", "which crate?");
+    r.ok(&answer_args(&a, &a, &[], "asf-core"));
+    let first = question_of(&comments_of(&r, &a), &q)["resolved_at"].clone();
+    assert!(first.is_string(), "{first}");
+
+    r.ok(&answer_args(&a, &a, &["--reply-to", &q], "asf-core, really"));
+    assert_eq!(question_of(&comments_of(&r, &a), &q)["resolved_at"], first);
+}
+
+#[test]
+fn answer_to_a_non_question_resolves_nothing() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let note = r.ok(&[
+        "--lane", &a, "issue", "comment", &a, "--type", "FYI", "--to", "all", "--body", "note",
+    ])["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    r.ok(&answer_args(&a, &a, &["--reply-to", &note], "reply"));
+    assert!(question_of(&comments_of(&r, &a), &note)["resolved_at"].is_null());
+}
+
 #[test]
 fn answer_to_a_lane_without_an_open_question_stays_a_plain_comment() {
     let r = Repo::initialised();

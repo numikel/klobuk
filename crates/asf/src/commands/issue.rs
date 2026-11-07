@@ -357,9 +357,9 @@ struct FinishView {
     comment: Comment,
 }
 
-/// Ids of QUESTION comments to the human on this issue that nobody has answered yet. `resolved_at`
-/// is never written by the store, so a question counts as answered only when an ANSWER comment
-/// replies to it (`--reply-to`).
+/// Ids of QUESTION comments to the human on this issue that nobody has answered yet. The store sets
+/// `resolved_at` when an ANSWER replies to a question, but questions answered before that existed
+/// keep it null, so the ANSWER's `reply_to` stays part of the test.
 fn unanswered_questions(comments: &[Comment]) -> Vec<i64> {
     open_questions(comments).iter().map(|q| q.id).collect()
 }

@@ -658,6 +658,21 @@ impl IssueStore for SqliteStore {
             )
             .map_err(backend)?;
             let cid = tx.last_insert_rowid();
+            // An ANSWER that replies to a QUESTION of the same issue resolves it. `resolved_at IS
+            // NULL` keeps the first resolution time when a second answer comes in.
+            if let (CommentType::Answer, Some(r)) = (c.kind, c.reply_to) {
+                tx.execute(
+                    "UPDATE comments SET resolved_at = ?1
+                     WHERE id = ?2 AND issue_id = ?3 AND type = ?4 AND resolved_at IS NULL",
+                    params![
+                        now_rfc3339(),
+                        r,
+                        c.issue_id.as_str(),
+                        CommentType::Question.as_str()
+                    ],
+                )
+                .map_err(backend)?;
+            }
             append_event_tx(
                 tx,
                 &event(
