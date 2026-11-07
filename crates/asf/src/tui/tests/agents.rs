@@ -287,6 +287,22 @@ fn the_title_of_a_reviewer_uses_the_review_session_name() {
     a.set_pane_preview(id("asf-30"), pane_text(2));
     let t = render_to_text(&a, 120, 30);
     assert!(
+        t.contains("pane preview · asf-30 · review-asf-28-asf-serve-reload-config · live"),
+        "{t}"
+    );
+}
+
+#[test]
+fn a_reviewer_without_a_review_link_falls_back_to_its_own_issue_for_the_session_name() {
+    let mut a = agents_app(agents_desk());
+    // `derive` rebuilds the links when the snapshot is loaded, so cut it afterwards
+    a.snap.review_of.clear();
+    a.handle_key(key('j'));
+    a.handle_key(key('j'));
+    assert_eq!(a.selected_issue(), Some(id("asf-30")));
+    a.set_pane_preview(id("asf-30"), pane_text(2));
+    let t = render_to_text(&a, 120, 30);
+    assert!(
         t.contains("pane preview · asf-30 · review-asf-30-review-asf-28-reload-config · live"),
         "{t}"
     );

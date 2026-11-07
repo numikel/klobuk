@@ -393,12 +393,14 @@ fn preview(frame: &mut Frame, area: Rect, snap: &Snapshot, entry: &Entry, theme:
         .last_run(id)
         .and_then(|l| l.session_name.clone())
         .unwrap_or_else(|| {
-            let title = snap.issue(id).map_or("", |i| i.title.as_str());
-            if entry.reviewer {
-                session_name(&format!("review-{id}"), title)
-            } else {
-                session_name(id.as_str(), title)
+            if !entry.reviewer {
+                let title = snap.issue(id).map_or("", |i| i.title.as_str());
+                return session_name(id.as_str(), title);
             }
+            // `worker::start_review` names the session after the REVIEWED issue, not the review issue.
+            let reviewed = snap.review_of.get(id).map_or(id, |l| &l.reviews);
+            let title = snap.issue(reviewed).map_or("", |i| i.title.as_str());
+            session_name(&format!("review-{reviewed}"), title)
         });
     let title = trunc(
         &format!(" pane preview · {id} · {name} · live "),
