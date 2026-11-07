@@ -1264,7 +1264,13 @@ impl<'a> Worker<'a> {
         if !dirty.is_empty() {
             problems.push(format!("uncommitted changes in worktree: {}", dirty.join(", ")));
         }
-        let changed = self.vcs.changed_files(&wt_abs, &run.base_sha).map_err(vcs_err)?;
+        // Against the default branch, not `run.base_sha`: `changed_files` takes the merge-base with HEAD, and
+        // after the merge queue rebased the branch the stored base predates that rebase, so main's own
+        // commits would be counted as the worker's.
+        let changed = self
+            .vcs
+            .changed_files(&wt_abs, &self.ctx.config.repo.default_branch)
+            .map_err(vcs_err)?;
         if changed.is_empty() {
             problems.push("no committed changes since the base".into());
         }

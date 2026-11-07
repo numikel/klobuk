@@ -826,6 +826,24 @@ fn verify_succeeds_after_a_failed_gate_is_fixed_and_enqueues_the_branch() {
 }
 
 #[test]
+fn verify_ignores_the_stored_base_sha_when_the_branch_was_rebased_onto_a_moved_main() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    commit_in(f.repo.path(), "README.md", "# moved on\n");
+    commit_in(f.repo.path(), "docs/notes.txt", "also moved\n");
+    git(&wt(&f), &["rebase", "main"]);
+    worker_finishes(&f);
+
+    let res = f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(res["to"], "succeeded", "{res}");
+    assert!(
+        res["detail"].as_str().unwrap().starts_with("1 files"),
+        "only src/greet.rs is the worker's: {res}"
+    );
+    assert_eq!(active_run(&f).exit_reason.as_deref(), Some("verified"));
+}
+
+#[test]
 fn verify_accepts_a_finishing_run_without_waiting_for_watch() {
     let f = setup();
     f.repo.ok(&["run", "start", &f.issue]);

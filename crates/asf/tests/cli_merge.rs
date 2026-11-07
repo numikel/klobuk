@@ -1315,6 +1315,64 @@ fn a_worker_that_finishes_again_gets_its_item_queued_and_the_next_review_round_s
 }
 
 #[test]
+fn a_run_reopened_after_a_rebase_verifies_against_the_rebased_base_and_lists_only_the_workers_files() {
+    let f = setup();
+    require_review(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let stale_base = worker_run(&f).base_sha;
+
+    // main moves on with a file far outside the issue's scope, then the queue rebases the branch onto it
+    commit_in(f.repo.path(), "README.md", "# moved on\n");
+    commit_in(f.repo.path(), "docs/notes.txt", "also moved\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    assert_ne!(
+        git_out(&wt, &["merge-base", "main", "HEAD"]),
+        stale_base,
+        "the branch now sits on a newer main than the run's base_sha"
+    );
+
+    // the reviewer asks for changes, the worker is sent back, fixes and finishes again
+    decide_as(
+        &f,
+        &review_id(&f),
+        "changes:\n- src/greet.rs: hello() has no test",
+    );
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(worker_run(&f).state, RunState::Working);
+    let res = finish_again(&f, "src/greet_test.rs", "// covers hello()\n");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(
+        res["transitions"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .next(),
+        Some("2"),
+        "only the worker's two files are counted, not main's: {res}"
+    );
+    let run = worker_run(&f);
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(run.exit_reason.as_deref(), Some("verified"));
+    assert_eq!(status_of(&f, &f.issue), "validating");
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
 fn a_changes_verdict_with_an_unreachable_worker_keeps_the_blocker_and_the_retry_hint() {
     let f = reviewing();
     let rid = review_id(&f);
