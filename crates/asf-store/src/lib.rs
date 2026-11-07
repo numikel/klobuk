@@ -697,6 +697,7 @@ impl IssueStore for SqliteStore {
         }
         let own_author = inbox_own_author(lane);
         let items = self.read(|c| row::inbox(c, lane, &own_author, all || lane == LANE_ORCHESTRATOR))?;
+        let items = without_resolved_questions(items);
         if !peek && !items.is_empty() {
             self.with_tx(|tx| advance_cursors(tx, lane, &items))?;
         }
@@ -711,10 +712,11 @@ impl IssueStore for SqliteStore {
         let own_author = inbox_own_author(lane);
         // Read and write in one transaction so a comment added in between is not marked unseen-as-read.
         self.with_tx(|tx| {
-            let items: Vec<Comment> = row::inbox(tx, lane, &own_author, lane == LANE_ORCHESTRATOR)?
-                .into_iter()
-                .filter(|c| &c.issue_id == issue)
-                .collect();
+            let items: Vec<Comment> =
+                without_resolved_questions(row::inbox(tx, lane, &own_author, lane == LANE_ORCHESTRATOR)?)
+                    .into_iter()
+                    .filter(|c| &c.issue_id == issue)
+                    .collect();
             advance_cursors(tx, lane, &items)?;
             Ok(items.len())
         })
@@ -771,6 +773,15 @@ impl IssueStore for SqliteStore {
 }
 
 /// The author name whose comments a lane never sees in its own inbox.
+/// A QUESTION that an ANSWER has resolved (`resolved_at` set by `add_comment`) needs nobody any more,
+/// so the inbox does not list it. Other comment types ignore `resolved_at`.
+fn without_resolved_questions(items: Vec<Comment>) -> Vec<Comment> {
+    items
+        .into_iter()
+        .filter(|c| !(c.kind == CommentType::Question && c.resolved_at.is_some()))
+        .collect()
+}
+
 fn inbox_own_author(lane: &str) -> String {
     if lane == LANE_ORCHESTRATOR {
         LANE_ORCHESTRATOR.to_string()

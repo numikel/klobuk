@@ -433,6 +433,46 @@ fn auto_linked_answer_sets_resolved_at_and_a_second_answer_keeps_the_first_time(
     assert_eq!(question_of(&comments_of(&r, &a), &q)["resolved_at"], first);
 }
 
+/// Ids of the comments the human lane would read now (`inbox --peek` leaves the cursor alone).
+fn human_inbox_ids(r: &Repo) -> Vec<String> {
+    r.ok(&["--lane", "human", "issue", "inbox", "--peek"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_i64().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn answered_questions_leave_the_human_inbox() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let b = r.create_issue("b", &["--ready"]);
+    let still_open = r.create_issue("c", &["--ready"]);
+    let qa = ask(&r, &a, "human", "auto-linked?");
+    let qb = ask(&r, &b, "human", "explicit?");
+    let qc = ask(&r, &still_open, "human", "nobody answers this");
+    let inbox = human_inbox_ids(&r);
+    assert!(
+        [&qa, &qb, &qc].iter().all(|q| inbox.contains(q)),
+        "unanswered questions are listed: {inbox:?}"
+    );
+
+    r.ok(&answer_args(&a, &a, &[], "yes"));
+    r.ok(&answer_args(&b, &b, &["--reply-to", &qb], "yes"));
+
+    let inbox = human_inbox_ids(&r);
+    assert!(
+        !inbox.contains(&qa),
+        "auto-linked answer hides the question: {inbox:?}"
+    );
+    assert!(
+        !inbox.contains(&qb),
+        "explicit answer hides the question: {inbox:?}"
+    );
+    assert!(inbox.contains(&qc), "an open question stays listed: {inbox:?}");
+}
+
 #[test]
 fn answer_to_a_non_question_resolves_nothing() {
     let r = Repo::initialised();
