@@ -1,5 +1,6 @@
 //! Gate runner: runs configured commands in a directory with a timeout, stopping at the first failure.
 
+use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -18,7 +19,11 @@ const TAIL_LINES: usize = 40;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// `link.exe` cannot open a just-written test executable while the AV scanner holds it.
 const LINKER_LOCK_MARKER: &str = "LNK1104";
+/// How many attempts may fail on a linker lock without making progress before the gate gives up.
 const LINKER_LOCK_ATTEMPTS: u32 = 5;
+/// Hard cap on reruns after a linker lock, progress or not, so a gate can never loop forever (each
+/// attempt is still bounded by the gate's own `timeout_s`).
+const LINKER_LOCK_MAX_RERUNS: u32 = 12;
 /// Pauses before reruns 1..=4 when a locked file exists and is moved aside (2 s, 4 s, 6 s, 8 s):
 /// the scanner needs a moment before the file can be touched.
 const LINKER_LOCK_PAUSES_MOVED: [Duration; 4] = [
@@ -250,24 +255,62 @@ fn pause_before_rerun(schedule: &[Duration], rerun: u32) -> Duration {
         .unwrap_or_default()
 }
 
-/// Runs one gate, rerunning it (up to [`LINKER_LOCK_ATTEMPTS`] times in total) when the only
-/// evidence of failure is a Windows linker lock (`LNK1104`), which is the AV scanner holding a
-/// freshly written test executable, not the code. A locked file that exists is moved aside before
-/// each rerun after a short pause; when the linker names no existing file there is nothing to move
-/// and the rerun waits out the longer `absent` schedule instead.
+/// The locked files as a comparable set (separators and case normalised, as Windows paths are).
+fn locked_set(files: &[std::path::PathBuf]) -> BTreeSet<String> {
+    files
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase())
+        .collect()
+}
+
+/// Runs one gate, rerunning it when the only evidence of failure is a Windows linker lock
+/// (`LNK1104`), which is the AV scanner holding a freshly written test executable, not the code. A
+/// locked file that exists is moved aside before each rerun after a short pause; when the linker
+/// names no existing file there is nothing to move and the rerun waits out the longer `absent`
+/// schedule instead.
+///
+/// A rerun counts against [`LINKER_LOCK_ATTEMPTS`] unless the attempt made progress: after a rebase
+/// the whole workspace relinks and every attempt trips over different files, so a rerun whose set
+/// of locked files differs from the previous attempt's is free. Reruns are capped at
+/// [`LINKER_LOCK_MAX_RERUNS`] in any case.
 fn run_gate_with_retry(spec: &GateSpec, cwd: &Path, pauses: &LinkerLockPauses) -> GateResult {
     let started = Instant::now();
     let mut r = run_gate(spec, cwd);
-    let mut attempt = 1;
+    // attempts that count against the limit, the first run included
+    let mut counted = 1;
+    let mut reruns = 0;
+    let mut previous: Option<BTreeSet<String>> = None;
     let mut notes: Vec<String> = Vec::new();
-    while !r.ok && attempt < LINKER_LOCK_ATTEMPTS && r.tail.contains(LINKER_LOCK_MARKER) {
+    while !r.ok
+        && counted < LINKER_LOCK_ATTEMPTS
+        && reruns < LINKER_LOCK_MAX_RERUNS
+        && r.tail.contains(LINKER_LOCK_MARKER)
+    {
         let named = locked_files(&r.tail);
+        let now = locked_set(&named);
+        // Progress needs names to compare: a message without any path says nothing about it.
+        let progress = !now.is_empty() && previous.as_ref().is_some_and(|p| *p != now);
         let exists = named.iter().any(|p| p.exists());
+        reruns += 1;
         // let the scanner finish before touching anything
-        let pause = pause_before_rerun(if exists { pauses.moved } else { pauses.absent }, attempt);
+        let pause = pause_before_rerun(if exists { pauses.moved } else { pauses.absent }, reruns);
         thread::sleep(pause);
         let (moved, stuck) = move_locked_aside(&r.tail);
-        attempt += 1;
+        let verdict = if progress {
+            format!(
+                "linker lock on {} other file(s); progress, rerun {reruns} (does not count)",
+                now.len()
+            )
+        } else {
+            counted += 1;
+            let why = match &previous {
+                None => "first linker lock".to_string(),
+                Some(_) if now.is_empty() => "no file names to compare, no progress".to_string(),
+                Some(_) => format!("same {} file(s) as the previous attempt, no progress", now.len()),
+            };
+            format!("{why}; rerun attempt {counted}/{LINKER_LOCK_ATTEMPTS} (counts)")
+        };
+        previous = Some(now);
         let what = if moved.is_empty() && stuck.is_empty() {
             let why = if named.is_empty() {
                 "no file path in the linker message"
@@ -287,10 +330,18 @@ fn run_gate_with_retry(spec: &GateSpec, cwd: &Path, pauses: &LinkerLockPauses) -
             )
         };
         notes.push(format!(
-            "[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); {what}; rerun attempt {attempt}/{LINKER_LOCK_ATTEMPTS}",
+            "[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); {what}; {verdict}",
             spec.name,
         ));
         r = run_gate(spec, cwd);
+    }
+    if !r.ok && !notes.is_empty() && r.tail.contains(LINKER_LOCK_MARKER) {
+        let reason = if reruns >= LINKER_LOCK_MAX_RERUNS {
+            format!("the cap of {LINKER_LOCK_MAX_RERUNS} reruns is used up")
+        } else {
+            format!("{LINKER_LOCK_ATTEMPTS} attempts failed on a linker lock without progress")
+        };
+        notes.push(format!("[asf] gate `{}` gives up: {reason}", spec.name));
     }
     if !notes.is_empty() {
         r.tail = tail(&format!("{}\n{}", r.tail, notes.join("\n")));

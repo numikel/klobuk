@@ -402,6 +402,134 @@ sys.exit(0 if not e else 101)",
     assert!(!tail.contains("nothing to move aside"), "{tail}");
 }
 
+/// A gate that fails with one `LNK1104` line per file in the Python list `files` (an expression over
+/// `n`, the 1-based run number kept in `n.txt`) until its `pass_on`-th run. None of the named files
+/// exists under `missing_dir`, so nothing is moved aside and only the pauses and the counting matter.
+/// Every run is also appended to `runs.log`.
+fn lock_gate(missing_dir: &std::path::Path, files: &str, pass_on: u32) -> String {
+    format!(
+        "import os, sys\n\
+n = int(open('n.txt').read()) + 1 if os.path.exists('n.txt') else 1\n\
+open('n.txt', 'w').write(str(n))\n\
+with open('runs.log', 'a') as f: f.write('x')\n\
+if n >= {pass_on}: print('tests ok'); sys.exit(0)\n\
+base = {:?}\n\
+for name in {files}: print('LINK : fatal error LNK1104: cannot open file \"' + base + '/' + name + '\"')\n\
+sys.exit(101)",
+        missing_dir.to_string_lossy().replace('\\', "/")
+    )
+}
+
+fn runs_of(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("runs.log")).unwrap().len()
+}
+
+const QUICK: LinkerLockPauses<'static> = LinkerLockPauses {
+    moved: &[Duration::from_millis(5); 4],
+    absent: &[Duration::from_millis(5); 4],
+};
+
+/// The asf-31 pattern: every attempt links more executables and trips over different ones. Five
+/// attempts are not enough there, but each attempt made progress, so the limit is not used up.
+#[test]
+fn a_rerun_that_hits_different_files_does_not_count_against_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = lock_gate(&dir.path().join("deps"), "['f%d.exe' % n]", 9);
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert_eq!(
+        runs_of(dir.path()),
+        9,
+        "passes on the ninth run, past the old limit of five"
+    );
+    assert!(tail.contains("progress"), "{tail}");
+    assert!(tail.contains("does not count"), "{tail}");
+}
+
+#[test]
+fn reruns_on_the_same_files_keep_counting_and_stop_at_five_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = lock_gate(&dir.path().join("deps"), "['a.exe']", u32::MAX);
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(!results[0].ok);
+    assert_eq!(results[0].exit_code, Some(101));
+    assert_eq!(runs_of(dir.path()), 5);
+    assert!(tail.contains("same 1 file(s)"), "{tail}");
+    assert!(tail.contains("no progress"), "{tail}");
+    assert!(tail.contains("rerun attempt 5/5 (counts)"), "{tail}");
+    assert!(!tail.contains("does not count"), "{tail}");
+}
+
+/// Progress buys one free rerun, not immunity: once the files repeat, every further rerun counts.
+#[test]
+fn the_same_files_count_again_after_a_rerun_that_made_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = lock_gate(
+        &dir.path().join("deps"),
+        "(['a.exe'] if n < 2 else ['b.exe'])",
+        u32::MAX,
+    );
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(!results[0].ok);
+    // run 1 counts (first lock), run 2 is free (a -> b), runs 3..=6 repeat b and count: attempt 5/5
+    assert_eq!(runs_of(dir.path()), 6, "{tail}");
+    assert_eq!(tail.matches("does not count").count(), 1, "{tail}");
+    assert!(tail.contains("rerun attempt 5/5 (counts)"), "{tail}");
+}
+
+#[test]
+fn the_total_number_of_reruns_is_capped_even_when_every_attempt_reports_different_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = lock_gate(&dir.path().join("deps"), "['f%d.exe' % n]", u32::MAX);
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(!results[0].ok);
+    assert_eq!(results[0].exit_code, Some(101));
+    assert_eq!(
+        runs_of(dir.path()),
+        13,
+        "the first run plus at most 12 reruns: {tail}"
+    );
+    assert!(tail.contains("12 reruns"), "the stop is explained: {tail}");
+}
+
+#[test]
+fn the_note_says_which_case_happened_in_plain_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = lock_gate(
+        &dir.path().join("deps"),
+        "['f%d_%d.exe' % (n, i) for i in range(3)]",
+        3,
+    );
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert!(
+        tail.contains("first linker lock; rerun attempt 2/5 (counts)"),
+        "{tail}"
+    );
+    assert!(
+        tail.contains("linker lock on 3 other file(s); progress, rerun 2 (does not count)"),
+        "{tail}"
+    );
+}
+
+/// Progress is judged by file names; a message without any gives nothing to compare, so it counts.
+#[test]
+fn a_lock_without_file_names_never_counts_as_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "import sys\n\
+with open('runs.log', 'a') as f: f.write('x')\n\
+print('LINK : fatal error LNK1104: cannot open file foo.exe'); sys.exit(101)";
+    let results = run_gates_with_pauses(&[spec("test", &py(code), 30)], dir.path(), &QUICK);
+    assert!(!results[0].ok);
+    assert_eq!(runs_of(dir.path()), 5, "{}", results[0].tail);
+    assert!(!results[0].tail.contains("does not count"), "{}", results[0].tail);
+}
+
 #[test]
 fn a_failure_without_lnk1104_is_not_rerun_whatever_the_schedule() {
     let dir = tempfile::tempdir().unwrap();
