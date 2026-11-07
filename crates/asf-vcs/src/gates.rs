@@ -1,8 +1,10 @@
 //! Gate runner: runs configured commands in a directory with a timeout, stopping at the first failure.
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,10 @@ use asf_core::config::{GateCfg, GateWhen};
 use asf_core::{GateResult, GateSpec};
 
 const TAIL_LINES: usize = 40;
+/// How long to wait for the output pipes to close once the gate has exited or been killed. A
+/// descendant of the gate (`sh -c`, `cargo test`, ...) can inherit the pipes and keep them open long
+/// after the gate itself is gone; whatever was read by then is the output.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// `link.exe` cannot open a just-written test executable while the AV scanner holds it.
 const LINKER_LOCK_MARKER: &str = "LNK1104";
 const LINKER_LOCK_ATTEMPTS: u32 = 5;
@@ -60,7 +66,51 @@ fn build(spec: &GateSpec) -> Option<Command> {
     }
 }
 
-/// Runs one gate; never panics, never blocks longer than `timeout_s` (plus a short grace period).
+/// Reads one output pipe on its own thread into a shared buffer, so the bytes read so far stay
+/// available when the pipe never reaches EOF.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    eof: Receiver<()>,
+}
+
+impl Drain {
+    fn start<R: Read + Send + 'static>(mut pipe: R) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (done, eof) = mpsc::channel();
+        let sink = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = done.send(());
+        });
+        Self { buf, eof }
+    }
+
+    /// Waits for EOF until `deadline` and returns what was read (lossy UTF-8). When the pipe is still
+    /// open at the deadline its thread is left to finish on its own once the last holder lets go.
+    fn collect(self, deadline: Instant) -> String {
+        let _ = self
+            .eof
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let bytes = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Runs one gate; never panics. After the gate exits or is killed it waits at most [`DRAIN_GRACE`]
+/// for its output, so a descendant that holds the pipes open cannot delay the result. The process
+/// start itself is not bounded: the timeout clock runs from before it, so a slow start only means
+/// the timeout is already due when the gate finally runs.
 pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
     let started = Instant::now();
     let fail = |tail: String| GateResult {
@@ -82,18 +132,8 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
         Ok(c) => c,
         Err(e) => return fail(format!("cannot start `{}`: {e}", spec.cmd.join(" "))),
     };
-    let mut out = child.stdout.take().expect("piped");
-    let mut err = child.stderr.take().expect("piped");
-    let t_out = thread::spawn(move || {
-        let mut s = String::new();
-        let _ = out.read_to_string(&mut s);
-        s
-    });
-    let t_err = thread::spawn(move || {
-        let mut s = String::new();
-        let _ = err.read_to_string(&mut s);
-        s
-    });
+    let t_out = Drain::start(child.stdout.take().expect("piped"));
+    let t_err = Drain::start(child.stderr.take().expect("piped"));
     let timeout = Duration::from_secs(spec.timeout_s.max(1));
     let mut timed_out = false;
     let status = loop {
@@ -109,8 +149,9 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
             Err(_) => break None,
         }
     };
-    let stdout = t_out.join().unwrap_or_default();
-    let stderr = t_err.join().unwrap_or_default();
+    let drain_until = Instant::now() + DRAIN_GRACE;
+    let stdout = t_out.collect(drain_until);
+    let stderr = t_err.collect(drain_until);
     let mut combined = stdout;
     if !stderr.trim().is_empty() {
         if !combined.is_empty() && !combined.ends_with('\n') {

@@ -46,10 +46,66 @@ fn runs_in_order_and_stops_at_first_failure() {
 #[test]
 fn timeout_kills_and_reports() {
     let dir = tempfile::tempdir().unwrap();
-    let specs = vec![spec("slow", &py("import time; time.sleep(30)"), 1)];
-    let start = std::time::Instant::now();
+    // The gate stamps the moment it begins to run. `run_gates` is timed from there, not from the
+    // call: starting a process takes seconds when other tests spawn at the same time (measured up
+    // to 6 s), and that wait is not what this test is about.
+    let code = "import time; open('started', 'w').write(str(time.time())); time.sleep(30)";
+    let specs = vec![spec("slow", &py(code), 1)];
     let results = run_gates(&specs, dir.path());
-    assert!(start.elapsed().as_secs() < 10, "killed well before 30 s");
+    let returned = epoch_now();
+    // no stamp means the gate was killed before it ran a single line, which is also a kill
+    if let Some(started) = epoch_in(&dir.path().join("started")) {
+        assert!(
+            returned - started < 10.0,
+            "killed well before its own 30 s sleep ended, but run_gates came back {:.1} s after the gate began",
+            returned - started
+        );
+    }
+    assert!(!results[0].ok);
+    assert_eq!(results[0].exit_code, None, "killed => no exit code");
+    assert!(results[0].tail.contains("timeout"), "{}", results[0].tail);
+}
+
+/// Seconds since the Unix epoch, the same clock as Python's `time.time()` in a gate.
+fn epoch_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+/// A timestamp a gate wrote into `path`, if it got as far as writing it.
+fn epoch_in(path: &std::path::Path) -> Option<f64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Killing the gate must not wait for its descendants: a grandchild that inherited the output pipe
+/// keeps it open long after the gate itself is gone (`sh -c`, `cargo test`, ...). The clock starts
+/// when the grandchild runs, not when `run_gates` is called, so a slow process start under load
+/// cannot move the result.
+#[test]
+fn returns_promptly_after_a_timeout_even_when_a_descendant_keeps_the_pipe_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "import subprocess, sys, time\n\
+subprocess.Popen([sys.executable, '-c', \"import time; open('grandchild', 'w').write(str(time.time())); time.sleep(15)\"])\n\
+time.sleep(60)";
+    let results = run_gates(&[spec("tree", &py(code), 3)], dir.path());
+    let returned = epoch_now();
+    // the grandchild may still be starting when the gate is killed: wait for its timestamp
+    let marker = dir.path().join("grandchild");
+    let wait = std::time::Instant::now();
+    let grandchild_started = loop {
+        if let Some(t) = epoch_in(&marker) {
+            break t;
+        }
+        assert!(wait.elapsed().as_secs() < 30, "the grandchild never started");
+        std::thread::sleep(ms(50));
+    };
+    assert!(
+        returned - grandchild_started < 10.0,
+        "run_gates came back {:.1} s after the grandchild started; it slept 15 s holding the pipe",
+        returned - grandchild_started
+    );
     assert!(!results[0].ok);
     assert_eq!(results[0].exit_code, None, "killed => no exit code");
     assert!(results[0].tail.contains("timeout"), "{}", results[0].tail);
