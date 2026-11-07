@@ -33,11 +33,11 @@ const EDITABLE: &[(&str, &str)] = &[
         "run the gates in the repo root after each merge",
     ),
     (
-        "notify.remind_after_minutes",
+        "notify.after_minutes",
         "minutes before `asf serve` first reminds you of something waiting (0: off)",
     ),
     (
-        "notify.remind_every_minutes",
+        "notify.every_minutes",
         "minutes between repeated reminders (0: remind once)",
     ),
 ];

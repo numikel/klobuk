@@ -82,7 +82,7 @@ pub fn send_due(
     now: OffsetDateTime,
 ) -> Result<Vec<Sent>, AppError> {
     let cfg = &ctx.config.notify;
-    if cfg.remind_after_minutes == 0 {
+    if cfg.after_minutes == 0 {
         return Ok(Vec::new());
     }
     state.sync(&ctx.store)?;
@@ -674,7 +674,7 @@ mod flow_tests {
             .is_empty());
         assert!(notify_log(&fx).is_empty());
 
-        fx.ctx.config.notify.remind_after_minutes = 0;
+        fx.ctx.config.notify.after_minutes = 0;
         assert!(send_due(&fx.ctx, &fx.rt, &mut state, later(600))
             .unwrap()
             .is_empty());

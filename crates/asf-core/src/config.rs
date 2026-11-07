@@ -297,9 +297,9 @@ impl Default for ReviewCfg {
 #[serde(default)]
 pub struct NotifyCfg {
     /// First reminder after this many minutes of waiting; `0` switches reminders off.
-    pub remind_after_minutes: u64,
+    pub after_minutes: u64,
     /// Repeat every this many minutes while the thing still waits; `0` reminds only once.
-    pub remind_every_minutes: u64,
+    pub every_minutes: u64,
     /// Optional program run once per reminder, without a shell. Empty: no command.
     pub command: Vec<String>,
 }
@@ -307,8 +307,8 @@ pub struct NotifyCfg {
 impl Default for NotifyCfg {
     fn default() -> Self {
         NotifyCfg {
-            remind_after_minutes: 15,
-            remind_every_minutes: 30,
+            after_minutes: 15,
+            every_minutes: 30,
             command: Vec::new(),
         }
     }
@@ -400,8 +400,8 @@ budget_usd = 1.0          # per planning step
 max_turns = 15
 
 [notify]                  # `asf serve` reminds you while something waits for you (blocked issue, failed merge, stalled run, unanswered question)
-remind_after_minutes = 15 # first reminder after this long; 0 switches reminders off
-remind_every_minutes = 30 # then again this often while it still waits; 0 reminds only once
+after_minutes = 15 # first reminder after this long; 0 switches reminders off
+every_minutes = 30 # then again this often while it still waits; 0 reminds only once
 # command = ["pwsh", "-File", "notify.ps1"]  # optional, run once per reminder without a shell (10 s limit) with
 #                                            # ASF_REMIND_ISSUE, ASF_REMIND_KIND, ASF_REMIND_AGE_MINUTES, ASF_REMIND_TEXT set
 "#;

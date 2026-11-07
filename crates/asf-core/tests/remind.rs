@@ -32,8 +32,8 @@ fn waiting(n: u32, kind: WaitKind, minutes_ago: i64, reason: &str) -> Waiting {
 
 fn cfg(after: u64, every: u64) -> NotifyCfg {
     NotifyCfg {
-        remind_after_minutes: after,
-        remind_every_minutes: every,
+        after_minutes: after,
+        every_minutes: every,
         command: Vec::new(),
     }
 }

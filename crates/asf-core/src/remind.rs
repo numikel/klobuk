@@ -121,11 +121,11 @@ fn parse_ts(s: &str) -> Option<OffsetDateTime> {
 
 /// The reminders due at `now`.
 ///
-/// - `remind_after_minutes == 0` switches everything off.
+/// - `after_minutes == 0` switches everything off.
 /// - An issue waits on at most one thing: the oldest of its [`Waiting`] entries (ties: the kind
 ///   that sorts first), so a failed run and a failed merge item of one issue remind once.
-/// - A wait of at least `remind_after_minutes` is due unless the issue was reminded within
-///   `remind_every_minutes` (`reminded` is [`EventIndex::reminded`]); `remind_every_minutes == 0`
+/// - A wait of at least `after_minutes` is due unless the issue was reminded within
+///   `every_minutes` (`reminded` is [`EventIndex::reminded`]); `every_minutes == 0`
 ///   means "once": no repeat while the same wait lasts.
 /// - A reminder older than the wait itself belongs to an earlier episode and does not count.
 ///
@@ -136,11 +136,11 @@ pub fn due(
     now: OffsetDateTime,
     cfg: &NotifyCfg,
 ) -> Vec<Reminder> {
-    if cfg.remind_after_minutes == 0 {
+    if cfg.after_minutes == 0 {
         return Vec::new();
     }
-    let after_secs = secs(cfg.remind_after_minutes);
-    let every_secs = secs(cfg.remind_every_minutes);
+    let after_secs = secs(cfg.after_minutes);
+    let every_secs = secs(cfg.every_minutes);
 
     let mut oldest: BTreeMap<&IssueId, (OffsetDateTime, &Waiting)> = BTreeMap::new();
     for w in waiting {

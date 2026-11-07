@@ -25,8 +25,8 @@ fn show_lists_the_twelve_editable_keys_with_current_values() {
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
     assert_eq!(rows.len(), 12, "{res}");
-    assert_eq!(entry(rows, "notify.remind_after_minutes")["value"], 15);
-    assert_eq!(entry(rows, "notify.remind_every_minutes")["value"], 30);
+    assert_eq!(entry(rows, "notify.after_minutes")["value"], 15);
+    assert_eq!(entry(rows, "notify.every_minutes")["value"], 30);
 
     assert_eq!(entry(rows, "scheduler.max_parallel")["value"], 3);
     assert_eq!(entry(rows, "review.required")["value"], false);
@@ -214,22 +214,22 @@ fn set_is_refused_inside_a_worker_run_but_show_is_allowed() {
 #[test]
 fn set_changes_the_reminder_minutes_and_keeps_the_commented_command() {
     let r = Repo::initialised();
-    let res = r.ok(&["config", "set", "notify.remind_after_minutes", "5"]);
+    let res = r.ok(&["config", "set", "notify.after_minutes", "5"]);
     assert_eq!(res["old"], 15, "{res}");
     assert_eq!(res["new"], 5, "{res}");
-    r.ok(&["config", "set", "notify.remind_every_minutes", "0"]);
+    r.ok(&["config", "set", "notify.every_minutes", "0"]);
 
     let after = String::from_utf8(config_bytes(&r)).unwrap();
-    assert!(after.contains("remind_after_minutes = 5"), "{after}");
-    assert!(after.contains("remind_every_minutes = 0"), "{after}");
+    assert!(after.contains("after_minutes = 5"), "{after}");
+    assert!(after.contains("every_minutes = 0"), "{after}");
     assert!(
         after.contains("# command = [\"pwsh\", \"-File\", \"notify.ps1\"]"),
         "the command stays a comment: {after}"
     );
     let rows = r.ok(&["config", "show"]);
     let rows = rows.as_array().unwrap();
-    assert_eq!(entry(rows, "notify.remind_after_minutes")["value"], 5);
-    assert_eq!(entry(rows, "notify.remind_every_minutes")["value"], 0);
+    assert_eq!(entry(rows, "notify.after_minutes")["value"], 5);
+    assert_eq!(entry(rows, "notify.every_minutes")["value"], 0);
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn a_negative_reminder_delay_and_the_command_list_are_refused() {
     let r = Repo::initialised();
     let before = config_bytes(&r);
     for bad in ["soon", "1.5"] {
-        let (code, _, _) = r.err(&["config", "set", "notify.remind_after_minutes", bad]);
+        let (code, _, _) = r.err(&["config", "set", "notify.after_minutes", bad]);
         assert_eq!(code, 1, "{bad}");
     }
     let (code, _, message) = r.err(&["config", "set", "notify.command", "[\"x\"]"]);

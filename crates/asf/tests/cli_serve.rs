@@ -595,9 +595,9 @@ fn serve_prints_the_reminder_in_the_human_report() {
 }
 
 #[test]
-fn zero_remind_after_minutes_switches_reminders_off() {
+fn zero_after_minutes_switches_reminders_off() {
     let (repo, _) = repo_with_an_old_blocked_issue();
-    set_notify(&repo, "[notify]\nremind_after_minutes = 0\n");
+    set_notify(&repo, "[notify]\nafter_minutes = 0\n");
     let res = repo.ok(&["serve", "--once"]);
     assert_eq!(res["reminders"], serde_json::json!([]), "{res}");
     assert!(notifications(&repo).is_empty());
