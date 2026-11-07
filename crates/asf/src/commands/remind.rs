@@ -170,7 +170,9 @@ fn collect(ctx: &Ctx, index: &EventIndex) -> Result<Vec<Waiting>, AppError> {
             MergeState::Blocked => WaitKind::MergeBlocked,
             _ => continue,
         };
-        if live.contains_key(&m.issue_id) {
+        // A worker that a reviewer sent back is fixing the findings (the item stays failed while its
+        // run is active again): nothing waits for the human then. Same guard as `merge retry`.
+        if live.contains_key(&m.issue_id) && store.runs(Some(&m.issue_id), true)?.is_empty() {
             out.push(Waiting {
                 reason: m
                     .last_error
@@ -609,6 +611,31 @@ mod flow_tests {
 
         let state = RemindState::new();
         assert!(collect(&fx.ctx, &state.index).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_merge_whose_worker_is_fixing_review_findings_does_not_wait() {
+        let fx = fixture();
+        // sent back by the reviewer: the item stays failed, the run is reopened as working
+        let fixing = issue(&fx, "fixing", Status::InProgress);
+        run_in(&fx, &fixing, RunState::Working, None);
+        merge_in(
+            &fx,
+            &fixing,
+            MergeState::Failed,
+            "review asks for changes on feat/x",
+        );
+        // the same failed item with nobody working on it does wait for the human
+        let idle = issue(&fx, "idle", Status::Validating);
+        merge_in(&fx, &idle, MergeState::Blocked, "main is dirty");
+
+        let state = RemindState::new();
+        let got: Vec<_> = collect(&fx.ctx, &state.index)
+            .unwrap()
+            .into_iter()
+            .map(|w| (w.issue, w.kind))
+            .collect();
+        assert_eq!(got, vec![(idle, WaitKind::MergeBlocked)]);
     }
 
     #[test]
