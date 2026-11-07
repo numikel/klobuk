@@ -8,6 +8,9 @@
 //! A scripted `{"error":"timeout"}` start leaves the agent registered in state `unknown`: a re-read
 //! sees `unknown` unless an `info` entry (`{"state":"idle"}`) says the agent came up after all, and
 //! closing the workspace drops it, so the next `start_agent` on a fresh workspace starts clean.
+//!
+//! A scripted `prompt` entry `{"error":"stalled"|"timeout"}` types the text but does not submit it;
+//! `"swallow_enter": N` makes the input box ignore the first N Enters that follow.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -27,6 +30,9 @@ struct Agent {
     info: AgentInfo,
     #[serde(default)]
     pending_enter: bool,
+    /// Enters that the input box still ignores before one submits the pending text.
+    #[serde(default)]
+    swallow_enter: u32,
     pane_id: String,
     workspace_id: String,
     screen: String,
@@ -186,6 +192,7 @@ impl AgentRuntime for FakeRuntime {
                     ..AgentInfo::default()
                 },
                 pending_enter: false,
+                swallow_enter: 0,
                 pane_id: r.pane_id.clone(),
                 workspace_id,
                 screen,
@@ -237,13 +244,25 @@ impl AgentRuntime for FakeRuntime {
             let scripted = st.script.prompt.pop_front();
             let a = agent_mut(st, &h.name)?;
             a.screen.push_str(&format!("\n> {text}\n"));
-            if scripted.as_ref().and_then(|v| v.get("error")).is_some() {
-                // text landed in the input box but Enter was not accepted
+            if let Some(v) = scripted.as_ref().filter(|v| v.get("error").is_some()) {
+                // text landed in the input box but Enter was not accepted; `swallow_enter` makes the
+                // box ignore that many further Enters too
                 a.pending_enter = true;
-                return Err(RuntimeError::Stalled(format!(
-                    "agent prompt produced no observed working or blocked state (fake); current status is {}",
-                    a.info.state
-                )));
+                a.swallow_enter = v
+                    .get("swallow_enter")
+                    .and_then(Value::as_u64)
+                    .map_or(0, |n| n as u32);
+                return Err(if v.get("error").and_then(Value::as_str) == Some("timeout") {
+                    RuntimeError::Timeout(format!(
+                        "timed out waiting for agent status of {} (fake prompt)",
+                        h.name
+                    ))
+                } else {
+                    RuntimeError::Stalled(format!(
+                        "agent prompt produced no observed working or blocked state (fake); current status is {}",
+                        a.info.state
+                    ))
+                });
             }
             a.info.state = until.first().copied().unwrap_or(AgentState::Working);
             a.info.revision += 1;
@@ -308,10 +327,14 @@ impl AgentRuntime for FakeRuntime {
         self.with("send_keys", json!({ "name": h.name, "keys": keys }), |st| {
             let a = agent_mut(st, &h.name)?;
             if a.pending_enter && keys.contains(&"enter") {
-                a.pending_enter = false;
-                a.info.state = AgentState::Working;
-                a.info.revision += 1;
-                a.info.state_change_seq = Some(a.info.revision);
+                if a.swallow_enter > 0 {
+                    a.swallow_enter -= 1;
+                } else {
+                    a.pending_enter = false;
+                    a.info.state = AgentState::Working;
+                    a.info.revision += 1;
+                    a.info.state_change_seq = Some(a.info.revision);
+                }
             }
             Ok(())
         })

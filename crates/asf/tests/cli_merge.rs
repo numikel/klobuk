@@ -1393,3 +1393,159 @@ fn merge_retry_is_refused_while_the_worker_is_fixing_the_findings() {
         "the item was not requeued behind the worker's back"
     );
 }
+
+// ---- a reviewer that cannot start does not burn the merge item ----------------------------------
+
+/// A 1 ms startup window, so the re-read after a start timeout finds `unknown` at once and gives up.
+/// Committed so main stays clean; call it before the worker's run is set up.
+fn short_start_window(f: &F) {
+    set_config(f, "auto_trust = true", "start_timeout_ms = 1\nauto_trust = true");
+}
+
+/// The next `n` agent starts time out and the agent never comes up. Call it after `finished_run`,
+/// which starts the worker's own agent first.
+fn failing_reviewer_starts(f: &F, n: usize) {
+    script_starts(f, vec![serde_json::json!({"error": "timeout"}); n]);
+}
+
+fn script_starts(f: &F, entries: Vec<serde_json::Value>) {
+    FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
+        .script(serde_json::json!({ "start_agent": entries }))
+        .unwrap();
+}
+
+fn item_state(f: &F) -> MergeState {
+    store(f).merge_queue().unwrap()[0].state
+}
+
+#[test]
+fn a_reviewer_that_cannot_start_closes_its_review_and_leaves_the_item_for_the_next_tick() {
+    let f = setup();
+    require_review(&f);
+    short_start_window(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    failing_reviewer_starts(&f, 1);
+    let agents = start_agents(&f);
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "queued", "{res}");
+    assert_eq!(start_agents(&f), agents + 1);
+    let err = res["items"][0]["last_error"].as_str().expect("the cause is kept");
+    assert!(err.contains("reviewer") && err.contains("1 of 2"), "{err}");
+    assert!(
+        comments_of(&f, CommentType::Blocker).is_empty(),
+        "no BLOCKER on the first failure"
+    );
+    assert_eq!(events_of(&f, "merge.review_start_failed").len(), 1);
+
+    // the failed reviewer is closed: review issue, run, claim, workspace, slot
+    let rid = review_id(&f);
+    assert_eq!(status_of(&f, &rid), "cancelled");
+    let run = store(&f)
+        .runs(Some(&rid.parse().unwrap()), false)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(run.state, RunState::Failed, "{run:?}");
+    assert!(run.finished_at.is_some());
+    assert!(store(&f)
+        .active_claims()
+        .unwrap()
+        .iter()
+        .all(|c| c.issue_id.to_string() != rid));
+    assert_eq!(running(&f), (0, 0));
+    assert_eq!(
+        status_of(&f, &f.issue),
+        "validating",
+        "the reviewed issue is untouched"
+    );
+
+    // the next tick starts a fresh reviewer on a new review issue
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(start_agents(&f), agents + 2);
+    let next = review_id(&f);
+    assert_ne!(next, rid);
+    assert_eq!(status_of(&f, &next), "in-progress");
+    assert_eq!(running(&f), (0, 1));
+    assert!(comments_of(&f, CommentType::Blocker).is_empty());
+}
+
+#[test]
+fn two_failed_reviewer_starts_in_a_row_fail_the_item_with_a_blocker() {
+    let f = setup();
+    require_review(&f);
+    short_start_window(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    failing_reviewer_starts(&f, 2);
+    let agents = start_agents(&f);
+
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "queued"
+    );
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(start_agents(&f), agents + 2, "two starts, then it gives up");
+    let err = res["items"][0]["last_error"].as_str().unwrap();
+    assert!(err.contains("cannot start the reviewer"), "{err}");
+    let blockers = comments_of(&f, CommentType::Blocker);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert_eq!(blockers[0].to_lane, "human");
+    assert!(blockers[0].body.contains("merge retry"), "{}", blockers[0].body);
+
+    for r in reviews_of(&f, &f.issue) {
+        assert_eq!(status_of(&f, r.id.as_str()), "cancelled", "{}", r.id);
+    }
+    assert_eq!(reviews_of(&f, &f.issue).len(), 2);
+    assert_eq!(running(&f), (0, 0));
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["processed"],
+        0,
+        "a failed item waits for the human"
+    );
+}
+
+#[test]
+fn a_reviewer_that_started_resets_the_count_of_failed_starts() {
+    let f = setup();
+    require_review(&f);
+    short_start_window(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    // fails, starts, then fails again in the next round: two failures, but not in a row
+    script_starts(
+        &f,
+        vec![
+            serde_json::json!({"error": "timeout"}),
+            serde_json::json!({"state": "idle"}),
+            serde_json::json!({"error": "timeout"}),
+        ],
+    );
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "queued"
+    );
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "reviewing"
+    );
+
+    lose_the_worker(&f);
+    decide_as(
+        &f,
+        &review_id(&f),
+        "changes:\n- src/greet.rs: hello() has no test",
+    );
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "failed"
+    );
+    f.repo.ok(&["merge", "retry", &f.issue]);
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(
+        res["items"][0]["state"], "queued",
+        "the earlier failure does not count: {res}"
+    );
+    assert_eq!(item_state(&f), MergeState::Queued);
+}

@@ -21,6 +21,13 @@ use crate::worker::{Worker, RUNS_DIR};
 /// comment at that moment, so verdicts of earlier rounds are never read again.
 const REVIEW_STARTED: &str = "merge.review_started";
 
+/// Event the queue appends when the reviewer of a round could not be started. The failures at the
+/// end of the history, with no started reviewer after them, are the ones that count in a row.
+const REVIEW_START_FAILED: &str = "merge.review_start_failed";
+
+/// Failed reviewer starts in a row after which the item fails instead of going back to the queue.
+const REVIEW_START_ATTEMPTS: usize = 2;
+
 /// Event the queue appends when a reviewer approves; its `patch_id` is the `git patch-id --verbatim`
 /// fingerprint of the approved branch (whitespace counts). Approvals never expire: a later review of an identical patch is skipped.
 const REVIEW_APPROVED: &str = "merge.review_approved";
@@ -783,22 +790,90 @@ fn enter_review(ctx: &Ctx, item: &MergeItem, run: &Option<Run>) -> Result<MergeI
     })?;
     match Worker::new(ctx).and_then(|w| w.start_review(&issue, run)) {
         Ok(_) => Ok(updated),
-        Err(e) => {
-            let msg = format!("cannot start the reviewer: {}", e.message);
-            let failed = fail(ctx, item, MergeState::Failed, msg.clone(), None)?;
-            comment(
-                ctx,
-                &item.issue_id,
-                CommentType::Blocker,
-                LANE_HUMAN,
-                format!(
-                    "{msg}\n\nFix the cause, then `asf merge retry {}`.",
-                    item.issue_id
-                ),
-            )?;
-            Ok(failed)
+        Err(e) => review_start_failed(ctx, item, &e.message),
+    }
+}
+
+/// A reviewer that could not start (its pane never came up, the prompt never went in, the runtime is
+/// down) is no verdict on the branch, so the first failures do not burn the item: the dead reviewer is
+/// closed and the item goes back to `queued`, where the next tick starts a fresh one. Only
+/// `REVIEW_START_ATTEMPTS` failed starts in a row fail the item, with a BLOCKER for the human.
+fn review_start_failed(ctx: &Ctx, item: &MergeItem, cause: &str) -> Result<MergeItem, AppError> {
+    close_reviews_as(
+        ctx,
+        &item.issue_id,
+        "reviewer could not start",
+        RunState::Failed,
+        Status::Cancelled,
+    );
+    ctx.store.append_event(&NewEvent {
+        kind: REVIEW_START_FAILED.into(),
+        issue_id: Some(item.issue_id.clone()),
+        run_id: item.run_id.clone(),
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload: serde_json::json!({ "cause": cause }),
+    })?;
+    let msg = format!("cannot start the reviewer: {cause}");
+    let in_a_row = failed_review_starts_in_a_row(ctx, &item.issue_id)?;
+    if in_a_row < REVIEW_START_ATTEMPTS {
+        return fail(
+            ctx,
+            item,
+            MergeState::Queued,
+            format!(
+                "{msg} (failed start {in_a_row} of {REVIEW_START_ATTEMPTS}; the next tick starts a fresh reviewer)"
+            ),
+            None,
+        );
+    }
+    let failed = fail(
+        ctx,
+        item,
+        MergeState::Failed,
+        format!("{msg} ({in_a_row} reviewer starts in a row failed)"),
+        None,
+    )?;
+    comment(
+        ctx,
+        &item.issue_id,
+        CommentType::Blocker,
+        LANE_HUMAN,
+        format!(
+            "{msg}\n\n{in_a_row} reviewer starts in a row failed. Fix the cause, then `asf merge retry {}`.",
+            item.issue_id
+        ),
+    )?;
+    Ok(failed)
+}
+
+/// Failed reviewer starts of `id` since a reviewer last started: the failures at the end of the
+/// `merge.review_started` / `merge.review_start_failed` history, where a start with no failure after
+/// it (a reviewer that did come up) ends the streak.
+fn failed_review_starts_in_a_row(ctx: &Ctx, id: &IssueId) -> Result<usize, AppError> {
+    let mut streak = 0;
+    let mut last_failed = false;
+    let mut seq = 0;
+    loop {
+        let page = ctx.store.events_since(seq, 500)?;
+        let Some(last) = page.last() else { break };
+        seq = last.seq;
+        for e in page.iter().filter(|e| e.issue_id.as_ref() == Some(id)) {
+            match e.kind.as_str() {
+                REVIEW_STARTED => {
+                    if !last_failed {
+                        streak = 0;
+                    }
+                    last_failed = false;
+                }
+                REVIEW_START_FAILED => {
+                    streak += 1;
+                    last_failed = true;
+                }
+                _ => {}
+            }
         }
     }
+    Ok(streak)
 }
 
 /// One look at an item waiting for its reviewer. `None` when there is no verdict of the current
@@ -978,6 +1053,12 @@ fn request_changes(ctx: &Ctx, item: &MergeItem, findings: &[String]) -> Result<M
 /// merge. A review issue that is already terminal is skipped untouched: `set_status(done -> done)`
 /// would rewrite `closed_at` and append a junk `issue.status` event each time.
 fn close_reviews(ctx: &Ctx, id: &IssueId, reason: &str) {
+    close_reviews_as(ctx, id, reason, RunState::Succeeded, Status::Done);
+}
+
+/// `close_reviews` with the end state of the runs and of the review issues chosen by the caller: a
+/// reviewer that read its verdict is `succeeded`/`done`, one that never started is `failed`/`cancelled`.
+fn close_reviews_as(ctx: &Ctx, id: &IssueId, reason: &str, run_state: RunState, status: Status) {
     let Ok(children) = review_children(ctx, id) else {
         return;
     };
@@ -999,7 +1080,7 @@ fn close_reviews(ctx: &Ctx, id: &IssueId, reason: &str) {
             let _ = ctx.store.update_run(
                 &r.id,
                 &RunPatch {
-                    state: Some(RunState::Succeeded),
+                    state: Some(run_state),
                     exit_reason: Some(reason.into()),
                     finished_at: Some(now_rfc3339()),
                     ..RunPatch::default()
@@ -1007,7 +1088,7 @@ fn close_reviews(ctx: &Ctx, id: &IssueId, reason: &str) {
             );
         }
         let _ = ctx.store.release(&rid);
-        let _ = ctx.store.set_status(&rid, Status::Done, LANE_ORCHESTRATOR);
+        let _ = ctx.store.set_status(&rid, status, LANE_ORCHESTRATOR);
     }
 }
 

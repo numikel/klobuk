@@ -180,6 +180,65 @@ fn script_can_make_prompt_stall_once() {
     );
 }
 
+fn started(rt: &FakeRuntime, dir: &std::path::Path) -> AgentHandle {
+    let ws = rt
+        .open_workspace(&OpenWorkspace {
+            cwd: dir.to_path_buf(),
+            label: "x".into(),
+            env: vec![],
+        })
+        .unwrap();
+    rt.start_agent(&StartAgent {
+        name: "a".into(),
+        pane_id: ws.pane_id,
+        args: vec![],
+        timeout_ms: 1,
+    })
+    .unwrap();
+    handle("a")
+}
+
+#[test]
+fn script_can_make_prompt_time_out_with_the_text_still_unsent() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "prompt": [{"error": "timeout"}] }))
+        .unwrap();
+    let h = started(&rt, dir.path());
+    let e = rt.prompt(&h, "go", &[AgentState::Working], 1).unwrap_err();
+    assert!(matches!(e, RuntimeError::Timeout(_)), "{e:?}");
+    assert_eq!(rt.info(&h).unwrap().state, AgentState::Idle);
+    rt.send_keys(&h, &["enter"]).unwrap();
+    assert_eq!(rt.info(&h).unwrap().state, AgentState::Working);
+}
+
+#[test]
+fn script_can_swallow_the_first_enters_after_a_failed_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "prompt": [{"error": "stalled", "swallow_enter": 2}] }))
+        .unwrap();
+    let h = started(&rt, dir.path());
+    assert!(matches!(
+        rt.prompt(&h, "go", &[AgentState::Working], 1).unwrap_err(),
+        RuntimeError::Stalled(_)
+    ));
+    for n in 1..=2 {
+        rt.send_keys(&h, &["enter"]).unwrap();
+        assert_eq!(
+            rt.info(&h).unwrap().state,
+            AgentState::Idle,
+            "Enter #{n} is swallowed"
+        );
+    }
+    rt.send_keys(&h, &["enter"]).unwrap();
+    assert_eq!(
+        rt.info(&h).unwrap().state,
+        AgentState::Working,
+        "the third Enter submits"
+    );
+}
+
 #[test]
 fn script_start_timeout_registers_the_agent_anyway() {
     let dir = tempfile::tempdir().unwrap();

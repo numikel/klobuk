@@ -19,6 +19,12 @@ use crate::output::{AppError, ErrorCode};
 pub const RUNS_DIR: &str = "runs";
 pub const HOOK_TIMEOUT_S: u64 = 30;
 const TRUST_MARKERS: [&str; 2] = ["trust this folder", "Yes, I trust"];
+/// Submit-key presses a kick-off gets before the start gives up.
+const KICKOFF_ENTERS: usize = 3;
+/// Look-and-wait rounds of that check (`unknown` states use rounds without a key press).
+const KICKOFF_ROUNDS: usize = 6;
+/// How long one round waits for the agent to leave `idle`; Claude normally does within a second.
+const KICKOFF_WAIT_MS: u64 = 5_000;
 
 pub struct Worker<'a> {
     pub ctx: &'a Ctx,
@@ -45,9 +51,11 @@ struct Launch<'a> {
     settings_path: PathBuf,
     model: Option<String>,
     kick: String,
-    /// After a startup-detection timeout whose agent never came up, start once more in a fresh
-    /// workspace. Workers do; reviewers keep the single attempt.
-    retry_start: bool,
+    /// A reviewer, not a worker. After a startup-detection timeout whose agent never came up, a worker
+    /// starts once more in a fresh workspace; a reviewer keeps the single attempt, and when it fails the
+    /// run and the review issue are closed (see `start_failed`), because the merge queue starts a fresh
+    /// reviewer on its next tick.
+    reviewer: bool,
 }
 
 /// A runtime workspace whose agent is about to be started: the run (patched with the workspace, the
@@ -435,7 +443,7 @@ impl<'a> Worker<'a> {
                 settings_path,
                 model: self.ctx.config.worker.model.clone(),
                 kick: format!("Start {id}: read {FACTORY_DIR}/{RUNS_DIR}/{id}/brief.md and follow it."),
-                retry_start: true,
+                reviewer: false,
             },
             &fail_run,
         )
@@ -456,8 +464,10 @@ impl<'a> Worker<'a> {
             mut start,
             mut handle,
         } = self.open_pane(l, l.run).map_err(fail_run)?;
+        let give_up =
+            |run: &Run, handle: &AgentHandle, e: RuntimeError| self.start_failed(l, run, handle, e, fail_run);
         let mut trusted = false;
-        let agent = match self.rt.start_agent(&start) {
+        let _up = match self.rt.start_agent(&start) {
             Ok(a) => a,
             Err(RuntimeError::NotReady(msg)) => {
                 let screen = self.rt.read(&handle, 60).unwrap_or_default();
@@ -474,17 +484,16 @@ impl<'a> Worker<'a> {
                     ) {
                         Ok(a) => a,
                         Err(_) => self
-                            .rt
-                            .start_agent(&start)
-                            .map_err(|e| self.block_start(&run, &handle, e))?,
+                            .start_and_await(&start, &handle)
+                            .map_err(|e| give_up(&run, &handle, e))?,
                     }
                 } else {
-                    return Err(self.block_start(&run, &handle, RuntimeError::NotReady(msg)));
+                    return Err(give_up(&run, &handle, RuntimeError::NotReady(msg)));
                 }
             }
             Err(RuntimeError::Timeout(msg)) => match self.await_started(&handle, msg) {
                 Ok(a) => a,
-                Err(first) if l.retry_start => {
+                Err(first) if !l.reviewer => {
                     // The pane never came up: record why, drop the dead workspace and try exactly once more
                     // in a fresh one (new pane, new session id). A second failure blocks as before.
                     store.append_event(&NewEvent {
@@ -497,43 +506,16 @@ impl<'a> Worker<'a> {
                     let _ = self.rt.close_workspace(&ws.workspace_id);
                     let pane = self.open_pane(l, &run).map_err(fail_run)?;
                     (run, ws, start, handle) = (pane.run, pane.ws, pane.start, pane.handle);
-                    match self.rt.start_agent(&start) {
-                        Ok(a) => a,
-                        Err(RuntimeError::Timeout(msg)) => self
-                            .await_started(&handle, msg)
-                            .map_err(|e| self.block_start(&run, &handle, e))?,
-                        Err(e) => return Err(self.block_start(&run, &handle, e)),
-                    }
+                    self.start_and_await(&start, &handle)
+                        .map_err(|e| give_up(&run, &handle, e))?
                 }
-                Err(e) => return Err(self.block_start(&run, &handle, e)),
+                Err(e) => return Err(give_up(&run, &handle, e)),
             },
-            Err(e) => return Err(self.block_start(&run, &handle, e)),
+            Err(e) => return Err(give_up(&run, &handle, e)),
         };
-        let agent = match self.rt.prompt(
-            &handle,
-            &l.kick,
-            &[AgentState::Working],
-            self.ctx.config.worker.prompt_timeout_ms,
-        ) {
-            Ok(a) => a,
-            Err(RuntimeError::Timeout(_)) => agent,
-            Err(RuntimeError::Stalled(_)) => {
-                // Verified live: the text can sit in Claude's input box with Enter swallowed. Never retype
-                // the prompt; press Enter once and give the agent a moment to start.
-                self.rt
-                    .send_keys(&handle, &["enter"])
-                    .map_err(|e| self.block_start(&run, &handle, e))?;
-                match self.rt.wait(
-                    &handle,
-                    &[AgentState::Working],
-                    self.ctx.config.worker.prompt_timeout_ms,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => return Err(self.block_start(&run, &handle, e)),
-                }
-            }
-            Err(e) => return Err(self.block_start(&run, &handle, e)),
-        };
+        let agent = self
+            .send_kickoff(&handle, &l.kick)
+            .map_err(|e| give_up(&run, &handle, e))?;
         let run = store.update_run(
             &run.id,
             &RunPatch {
@@ -625,6 +607,73 @@ impl<'a> Worker<'a> {
             start,
             handle,
         })
+    }
+
+    /// `start_agent`, and when Herdr's startup detection times out, a re-read of the agent instead of
+    /// a verdict: it may be up and ready (`await_started`).
+    fn start_and_await(&self, start: &StartAgent, handle: &AgentHandle) -> Result<AgentInfo, RuntimeError> {
+        match self.rt.start_agent(start) {
+            Err(RuntimeError::Timeout(msg)) => self.await_started(handle, msg),
+            other => other,
+        }
+    }
+
+    /// Types the kick-off prompt and makes sure Claude took it. `agent prompt --wait` has two ways to
+    /// end without seeing the agent work: `agent_prompt_stalled` (no `working`/`blocked` within 5 s of
+    /// the submission) and `timeout` (its own clock ran out). In both the text may sit in Claude's input
+    /// box with the Enter swallowed, so neither counts as delivered: `ensure_submitted` looks at the
+    /// agent and presses the submit key. The prompt itself is never typed twice.
+    fn send_kickoff(&self, handle: &AgentHandle, text: &str) -> Result<AgentInfo, RuntimeError> {
+        match self.rt.prompt(
+            handle,
+            text,
+            &[AgentState::Working],
+            self.ctx.config.worker.prompt_timeout_ms,
+        ) {
+            Ok(a) => Ok(a),
+            Err(RuntimeError::Timeout(_) | RuntimeError::Stalled(_)) => self.ensure_submitted(handle),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// After a kick-off that Herdr could not see start: the prompt is accepted once the agent is
+    /// `working`, `blocked` (a dialog took over, the watch loop answers it) or `done`. An `idle` agent
+    /// still has the text in its input box, so the submit key is pressed again, at most
+    /// `KICKOFF_ENTERS` times, each followed by a bounded wait. `unknown` gets a wait but no key: Enter
+    /// on a dialog Herdr cannot classify could answer it with its default. Whatever is left ends in a
+    /// `Timeout` naming the last state seen, which becomes the BLOCKER text.
+    fn ensure_submitted(&self, handle: &AgentHandle) -> Result<AgentInfo, RuntimeError> {
+        let window = self.ctx.config.worker.prompt_timeout_ms.min(KICKOFF_WAIT_MS);
+        let taken = [AgentState::Working, AgentState::Blocked, AgentState::Done];
+        let mut pressed = 0;
+        let mut last = AgentState::Unknown;
+        for _ in 0..KICKOFF_ROUNDS {
+            let info = self.rt.info(handle)?;
+            last = info.state;
+            let wait_for: &[AgentState] = match info.state {
+                AgentState::Working | AgentState::Blocked | AgentState::Done => return Ok(info),
+                AgentState::Idle if pressed >= KICKOFF_ENTERS => break,
+                AgentState::Idle => {
+                    self.rt.send_keys(handle, &["enter"])?;
+                    pressed += 1;
+                    &taken
+                }
+                AgentState::Unknown => &[
+                    AgentState::Idle,
+                    AgentState::Working,
+                    AgentState::Blocked,
+                    AgentState::Done,
+                ],
+            };
+            match self.rt.wait(handle, wait_for, window) {
+                Ok(a) if taken.contains(&a.state) => return Ok(a),
+                Ok(_) | Err(RuntimeError::Timeout(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(RuntimeError::Timeout(format!(
+            "kick-off prompt not submitted: agent still {last} after {pressed} submit key press(es)"
+        )))
     }
 
     /// `start_agent` timed out: Herdr's startup detection gave up, but the agent may still be coming
@@ -857,10 +906,37 @@ impl<'a> Worker<'a> {
                 settings_path,
                 model: Some(self.ctx.config.review.model.clone()),
                 kick: format!("Start {rid}: read {FACTORY_DIR}/{RUNS_DIR}/{rid}/brief.md and follow it."),
-                retry_start: false,
+                reviewer: true,
             },
             &fail_run,
         )
+    }
+
+    /// Startup of `l`'s agent failed for good. A worker is blocked (`block_start`). A reviewer is not
+    /// worth a human's attention yet: its workspace is closed, its run `failed`, its claim released and
+    /// its review issue `cancelled`, so no slot stays taken and no BLOCKER is posted; the merge queue
+    /// decides whether to start a fresh reviewer.
+    fn start_failed(
+        &self,
+        l: &Launch<'_>,
+        run: &Run,
+        handle: &AgentHandle,
+        e: RuntimeError,
+        fail_run: &dyn Fn(AppError) -> AppError,
+    ) -> AppError {
+        if !l.reviewer {
+            return self.block_start(run, handle, e);
+        }
+        let _ = self.rt.close_workspace(&handle.workspace_id);
+        let err = fail_run(AppError::new(
+            ErrorCode::Blocked,
+            format!("reviewer {} could not start: {e}", run.issue_id),
+        ));
+        let _ = self
+            .ctx
+            .store
+            .set_status(&run.issue_id, Status::Cancelled, LANE_ORCHESTRATOR);
+        err
     }
 
     /// Startup could not reach a working agent: keep the claim and workspace for inspection, tell the human.

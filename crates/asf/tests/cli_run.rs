@@ -232,6 +232,33 @@ fn start_answers_trust_prompt_automatically() {
 }
 
 #[test]
+fn a_startup_timeout_after_the_trust_answer_is_judged_by_a_re_read_of_the_agent() {
+    let f = setup();
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        s.replace("auto_trust = true", "start_timeout_ms = 1\nauto_trust = true"),
+    )
+    .unwrap();
+    fake(&f)
+        .script(serde_json::json!({
+            "start_agent": [{"error": "not_ready"}, {"error": "timeout"}],
+            "info": [{"state": "idle"}],
+            "screen": "Quick safety check: Is this a project you created?\n > No, exit\n   Yes, I trust this folder"
+        }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(res["trusted"], true);
+    assert_eq!(
+        ops(&f).iter().filter(|o| *o == "start_agent").count(),
+        2,
+        "never restarted a third time"
+    );
+}
+
+#[test]
 fn start_blocked_for_other_reason_keeps_run_blocked_and_posts_blocker() {
     let f = setup();
     fake(&f)
@@ -465,6 +492,78 @@ fn start_recovers_from_stalled_kickoff_by_pressing_enter() {
         log.iter().filter(|e| e.op == "prompt").count(),
         1,
         "the prompt is not typed twice"
+    );
+}
+
+fn enters(f: &F) -> usize {
+    fake(f)
+        .log()
+        .iter()
+        .filter(|e| e.op == "send_keys" && e.args["keys"] == serde_json::json!(["enter"]))
+        .count()
+}
+
+#[test]
+fn start_presses_enter_again_when_the_input_box_swallows_the_first_one() {
+    // the asf-72 / asf-36 shape: the kick-off is typed, the prompt stalls, and the Enter that
+    // follows is swallowed as well; the agent sits idle with the text in its input box
+    let f = setup();
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "stalled", "swallow_enter": 1}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(
+        enters(&f),
+        2,
+        "the submit key is pressed until the agent leaves idle"
+    );
+    assert_eq!(count_op(&f, "prompt"), 1, "the prompt is never typed twice");
+    assert_eq!(count_op(&f, "start_agent"), 1);
+    assert!(
+        store(&f)
+            .comments(&f.issue.parse().unwrap())
+            .unwrap()
+            .iter()
+            .all(|c| c.kind != CommentType::Blocker),
+        "no BLOCKER"
+    );
+}
+
+#[test]
+fn start_does_not_trust_a_prompt_call_that_timed_out() {
+    // `prompt` ended in `timeout` and the agent is still idle: the text was never submitted
+    let f = setup();
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "timeout"}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(
+        enters(&f),
+        1,
+        "an idle agent after the kick-off gets the submit key"
+    );
+    assert_eq!(count_op(&f, "prompt"), 1);
+}
+
+#[test]
+fn start_blocks_when_the_kickoff_stays_unsent_after_every_submit_key() {
+    let f = setup();
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "stalled", "swallow_enter": 99}] }))
+        .unwrap();
+    let (code, ecode, msg) = f.repo.err(&["run", "start", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (1, "blocked"), "{msg}");
+    assert!(msg.contains("not submitted"), "{msg}");
+    assert_eq!(enters(&f), 3, "three submit keys, not an endless loop");
+    assert_eq!(count_op(&f, "prompt"), 1);
+    assert_eq!(active_run(&f).state, RunState::Blocked);
+    let cs = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
+    assert_eq!(
+        cs.iter().filter(|c| c.kind == CommentType::Blocker).count(),
+        1,
+        "{cs:?}"
     );
 }
 
