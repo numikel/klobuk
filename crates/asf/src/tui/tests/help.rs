@@ -277,18 +277,6 @@ fn g_and_capital_g_jump_to_the_first_and_last_row() {
 }
 
 #[test]
-fn escape_in_normal_mode_closes_the_board_detail_panel() {
-    let mut a = app();
-    assert!(a.board.detail);
-    assert!(render_to_text(&a, 100, 30).contains("┌ detail "));
-    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
-    assert!(!a.board.detail);
-    assert!(!render_to_text(&a, 100, 30).contains("┌ detail "));
-    a.handle_key(code(KeyCode::Enter));
-    assert!(a.board.detail, "Enter still toggles it back");
-}
-
-#[test]
 fn a_status_set_again_by_a_key_gets_a_fresh_four_seconds() {
     let mut a = app();
     a.advance(ms(0));

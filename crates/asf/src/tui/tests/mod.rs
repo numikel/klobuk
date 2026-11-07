@@ -1,5 +1,8 @@
 //! Tests of the TUI, split by what they test. The builders every topic needs live here; each topic
-//! file starts with `use super::*;`.
+//! file starts with `use super::*;`. A view's own tests live in the file named after it
+//! (`board.rs`, `agents.rs`, `inbox.rs`, `queue.rs`, `log.rs`, `config.rs`, `now_view.rs`), so a view
+//! task edits its own file and no other. The modules are named like the views, so none of them is
+//! imported here by its short name: tests use the full path `crate::tui::views::<view>`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -17,7 +20,7 @@ use super::snapshot::{
 };
 use super::theme::no_color_requested;
 use super::theme::Theme;
-use super::views::{board, now};
+use super::views::now;
 use super::{bg_outcome, config_set_status, config_unset_status, keys_status, post_answer, BgKind};
 
 /// Selection and row queries the older tests were written against; the views own the state now.
@@ -26,7 +29,7 @@ impl App {
         let s = &self.snap;
         match view {
             View::Now => now::selected(s, &self.now),
-            View::Board => board::selected(s, &self.board),
+            View::Board => super::views::board::selected(s, &self.board),
             View::Agents => super::views::agents::selected(s, &self.agents),
             View::Inbox => super::views::inbox::selected(s, &self.inbox),
             View::Queue => super::views::queue::selected(s, &self.queue),
@@ -39,7 +42,7 @@ impl App {
         let s = &self.snap;
         match view {
             View::Now => now::rows(s),
-            View::Board => board::rows(s),
+            View::Board => super::views::board::rows(s),
             View::Agents => super::views::agents::rows(s),
             View::Inbox => super::views::inbox::rows(s),
             View::Queue => super::views::queue::rows(s),
@@ -52,7 +55,7 @@ impl App {
         let s = &self.snap;
         match self.view {
             View::Now => now::selected_row(s, &self.now).map(|r| r.issue().clone()),
-            View::Board => board::selected_issue(s, &self.board),
+            View::Board => super::views::board::selected_issue(s, &self.board),
             View::Agents => super::views::agents::selected_issue(s, &self.agents),
             View::Inbox => super::views::inbox::selected_issue(s, &self.inbox),
             View::Queue => super::views::queue::selected_issue(s, &self.queue),
@@ -70,14 +73,18 @@ fn needs(snap: &Snapshot) -> Vec<Need> {
     compute_needs(snap)
 }
 
+mod agents;
 mod answer;
 mod background;
+mod board;
 mod config;
 mod controls;
 mod frame;
 mod help;
 mod inbox;
+mod log;
 mod now_view;
+mod queue;
 mod render;
 mod snapshot;
 mod state;

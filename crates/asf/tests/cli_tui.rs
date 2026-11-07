@@ -464,6 +464,17 @@ fn tui_once_draws_the_same_frame_around_every_view() {
         );
         let tab = format!("[{}] ", n + 1);
         assert!(lines[1].contains(&tab), "{view} tabs: {:?}", lines[1]);
+        // a full-width rule closes the top chrome: under the tabs, or under the waiting banner
+        let top = if lines[2].trim_start().starts_with('■') {
+            3
+        } else {
+            2
+        };
+        assert_eq!(
+            lines[top],
+            "─".repeat(120),
+            "{view}: a rule above the view:\n{text}"
+        );
         let last = lines.len() - 1;
         assert_eq!(
             lines[last - 1],

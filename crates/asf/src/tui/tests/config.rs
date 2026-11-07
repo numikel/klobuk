@@ -1,39 +1,6 @@
 use super::*;
 
 #[test]
-fn board_columns_follow_status_all_without_cancelled() {
-    let expected: Vec<Status> = Status::ALL
-        .iter()
-        .copied()
-        .filter(|s| *s != Status::Cancelled)
-        .collect();
-    assert_eq!(board::columns(), expected);
-    let cols = board::columns();
-    let pos = |s: Status| cols.iter().position(|c| *c == s).unwrap();
-    assert_eq!(pos(Status::Validating), pos(Status::InReview) + 1);
-    assert_eq!(pos(Status::Done), pos(Status::Validating) + 1);
-}
-
-#[test]
-fn board_renders_a_validating_column_between_in_review_and_done() {
-    let mut s = snapshot();
-    s.issues.push(issue("asf-5", "Verify gates", Status::Validating));
-    let a = board_app(s);
-    let text = render_to_text(&a, 120, 30);
-    let title_row = text
-        .lines()
-        .find(|l| l.contains("in-review") && l.contains("validating") && l.contains("done"))
-        .unwrap_or_else(|| panic!("no column title row with all three:\n{text}"));
-    let at = |needle: &str| title_row.find(needle).unwrap();
-    assert!(
-        at("in-review") < at("validating") && at("validating") < at("done"),
-        "{title_row}"
-    );
-    assert!(text.contains("asf-5"), "validating issue missing:\n{text}");
-    assert_eq!(a.rows(View::Board), 5, "board_issues must include validating");
-}
-
-#[test]
 fn key_six_opens_config_view_listing_every_editable_key_with_its_value() {
     let mut a = app();
     assert_eq!(a.handle_key(key('7')), Action::None);

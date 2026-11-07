@@ -774,9 +774,10 @@ fn the_banner_is_for_the_other_views_the_footer_and_help_know_the_new_view() {
         line_of(&t, 1).contains("[1] Now") && line_of(&t, 1).contains("[7] Config"),
         "{t}"
     );
+    assert_eq!(line_of(&t, 2), "─".repeat(120), "a rule under the tab bar:\n{t}");
     assert!(
-        line_of(&t, 2).contains("NEEDS YOU"),
-        "content starts under the tab bar:\n{t}"
+        line_of(&t, 3).contains("NEEDS YOU"),
+        "content starts under that rule:\n{t}"
     );
     a.handle_key(key('2'));
     // the oldest thing that needs you: asf-5, over budget since the run started

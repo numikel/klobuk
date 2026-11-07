@@ -3,7 +3,7 @@
 //! area [`render`] hands it.
 //!
 //! Rows from the top: header, tabs, the banner (only while something needs the human and the view is
-//! not the Now view, which lists it itself), the view; from the bottom: a rule, then the hints.
+//! not the Now view, which lists it itself), a rule, the view; from the bottom: a rule, then the hints.
 
 use std::time::Duration;
 
@@ -171,7 +171,10 @@ struct Rows {
     header: Rect,
     tabs: Rect,
     banner: Option<Rect>,
+    /// The rule that closes the top chrome (under the banner, or under the tabs without one).
+    top_rule: Rect,
     body: Rect,
+    /// The rule above the key hints.
     rule: Rect,
     footer: Rect,
 }
@@ -181,13 +184,19 @@ fn split(area: Rect, banner: bool) -> Rows {
     if banner {
         constraints.push(Constraint::Length(1));
     }
-    constraints.extend([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)]);
+    constraints.extend([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ]);
     let rows = Layout::vertical(constraints).split(area);
     let n = rows.len();
     Rows {
         header: rows[0],
         tabs: rows[1],
         banner: banner.then(|| rows[2]),
+        top_rule: rows[n - 4],
         body: rows[n - 3],
         rule: rows[n - 2],
         footer: rows[n - 1],
@@ -225,6 +234,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             r,
         );
     }
+    frame.render_widget(rule(area.width, &app.theme), rows.top_rule);
     app.render_view(frame, rows.body);
     frame.render_widget(rule(area.width, &app.theme), rows.rule);
     frame.render_widget(footer(app), rows.footer);

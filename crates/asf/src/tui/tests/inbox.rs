@@ -1,4 +1,29 @@
+//! The Inbox view. Tests of it live here and nowhere else, so the task that rebuilds the view edits
+//! this file only.
+
 use super::*;
+
+#[test]
+fn inbox_view_renders_its_rows() {
+    let mut a = app();
+    a.handle_key(key('4'));
+    let t = render_to_text(&a, 100, 30);
+    assert!(
+        t.contains("BLOCKER") && t.contains("Worker is waiting for input."),
+        "{t}"
+    );
+    assert_eq!(a.rows(View::Inbox), 1);
+}
+
+#[test]
+fn inbox_view_selects_its_own_issue_and_enter_only_opens_the_comment() {
+    let mut a = app();
+    a.handle_key(key('4'));
+    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-2");
+    // Enter only opens the comment now; marking read is `m` / `M`.
+    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::None);
+    assert!(matches!(a.mode(), Mode::Comment { .. }));
+}
 
 #[test]
 fn enter_opens_the_comment_modal_and_changes_nothing_unread() {

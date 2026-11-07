@@ -4,7 +4,7 @@
 use super::*;
 use crate::tui::bindings::Binding;
 use crate::tui::theme::Mark;
-use crate::tui::views::{agents, config, inbox, log, queue};
+use crate::tui::views::{agents, board, config, inbox, log, queue};
 
 const WIDTHS: [u16; 2] = [100, 120];
 
@@ -27,6 +27,17 @@ fn every_view_sits_between_the_header_and_tabs_above_and_a_rule_and_the_hints_be
                 "{view:?}@{width} tabs: {:?}",
                 lines[1]
             );
+            // the top chrome ends with a rule: under the tabs, or under the banner when there is one
+            let banner = view != View::Now && !a.snap.needs_you.is_empty();
+            let top = if banner { 3 } else { 2 };
+            if banner {
+                assert!(lines[2].contains('■'), "{view:?}@{width} banner: {:?}", lines[2]);
+            }
+            assert_eq!(
+                lines[top],
+                "─".repeat(width as usize),
+                "{view:?}@{width}: a full-width rule above the view"
+            );
             assert_eq!(
                 lines[28],
                 "─".repeat(width as usize),
@@ -42,12 +53,44 @@ fn every_view_sits_between_the_header_and_tabs_above_and_a_rule_and_the_hints_be
 }
 
 #[test]
+fn without_a_banner_the_rule_follows_the_tabs_directly_and_the_view_starts_below_it() {
+    for view in View::ALL {
+        let mut a = App::new(Snapshot::default());
+        a.view = view;
+        let t = render_to_text(&a, 100, 30);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[1].contains("[1] Now"), "{view:?}: {:?}", lines[1]);
+        assert_eq!(lines[2], "─".repeat(100), "{view:?}: rule under the tabs");
+        assert_ne!(
+            lines[3],
+            "─".repeat(100),
+            "{view:?}: the view starts under the rule"
+        );
+    }
+    let buf = render_to_buffer(&App::new(Snapshot::default()), 100, 30);
+    assert!(
+        buf[(0, 2)].modifier.contains(Modifier::DIM),
+        "the top rule is secondary"
+    );
+}
+
+#[test]
 fn the_rule_and_the_hints_are_dim_and_accent() {
     let a = app();
     let buf = render_to_buffer(&a, 100, 30);
     assert!(
         buf[(0, 28)].modifier.contains(Modifier::DIM),
         "the rule is secondary"
+    );
+    // with a banner (a question waits) the rule sits one row lower, and is just as secondary
+    let waiting = board_app(blocked_snapshot());
+    let t = render_to_text(&waiting, 100, 30);
+    assert!(t.lines().nth(2).unwrap().contains('■'), "{t}");
+    assert_eq!(t.lines().nth(3).unwrap(), "─".repeat(100), "{t}");
+    let buf = render_to_buffer(&waiting, 100, 30);
+    assert!(
+        buf[(0, 3)].modifier.contains(Modifier::DIM),
+        "the rule under the banner is secondary too"
     );
     let (fg, m) = cell_style(&a, "? help", "?");
     assert_eq!((fg, m.contains(Modifier::BOLD)), (Color::Cyan, true));
@@ -75,7 +118,7 @@ fn the_answer_overlay_is_a_centred_accent_box_with_the_worker_screen_and_the_moc
             assert!(t.contains(needle), "{width}: {needle:?}:\n{t}");
         }
         // accent border, bold title, key letters accent + bold, words dim
-        let (fg, _) = cell_style(&a, "┌ answer", "┌");
+        let (fg, _) = cell_style(&a, "┌ answer", "┌ answer");
         assert_eq!(fg, Color::Cyan, "accent border");
         let (fg, m) = cell_style(&a, "1-4 choose", "Enter");
         assert_eq!((fg, m.contains(Modifier::BOLD)), (Color::Cyan, true));
@@ -190,62 +233,6 @@ fn every_view_renders_without_data_at_every_size_and_four_of_them_say_what_to_do
             "{view:?}: the sentence is secondary text"
         );
     }
-}
-
-#[test]
-fn the_board_asks_for_the_detail_of_the_issue_it_lands_on() {
-    let mut a = app(); // the Board, asf-4 (backlog) first
-    assert_eq!(a.handle_key(key('j')), Action::LoadDetail(id("asf-3")));
-    assert_eq!(a.handle_key(key('G')), Action::LoadDetail(id("asf-1")));
-    assert_eq!(
-        a.handle_key(key('G')),
-        Action::None,
-        "already there: nothing to load"
-    );
-    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
-    assert_eq!(
-        a.handle_key(code(KeyCode::Enter)),
-        Action::LoadDetail(id("asf-1")),
-        "opening the panel loads what it shows"
-    );
-    // the event loop also asks after a view switch or a refresh: wanted until the detail is there
-    assert_eq!(a.detail_wanted(), Some(id("asf-1")));
-    a.snap.detail = Some(crate::tui::snapshot::IssueDetail {
-        issue: id("asf-1"),
-        comments: vec![],
-        deps: vec![],
-    });
-    assert_eq!(a.detail_wanted(), None);
-    a.handle_key(key('2'));
-    assert_eq!(a.detail_wanted(), None, "only the Board shows a detail");
-}
-
-#[test]
-fn cancelled_issues_are_not_rows_so_the_selection_never_runs_past_the_last_card() {
-    use crate::tui::views::board;
-    let mut s = snapshot();
-    // the loader reads cancelled issues too; the Board does not list them
-    for n in 90..93 {
-        s.issues
-            .push(issue(&format!("asf-{n}"), "Dropped", Status::Cancelled));
-    }
-    let mut a = board_app(s);
-    let cards = board::ordered(&a.snap);
-    assert!(cards.len() >= 2 && cards.len() < a.snap.issues.len());
-    let last = cards.len() - 1;
-    let (second_to_last, final_card) = (cards[last - 1].id.clone(), cards[last].id.clone());
-
-    assert_eq!(board::rows(&a.snap), cards.len(), "rows are the cards on screen");
-    a.handle_key(key('G'));
-    a.handle_key(key('j')); // already at the bottom: nothing moves
-    assert_eq!(a.board.selected, last, "G stops at the last card");
-    assert_eq!(board::selected_issue(&a.snap, &a.board), Some(final_card));
-    assert_eq!(
-        a.handle_key(key('k')),
-        Action::LoadDetail(second_to_last.clone()),
-        "one k moves to the second-to-last card"
-    );
-    assert_eq!(board::selected_issue(&a.snap, &a.board), Some(second_to_last));
 }
 
 #[test]

@@ -110,9 +110,14 @@ fn banner_is_visible_in_every_view_but_now() {
 #[test]
 fn no_banner_and_no_reserved_line_when_nothing_waits() {
     let t = render_to_text(&app(), 120, 30);
+    assert_eq!(
+        line_of(&t, 2),
+        "─".repeat(120),
+        "no banner row: the rule follows the tab bar:\n{t}"
+    );
     assert!(
-        line_of(&t, 2).contains("backlog"),
-        "content starts right under the tab bar:\n{t}"
+        line_of(&t, 3).contains("backlog"),
+        "content starts right under that rule:\n{t}"
     );
     assert!(!t.contains("is waiting for your answer") && !t.contains(" asks:"));
 }
@@ -128,37 +133,4 @@ fn answered_question_is_not_waiting() {
     let mut other = q;
     other.to_lane = "orchestrator".into();
     assert!(unanswered_questions(&[other]).is_empty());
-}
-
-#[test]
-fn board_marks_a_blocked_run_with_a_red_bold_question_marker() {
-    let a = board_app(blocked_snapshot());
-    let t = render_to_text(&a, 120, 30);
-    assert!(t.contains("■ ? asf-2") && !t.contains('●'), "{t}");
-    let (fg, m) = cell_style(&a, "■ ? asf-2", "■ ? asf-2");
-    assert_eq!(fg, Color::Red);
-    assert!(m.contains(Modifier::BOLD));
-    let t = render_to_text(&app(), 120, 30);
-    assert!(
-        t.contains("● asf-2") && !t.contains('■'),
-        "a working run is a green dot:\n{t}"
-    );
-}
-
-#[test]
-fn agents_row_of_a_blocked_run_starts_with_a_red_bold_square() {
-    let mut a = board_app(blocked_snapshot());
-    a.handle_key(key('3'));
-    let t = render_to_text(&a, 120, 30);
-    let row = t
-        .lines()
-        .find(|l| l.contains("asf-2") && l.contains("blocked") && l.contains('│'))
-        .unwrap_or_else(|| panic!("no agents row:\n{t}"));
-    assert!(row.trim_start_matches([' ', '│']).starts_with('■'), "{row:?}");
-    let (fg, m) = cell_style(&a, "blocked", "■");
-    assert_eq!(fg, Color::Red);
-    assert!(m.contains(Modifier::BOLD));
-    let mut w = board_app(snapshot());
-    w.handle_key(key('3'));
-    assert!(!render_to_text(&w, 120, 30).contains('■'));
 }

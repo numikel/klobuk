@@ -28,58 +28,6 @@ fn number_keys_switch_views_and_q_quits() {
 }
 
 #[test]
-fn board_selection_moves_in_status_order_and_clamps() {
-    let mut a = app();
-    // board order = status order: done(asf-1), in-progress(asf-2), ready(asf-3), backlog(asf-4)? No: columns are
-    // backlog, ready, in-progress, blocked, in-review, done → asf-4, asf-3, asf-2, asf-1
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-4");
-    a.handle_key(key('j'));
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-3");
-    a.handle_key(code(KeyCode::Down));
-    a.handle_key(key('j'));
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-1");
-    a.handle_key(key('j'));
-    assert_eq!(
-        a.selected_issue().unwrap().as_str(),
-        "asf-1",
-        "clamped at the end"
-    );
-    a.handle_key(key('k'));
-    a.handle_key(code(KeyCode::Up));
-    a.handle_key(key('k'));
-    a.handle_key(key('k'));
-    assert_eq!(
-        a.selected_issue().unwrap().as_str(),
-        "asf-4",
-        "clamped at the start"
-    );
-    assert_eq!(a.rows(View::Board), 4);
-    assert_eq!(a.rows(View::Agents), 1);
-    assert_eq!(a.rows(View::Inbox), 1);
-    assert_eq!(a.rows(View::Queue), 1);
-    assert_eq!(a.rows(View::Log), 2);
-}
-
-#[test]
-fn start_only_for_ready_issues() {
-    let mut a = app();
-    a.handle_key(key('j')); // asf-3 ready
-    assert_eq!(a.handle_key(key('s')), Action::Start(id("asf-3")));
-    a.handle_key(key('j')); // asf-2 in-progress
-    assert_eq!(a.handle_key(key('s')), Action::None);
-    assert!(
-        a.status.as_deref().unwrap_or("").contains("ready"),
-        "{:?}",
-        a.status
-    );
-    assert_eq!(a.handle_key(key('m')), Action::Enqueue(id("asf-2")));
-    assert_eq!(a.handle_key(key('f')), Action::Focus(id("asf-2")));
-    // asf-30: bare y/n no longer reach the worker from normal mode.
-    assert_eq!(a.handle_key(key('y')), Action::None);
-    assert_eq!(a.handle_key(key('n')), Action::None);
-}
-
-#[test]
 fn reply_input_mode_types_and_sends_or_cancels() {
     let mut a = app();
     a.handle_key(key('j'));
@@ -124,34 +72,4 @@ fn abort_requires_confirmation() {
     a.handle_key(key('k'));
     assert_eq!(a.handle_key(key('x')), Action::None);
     assert!(matches!(a.mode(), Mode::Normal));
-}
-
-#[test]
-fn agents_and_inbox_views_select_their_own_issue() {
-    let mut a = app();
-    a.handle_key(key('3'));
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-2");
-    a.handle_key(key('4'));
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-2");
-    // Enter only opens the comment now; marking read is `m` / `M`.
-    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::None);
-    assert!(matches!(a.mode(), Mode::Comment { .. }));
-    a.handle_key(code(KeyCode::Esc));
-    a.handle_key(key('5'));
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-1");
-    a.handle_key(key('6'));
-    assert_eq!(a.selected_issue(), None);
-}
-
-#[test]
-fn snapshot_replace_keeps_selection_in_range() {
-    let mut a = app();
-    a.handle_key(key('j'));
-    a.handle_key(key('j'));
-    a.handle_key(key('j')); // asf-1 (index 3)
-    let mut s = snapshot();
-    s.issues.truncate(1);
-    a.replace(s);
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-1");
-    assert_eq!(a.rows(View::Board), 1);
 }
