@@ -219,6 +219,7 @@ fn what_was_loaded_on_demand_survives_a_refresh() {
 fn a_refresh_asks_again_for_the_detail_of_the_issue_the_board_has_open() {
     use crate::tui::snapshot::IssueDetail;
     let mut a = app(); // the Board, its panel open on the selected issue
+    a.handle_key(key('j')); // off the group header, onto the first issue
     assert!(a.board.detail);
     let open = crate::tui::views::board::selected_issue(&a.snap, &a.board).expect("a selection");
     let detail = |comments: usize| IssueDetail {
@@ -251,10 +252,11 @@ fn a_refresh_asks_again_for_the_detail_of_the_issue_the_board_has_open() {
     assert_eq!(a.detail_wanted(), None, "loaded again");
     assert_eq!(a.snap.detail_of(&open).map(|d| d.comments.len()), Some(1));
 
-    // only an open Board panel is worth a reload
+    // only the Board shows a detail, so only the Board reloads it
     a.replace(snapshot());
-    a.handle_key(code(KeyCode::Esc));
-    assert_eq!(a.detail_wanted(), None, "the panel is closed");
+    assert_eq!(a.detail_wanted(), Some(open.clone()));
+    a.handle_key(key('3'));
+    assert_eq!(a.detail_wanted(), None, "not the Board");
 }
 
 #[test]

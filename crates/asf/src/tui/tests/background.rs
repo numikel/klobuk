@@ -6,7 +6,9 @@ fn a_second_background_request_answers_busy_and_runs_nothing() {
     a.busy = Some("tick".into());
     assert_eq!(a.handle_key(key('t')), Action::None);
     assert_eq!(a.status.as_deref(), Some("busy: tick"));
-    a.handle_key(key('j')); // asf-3 is ready
+    for _ in 0..3 {
+        a.handle_key(key('j')); // past the No epic header and asf-1, asf-2: asf-3 is ready
+    }
     assert_eq!(a.handle_key(key('s')), Action::None);
     assert_eq!(a.status.as_deref(), Some("busy: tick"));
     a.busy = None;

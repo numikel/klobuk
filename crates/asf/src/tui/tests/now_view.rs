@@ -286,7 +286,7 @@ fn symbols_differ_per_state_and_carry_their_colours() {
     assert_eq!(cell_style(&b, "asf-24", "●").0, Color::Green);
     assert_eq!(cell_style(&b, "asf-31", "◆").0, Color::Yellow);
     assert_eq!(cell_style(&b, "asf-60", "◆").0, Color::Yellow);
-    assert_eq!(cell_style(&b, "│■ asf-5", "■").0, Color::Red);
+    assert_eq!(cell_style(&b, "asf-5   in-progress", "■").0, Color::Red);
     let (_, m) = cell_style(&b, "asf-62", "✓");
     assert!(m.contains(Modifier::DIM), "done is dim");
     assert_eq!(cell_style(&b, "asf-61", "○").0, Color::Reset);

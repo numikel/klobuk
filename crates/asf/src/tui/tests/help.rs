@@ -262,9 +262,9 @@ fn tab_and_shift_tab_cycle_the_views_and_wrap() {
 fn g_and_capital_g_jump_to_the_first_and_last_row() {
     let mut a = app();
     a.handle_key(key('G'));
-    assert_eq!(a.selected_issue().unwrap().as_str(), "asf-1");
-    a.handle_key(key('g'));
     assert_eq!(a.selected_issue().unwrap().as_str(), "asf-4");
+    a.handle_key(key('g'));
+    assert_eq!(a.selected(View::Board), 0, "the first row is the group header");
     let mut c = app();
     c.handle_key(key('7'));
     c.handle_key(key('G'));
@@ -374,7 +374,7 @@ fn page_and_jump_keys_do_what_the_help_says() {
     // Home / End move the selection in normal mode
     let mut b = app();
     b.handle_key(code(KeyCode::End));
-    assert_eq!(b.selected_issue().unwrap().as_str(), "asf-1");
-    b.handle_key(code(KeyCode::Home));
     assert_eq!(b.selected_issue().unwrap().as_str(), "asf-4");
+    b.handle_key(code(KeyCode::Home));
+    assert_eq!(b.selected(View::Board), 0);
 }

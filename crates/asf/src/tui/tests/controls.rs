@@ -94,7 +94,7 @@ fn modifier_chords_never_insert_a_character_or_trigger_a_binding() {
     assert_eq!(n.handle_key(mods('q', KeyModifiers::ALT)), Action::None);
     assert_eq!(n.handle_key(ctrl('t')), Action::None);
     n.handle_key(ctrl('j'));
-    assert_eq!(n.selected_issue().unwrap().as_str(), "asf-4");
+    assert_eq!(n.selected(View::Board), 0, "still on the first row");
     let mut o = open_overlay();
     assert_eq!(o.handle_key(ctrl('y')), Action::None);
     assert!(matches!(o.mode(), Mode::Answer { .. }));

@@ -348,6 +348,11 @@ impl App {
             self.overlays.extend(keep);
             return self.dispatch(action);
         }
+        // The Board's filter takes every key as text, also the ones that are bound elsewhere (q, t, 1-7).
+        if self.view == View::Board && self.board.typing() {
+            let action = self.view_key(key);
+            return self.dispatch(action);
+        }
         // Ctrl/Alt chords are not bindings (and never text); Ctrl+C was handled above.
         if is_chord(&key) {
             return Action::None;
