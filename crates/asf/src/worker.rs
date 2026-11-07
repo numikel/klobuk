@@ -916,6 +916,54 @@ impl<'a> Worker<'a> {
         self.unblock(&run)
     }
 
+    /// Sends a worker whose run already `succeeded` back to work. The run is over (verified, queued,
+    /// reviewed) but its agent may still sit idle in the pane; when it can be reached, it gets `text`
+    /// and the same run is reopened as `working`, so the normal `asf issue finish` -> verify path
+    /// applies again. The run is reopened, not replaced, because the pane's environment carries its
+    /// `ASF_RUN`: the hooks (budget, scope, cost) keep resolving this run. `why` becomes its exit reason
+    /// until the next terminal state replaces it.
+    ///
+    /// Errors (nothing is written to the store then): the latest run is not `succeeded`, it has no
+    /// pane, the agent is gone, or it waits on a dialog (`blocked`) and a prompt would answer that
+    /// dialog instead of reaching Claude.
+    pub fn send_back(&self, id: &IssueId, text: &str, why: &str) -> Result<Run, AppError> {
+        let run = self.run_for(id)?;
+        if run.state != RunState::Succeeded {
+            return Err(AppError::conflict(format!(
+                "run {} is {}, only a succeeded run is sent back",
+                run.id, run.state
+            )));
+        }
+        let h = Self::handle(&run)?;
+        let info = self.rt.info(&h).map_err(rt_err)?;
+        if matches!(info.state, AgentState::Blocked | AgentState::Unknown) {
+            return Err(AppError::new(
+                ErrorCode::Blocked,
+                format!("the agent of {id} is {} and cannot take a prompt", info.state),
+            ));
+        }
+        match self.rt.prompt(
+            &h,
+            text,
+            &[AgentState::Working],
+            self.ctx.config.worker.prompt_timeout_ms,
+        ) {
+            Ok(_) | Err(RuntimeError::Timeout(_)) => {}
+            // The text can sit in Claude's input box with Enter swallowed (see `launch`): press it once.
+            Err(RuntimeError::Stalled(_)) => self.rt.send_keys(&h, &["enter"]).map_err(rt_err)?,
+            Err(e) => return Err(rt_err(e)),
+        }
+        Ok(self.ctx.store.update_run(
+            &run.id,
+            &RunPatch {
+                state: Some(RunState::Working),
+                exit_reason: Some(why.to_string()),
+                last_seen_at: Some(now_rfc3339()),
+                ..RunPatch::default()
+            },
+        )?)
+    }
+
     pub fn keys(&self, id: &IssueId, keys: &[String]) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
         let h = Self::handle(&run)?;
@@ -1168,17 +1216,39 @@ impl<'a> Worker<'a> {
                 .store
                 .set_status(&run.issue_id, Status::Validating, LANE_ORCHESTRATOR)?;
             // A branch that is already queued (an earlier verification, or `merge enqueue` by hand) is
-            // reused: a second `enqueue_merge` would be a conflict that aborts the whole tick.
-            let queued = self
+            // reused: a second `enqueue_merge` would be a conflict that aborts the whole tick. An item
+            // that `failed` is the one a reviewer's `changes` verdict left behind while the worker fixed
+            // the findings: the worker is done and verified, so it is queued again without a command.
+            let existing = self
                 .ctx
                 .store
                 .merge_queue()?
-                .iter()
-                .any(|m| m.issue_id == run.issue_id && !m.state.is_terminal());
-            if !queued {
-                self.ctx
-                    .store
-                    .enqueue_merge(&run.issue_id, Some(&run.id), &run.branch)?;
+                .into_iter()
+                .find(|m| m.issue_id == run.issue_id && !m.state.is_terminal());
+            match existing {
+                None => {
+                    self.ctx
+                        .store
+                        .enqueue_merge(&run.issue_id, Some(&run.id), &run.branch)?;
+                }
+                Some(m) if m.state == MergeState::Failed => {
+                    self.ctx.store.update_merge(
+                        m.id,
+                        &MergePatch {
+                            state: Some(MergeState::Queued),
+                            last_error: Some(None),
+                            ..MergePatch::default()
+                        },
+                    )?;
+                    self.ctx.store.append_event(&NewEvent {
+                        kind: "merge.requeued".into(),
+                        issue_id: Some(run.issue_id.clone()),
+                        run_id: Some(run.id.clone()),
+                        actor: Some(LANE_ORCHESTRATOR.into()),
+                        payload: json!({ "reason": "worker_finished_again", "branch": m.branch }),
+                    })?;
+                }
+                Some(_) => {}
             }
             let _ = self.rt.notify(
                 &format!("asf {} verified", run.issue_id),

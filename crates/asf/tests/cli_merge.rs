@@ -709,6 +709,7 @@ fn an_approve_decision_merges_and_closes_the_issue_and_the_review_issue() {
 fn a_changes_decision_fails_the_item_blocks_the_issue_and_posts_a_blocker() {
     let f = reviewing();
     let rid = review_id(&f);
+    lose_the_worker(&f); // a reachable worker is sent the findings instead (see the tests at the end)
     decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no test");
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "failed", "{res}");
@@ -737,6 +738,7 @@ fn a_changes_decision_fails_the_item_blocks_the_issue_and_posts_a_blocker() {
 fn the_third_changes_round_asks_the_human_instead_of_starting_another_reviewer() {
     let f = reviewing();
     let rid = review_id(&f);
+    lose_the_worker(&f); // the operator drives the rounds by hand here, with `merge retry`
     for round in 1..=2 {
         decide_as(&f, &rid, &format!("changes:\n- round {round} finding"));
         let res = f.repo.ok(&["merge", "tick", "--once"]);
@@ -1120,6 +1122,7 @@ fn an_approve_verdict_closes_the_review_issue_its_claim_and_run_even_when_the_me
 fn a_changes_verdict_closes_the_review_at_once_and_the_next_round_gets_a_fresh_review() {
     let f = reviewing();
     let rid = review_id(&f);
+    lose_the_worker(&f);
     decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no test");
     let closed = close_workspaces(&f);
     let res = f.repo.ok(&["merge", "tick", "--once"]);
@@ -1146,4 +1149,247 @@ fn a_changes_verdict_closes_the_review_at_once_and_the_next_round_gets_a_fresh_r
     assert_ne!(next, rid, "a new review issue for the new round");
     assert_eq!(status_of(&f, &next), "in-progress");
     assert_eq!(running(&f), (0, 1));
+}
+
+// ---- a `changes` verdict sends the findings back to the idle worker ------------------------------
+
+/// The latest run of the reviewed issue.
+fn worker_run(f: &F) -> Run {
+    store(f)
+        .runs(Some(&f.issue.parse().unwrap()), false)
+        .unwrap()
+        .pop()
+        .expect("the issue has a run")
+}
+
+/// Closes the worker's runtime workspace: its agent can no longer be reached.
+fn lose_the_worker(f: &F) {
+    let ws = worker_run(f).workspace_id.expect("the worker has a workspace");
+    FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
+        .close_workspace(&ws)
+        .unwrap();
+}
+
+/// Prompts that point a worker at a review file, oldest first.
+fn send_back_prompts(f: &F) -> Vec<String> {
+    FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
+        .log()
+        .into_iter()
+        .filter(|e| e.op == "prompt")
+        .filter_map(|e| e.args["text"].as_str().map(str::to_string))
+        .filter(|t| t.contains("review-"))
+        .collect()
+}
+
+fn review_file(f: &F, round: u32) -> std::path::PathBuf {
+    f.repo
+        .path()
+        .join(".worktrees")
+        .join(&f.issue)
+        .join(".factory/runs")
+        .join(&f.issue)
+        .join(format!("review-{round}.md"))
+}
+
+fn comments_of(f: &F, kind: CommentType) -> Vec<Comment> {
+    store(f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind == kind)
+        .collect()
+}
+
+/// The worker commits `rel`, writes its report and finishes again; `run watch` then verifies the run.
+fn finish_again(f: &F, rel: &str, content: &str) -> serde_json::Value {
+    let issue = &f.issue;
+    let wt = f.repo.path().join(".worktrees").join(issue);
+    commit_in(&wt, rel, content);
+    let report = wt.join(".factory/runs").join(issue).join("report.md");
+    std::fs::write(&report, "# done again\n").unwrap();
+    f.repo.ok(&[
+        "--lane",
+        issue,
+        "issue",
+        "finish",
+        issue,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    f.repo.ok(&["run", "watch", "--once"])
+}
+
+#[test]
+fn a_changes_verdict_sends_the_findings_to_a_reachable_worker_instead_of_a_blocker() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    assert!(send_back_prompts(&f).is_empty());
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no \"test\"");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+
+    // the findings are in a file in the worker's worktree: data from the reviewer, then what to do
+    let text = std::fs::read_to_string(review_file(&f, 1)).expect("review-1.md is written");
+    assert!(!text.contains('\r'), "LF line endings:\n{text}");
+    assert!(
+        text.contains("- src/greet.rs: hello() has no \"test\""),
+        "the finding is listed:\n{text}"
+    );
+    assert!(text.contains("data"), "says the findings are data:\n{text}");
+    assert!(text.contains("test-first"), "{text}");
+    assert!(
+        text.contains("issue finish") && text.contains(&f.issue),
+        "tells the worker to finish again:\n{text}"
+    );
+
+    // the worker gets exactly one line that points at the file; the findings are not inline
+    let prompts = send_back_prompts(&f);
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(!prompts[0].contains('\n'), "one line: {:?}", prompts[0]);
+    assert!(
+        prompts[0].contains(&format!(".factory/runs/{}/review-1.md", f.issue)),
+        "{prompts:?}"
+    );
+    assert!(!prompts[0].contains("hello()"), "no findings inline: {prompts:?}");
+
+    // no BLOCKER for the human, a STATUS for everyone, and the issue is being worked on again
+    assert!(
+        comments_of(&f, CommentType::Blocker).is_empty(),
+        "{:?}",
+        comments_of(&f, CommentType::Blocker)
+    );
+    let status: Vec<String> = comments_of(&f, CommentType::Status)
+        .into_iter()
+        .filter(|c| c.author == "orchestrator" && c.to_lane == "all")
+        .map(|c| c.body)
+        .collect();
+    assert_eq!(status.len(), 1, "{status:?}");
+    assert!(
+        status[0].contains("review round 1 asked for changes") && status[0].contains("sent to the worker"),
+        "{status:?}"
+    );
+    assert_eq!(status_of(&f, &f.issue), "in-progress");
+    assert_eq!(worker_run(&f).state, RunState::Working);
+    assert_eq!(
+        running(&f),
+        (1, 0),
+        "the worker holds its slot again, no reviewer is left"
+    );
+    assert!(!main_has(&f, "src/greet.rs"));
+
+    // the failed item is left alone until the worker is done
+    assert_eq!(f.repo.ok(&["merge", "tick", "--once"])["processed"], 0);
+}
+
+#[test]
+fn a_worker_that_finishes_again_gets_its_item_queued_and_the_next_review_round_starts() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no test");
+    f.repo.ok(&["merge", "tick", "--once"]);
+    let item_id = store(&f).merge_queue().unwrap()[0].id;
+
+    let res = finish_again(&f, "src/greet_test.rs", "// covers hello()\n");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(status_of(&f, &f.issue), "validating");
+    let queue = store(&f).merge_queue().unwrap();
+    assert_eq!(queue.len(), 1, "the item is reused, not duplicated: {queue:?}");
+    assert_eq!(queue[0].id, item_id);
+    assert_eq!(queue[0].state, MergeState::Queued, "{queue:?}");
+    assert!(queue[0].last_error.is_none(), "{queue:?}");
+
+    // no operator command: the next tick rebases, gates and starts round 2
+    let agents = start_agents(&f);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(res["items"][0]["id"], item_id);
+    assert_eq!(start_agents(&f), agents + 1, "a reviewer for round 2");
+    let next = review_id(&f);
+    assert_ne!(next, rid, "round 2 has its own review issue");
+
+    decide_as(&f, &next, "approve");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(main_has(&f, "src/greet_test.rs"), "the fix was merged");
+    assert_eq!(status_of(&f, &f.issue), "done");
+}
+
+#[test]
+fn a_changes_verdict_with_an_unreachable_worker_keeps_the_blocker_and_the_retry_hint() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    lose_the_worker(&f);
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no test");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+    assert!(send_back_prompts(&f).is_empty(), "nothing could be delivered");
+    let blockers = comments_of(&f, CommentType::Blocker);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert_eq!(blockers[0].to_lane, "human");
+    assert!(
+        blockers[0].body.contains("hello() has no test"),
+        "{}",
+        blockers[0].body
+    );
+    assert!(
+        blockers[0].body.contains(&format!("asf merge retry {}", f.issue)),
+        "{}",
+        blockers[0].body
+    );
+    assert_eq!(
+        worker_run(&f).state,
+        RunState::Succeeded,
+        "the run is left as it was"
+    );
+}
+
+#[test]
+fn the_round_that_reaches_max_rounds_asks_the_human_and_sends_nothing_to_the_worker() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "changes:\n- round 1 finding");
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(send_back_prompts(&f).len(), 1, "round 1 goes back to the worker");
+    finish_again(&f, "src/greet_test.rs", "// round 1 fix\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+
+    // two `changes` rounds are on record now and [review] max_rounds is 2: the human decides
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "changes:\n- round 2 finding");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(
+        send_back_prompts(&f).len(),
+        1,
+        "nothing is sent for the last round"
+    );
+    assert!(!review_file(&f, 2).exists(), "no review-2.md");
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+    let last = comments_of(&f, CommentType::Blocker).pop().expect("a BLOCKER");
+    assert_eq!(last.to_lane, "human");
+    assert!(last.body.contains("round 2 finding"), "{}", last.body);
+    assert!(
+        last.body.contains(&format!("asf merge retry {}", f.issue)),
+        "{}",
+        last.body
+    );
+    assert_eq!(worker_run(&f).state, RunState::Succeeded);
+}
+
+#[test]
+fn merge_retry_is_refused_while_the_worker_is_fixing_the_findings() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: hello() has no test");
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(worker_run(&f).state, RunState::Working);
+    let (code, error, message) = f.repo.err(&["merge", "retry", &f.issue]);
+    assert_eq!((code, error.as_str()), (3, "conflict"), "{message}");
+    assert_eq!(
+        store(&f).merge_queue().unwrap()[0].state,
+        MergeState::Failed,
+        "the item was not requeued behind the worker's back"
+    );
 }
