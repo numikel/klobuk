@@ -32,6 +32,14 @@ const EDITABLE: &[(&str, &str)] = &[
         "merge.verify_main_after",
         "run the gates in the repo root after each merge",
     ),
+    (
+        "notify.remind_after_minutes",
+        "minutes before `asf serve` first reminds you of something waiting (0: off)",
+    ),
+    (
+        "notify.remind_every_minutes",
+        "minutes between repeated reminders (0: remind once)",
+    ),
 ];
 
 /// The keys [`set_key`] accepts, each with a one-line description.
@@ -187,6 +195,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 10);
+        assert_eq!(EDITABLE.len(), 12);
     }
 }

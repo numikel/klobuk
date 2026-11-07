@@ -8,6 +8,7 @@ pub mod lane;
 pub mod merge;
 pub mod method;
 pub mod plan;
+pub mod remind;
 pub mod repo;
 pub mod run;
 pub mod serve;

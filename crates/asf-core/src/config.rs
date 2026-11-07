@@ -292,6 +292,28 @@ impl Default for ReviewCfg {
     }
 }
 
+/// `[notify]`: how `asf serve` nags the human when something waits for them too long.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyCfg {
+    /// First reminder after this many minutes of waiting; `0` switches reminders off.
+    pub remind_after_minutes: u64,
+    /// Repeat every this many minutes while the thing still waits; `0` reminds only once.
+    pub remind_every_minutes: u64,
+    /// Optional program run once per reminder, without a shell. Empty: no command.
+    pub command: Vec<String>,
+}
+
+impl Default for NotifyCfg {
+    fn default() -> Self {
+        NotifyCfg {
+            remind_after_minutes: 15,
+            remind_every_minutes: 30,
+            command: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -306,6 +328,7 @@ pub struct Config {
     pub review: ReviewCfg,
     pub planner: PlannerCfg,
     pub methodology: MethodologyCfg,
+    pub notify: NotifyCfg,
 }
 
 const TEMPLATE: &str = r#"# auto-software-factory configuration (committed). Unknown sections are ignored.
@@ -375,6 +398,12 @@ runner = "claude"         # claude (headless `claude -p`, read-only tools) | fak
 model = "claude-haiku-5-5"
 budget_usd = 1.0          # per planning step
 max_turns = 15
+
+[notify]                  # `asf serve` reminds you while something waits for you (blocked issue, failed merge, stalled run, unanswered question)
+remind_after_minutes = 15 # first reminder after this long; 0 switches reminders off
+remind_every_minutes = 30 # then again this often while it still waits; 0 reminds only once
+# command = ["pwsh", "-File", "notify.ps1"]  # optional, run once per reminder without a shell (10 s limit) with
+#                                            # ASF_REMIND_ISSUE, ASF_REMIND_KIND, ASF_REMIND_AGE_MINUTES, ASF_REMIND_TEXT set
 "#;
 
 impl Config {
@@ -439,6 +468,11 @@ impl Config {
                     g.name
                 )));
             }
+        }
+        if self.notify.command.first().is_some_and(|p| p.trim().is_empty()) {
+            return Err(ConfigError::Invalid(
+                "notify.command must start with a program name".into(),
+            ));
         }
         if !matches!(self.planner.runner.as_str(), "claude" | "fake") {
             return Err(ConfigError::Invalid(format!(

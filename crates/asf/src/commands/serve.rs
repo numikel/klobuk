@@ -8,6 +8,9 @@
 //! The config is re-read at the start of every tick (see `ConfigWatch`), so edits take effect
 //! without restarting the loop. Tick reports and the summary carry `questions_waiting`: the
 //! unanswered QUESTIONs to the human plus the runs in `blocked`, i.e. what waits for the operator.
+//!
+//! The loop also reminds the human of what waits too long (`[notify]`, see `remind`): each tick
+//! report lists the `reminders` sent in that tick. One-shot commands never remind, only `serve`.
 
 use std::io::Write;
 use std::time::Duration;
@@ -23,6 +26,7 @@ use crate::tui::app::unanswered_questions;
 use crate::worker::{self, WatchResult, Worker};
 
 use super::merge::{tick_all, TickResult};
+use super::remind::{self, RemindState};
 
 #[derive(Serialize)]
 pub struct TickReport {
@@ -34,6 +38,8 @@ pub struct TickReport {
     pub start_errors: Vec<serde_json::Value>,
     /// Unanswered QUESTIONs to the human plus runs in `blocked`; always present, `0` when none.
     pub questions_waiting: usize,
+    /// Reminders sent in this tick for things that waited too long (`[notify]`).
+    pub reminders: Vec<remind::Sent>,
 }
 
 fn blocked_runs(states: impl IntoIterator<Item = RunState>) -> usize {
@@ -65,7 +71,7 @@ fn waiting_line(n: usize) -> String {
 }
 
 /// Order matters: merges close issues, and only then can their dependents be promoted.
-fn tick(ctx: &Ctx, dispatch: bool) -> Result<TickReport, AppError> {
+fn tick(ctx: &Ctx, dispatch: bool, reminders: &mut RemindState) -> Result<TickReport, AppError> {
     let worker = Worker::new(ctx)?;
     let watch = worker.watch()?;
     let merge = tick_all(ctx, false)?;
@@ -84,6 +90,8 @@ fn tick(ctx: &Ctx, dispatch: bool) -> Result<TickReport, AppError> {
             }
         }
     }
+    // Last, so the reminders see the state this tick has just produced.
+    let reminders = remind::send_due(ctx, &*worker.rt, reminders, time::OffsetDateTime::now_utc())?;
     Ok(TickReport {
         promoted,
         closed_epics,
@@ -92,6 +100,7 @@ fn tick(ctx: &Ctx, dispatch: bool) -> Result<TickReport, AppError> {
         started,
         start_errors,
         questions_waiting: questions_waiting(ctx)?,
+        reminders,
     })
 }
 
@@ -122,6 +131,25 @@ fn text(t: &TickReport) -> String {
     }
     for e in &t.start_errors {
         s.push_str(&format!("\nstart failed {}: {}", e["issue"], e["message"]));
+    }
+    for r in &t.reminders {
+        s.push_str(&format!(
+            "
+reminded: {}",
+            r.text
+        ));
+        if let Some(e) = &r.notify_error {
+            s.push_str(&format!(
+                "
+  notification failed: {e}"
+            ));
+        }
+        if let Some(e) = &r.command_error {
+            s.push_str(&format!(
+                "
+  command failed: {e}"
+            ));
+        }
     }
     s.push_str(&waiting_line(t.questions_waiting));
     s
@@ -284,8 +312,9 @@ fn finish(cli: &Cli, ticks: u64, reason: StopReason, a: Assessment) -> Result<Re
 
 pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
     let mut ctx = Ctx::load(cli)?;
+    let mut reminders = RemindState::new();
     if a.once {
-        let t = tick(&ctx, a.dispatch)?;
+        let t = tick(&ctx, a.dispatch, &mut reminders)?;
         return Rendered::new(&t, text(&t));
     }
     eprintln!(
@@ -300,7 +329,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         if let Some(warning) = watch.refresh(&mut ctx) {
             eprintln!("asf serve: {warning}");
         }
-        let tick_ok = match tick(&ctx, a.dispatch) {
+        let tick_ok = match tick(&ctx, a.dispatch, &mut reminders) {
             Ok(t) => {
                 if !t.promoted.is_empty()
                     || !t.closed_epics.is_empty()
@@ -308,6 +337,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
                     || !t.merge.items.is_empty()
                     || !t.started.is_empty()
                     || !t.start_errors.is_empty()
+                    || !t.reminders.is_empty()
                 {
                     print_ok(cli.json, cli.quiet, &Rendered::new(&t, text(&t))?);
                 }

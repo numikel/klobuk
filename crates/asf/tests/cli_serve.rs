@@ -496,3 +496,155 @@ fn until_done_summary_reports_questions_waiting_until_they_are_answered() {
     let human = repo.asf().args(["serve", "--until-done"]).output().unwrap();
     assert!(!String::from_utf8_lossy(&human.stdout).contains("waiting for you"));
 }
+
+/// A repository on the fake runtime with one blocked issue that has waited since 2020.
+fn repo_with_an_old_blocked_issue() -> (Repo, String) {
+    let repo = Repo::initialised();
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("runtime = \"herdr\"", "runtime = \"fake\"");
+    std::fs::write(&cfg, s).unwrap();
+    let id = repo.create_issue("stuck", &[]);
+    repo.ok(&["issue", "status", &id, "blocked"]);
+    repo.ok(&[
+        "issue",
+        "comment",
+        &id,
+        "--type",
+        "BLOCKER",
+        "--to",
+        "human",
+        "--body",
+        "gate test timed out\nand a long tail",
+    ]);
+    // Nothing in the CLI moves time, so the issue is aged through an export/import round trip.
+    let file = repo.path().join("aged.jsonl");
+    repo.ok(&["export", "--out", file.to_str().unwrap()]);
+    let aged: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            if v["kind"] == "issue" {
+                v["updated_at"] = "2020-01-01T00:00:00Z".into();
+            }
+            v.to_string()
+        })
+        .collect();
+    std::fs::write(&file, aged.join("\n") + "\n").unwrap();
+    repo.ok(&["import", file.to_str().unwrap(), "--mode", "replace"]);
+    (repo, id)
+}
+
+fn notifications(repo: &Repo) -> Vec<serde_json::Value> {
+    asf_runtime::FakeRuntime::new(repo.path().join(".factory/fake-runtime.json"))
+        .log()
+        .into_iter()
+        .filter(|e| e.op == "notify")
+        .map(|e| e.args)
+        .collect()
+}
+
+/// Replaces the `[notify]` section (the last one in the template) with `section`.
+fn set_notify(repo: &Repo, section: &str) {
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    let start = s.find("\n[notify]").expect("[notify] in the template");
+    std::fs::write(&cfg, format!("{}\n{section}", &s[..start])).unwrap();
+}
+
+#[test]
+fn serve_reminds_once_about_a_blocked_issue_and_a_restart_does_not_repeat_it() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    let res = repo.ok(&["serve", "--once"]);
+    let sent = res["reminders"].as_array().unwrap_or_else(|| panic!("{res}"));
+    assert_eq!(sent.len(), 1, "{res}");
+    assert_eq!(sent[0]["issue"], id.as_str(), "{res}");
+    assert_eq!(sent[0]["kind"], "issue_blocked", "{res}");
+    assert!(sent[0]["age_minutes"].as_u64().unwrap() > 60 * 24, "{res}");
+    let text = sent[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(&format!("{id} has been blocked for ")) && text.ends_with(": gate test timed out"),
+        "{text}"
+    );
+    assert_eq!(sent[0]["notify_error"], serde_json::Value::Null, "{res}");
+    assert_eq!(sent[0]["command_error"], serde_json::Value::Null, "{res}");
+
+    let n = notifications(&repo);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!(n[0]["title"], format!("asf {id} needs you"));
+    assert_eq!(n[0]["body"], text);
+
+    // a new `asf serve` process: the reminder time comes back from the store
+    let again = repo.ok(&["serve", "--once"]);
+    assert_eq!(again["reminders"], serde_json::json!([]), "{again}");
+    assert_eq!(notifications(&repo).len(), 1, "no second notification");
+}
+
+#[test]
+fn serve_prints_the_reminder_in_the_human_report() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    let out = repo.asf().args(["serve", "--once"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("reminded: {id} has been blocked for ")),
+        "{text}"
+    );
+}
+
+#[test]
+fn zero_remind_after_minutes_switches_reminders_off() {
+    let (repo, _) = repo_with_an_old_blocked_issue();
+    set_notify(&repo, "[notify]\nremind_after_minutes = 0\n");
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["reminders"], serde_json::json!([]), "{res}");
+    assert!(notifications(&repo).is_empty());
+}
+
+#[test]
+fn a_notify_command_runs_without_a_shell_and_its_failure_never_fails_the_tick() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    // `git init <dir>` leaves a directory behind: proof the command ran, with no shell involved.
+    let proof = repo.path().join("proof-repo");
+    set_notify(
+        &repo,
+        &format!(
+            "[notify]\ncommand = [\"git\", \"init\", \"-q\", \"{}\"]\n",
+            proof.to_string_lossy().replace('\\', "/")
+        ),
+    );
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["reminders"][0]["issue"], id.as_str(), "{res}");
+    assert_eq!(
+        res["reminders"][0]["command_error"],
+        serde_json::Value::Null,
+        "{res}"
+    );
+    assert!(proof.join(".git").exists(), "the command did not run");
+
+    // a program that does not exist: reported in the tick, exit code still 0, reminder still recorded
+    let (repo, _) = repo_with_an_old_blocked_issue();
+    set_notify(&repo, "[notify]\ncommand = [\"asf-no-such-program-xyz\"]\n");
+    let (v, code) = repo.json(&["serve", "--once"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    let err = v["result"]["reminders"][0]["command_error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(err.contains("cannot start `asf-no-such-program-xyz`"), "{v}");
+    assert_eq!(notifications(&repo).len(), 1, "the notification went out anyway");
+    let again = repo.ok(&["serve", "--once"]);
+    assert_eq!(again["reminders"], serde_json::json!([]), "{again}");
+}
+
+#[test]
+fn a_fresh_wait_is_not_reminded_yet() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let id = repo.create_issue("fresh", &[]);
+    repo.ok(&["issue", "status", &id, "blocked"]);
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["reminders"], serde_json::json!([]), "{res}");
+}
