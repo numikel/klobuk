@@ -281,15 +281,16 @@ fn run_gate_with_retry(spec: &GateSpec, cwd: &Path, pauses: &LinkerLockPauses) -
     let mut reruns = 0;
     let mut previous: Option<BTreeSet<String>> = None;
     let mut notes: Vec<String> = Vec::new();
-    while !r.ok
-        && counted < LINKER_LOCK_ATTEMPTS
-        && reruns < LINKER_LOCK_MAX_RERUNS
-        && r.tail.contains(LINKER_LOCK_MARKER)
-    {
+    while !r.ok && reruns < LINKER_LOCK_MAX_RERUNS && r.tail.contains(LINKER_LOCK_MARKER) {
         let named = locked_files(&r.tail);
         let now = locked_set(&named);
         // Progress needs names to compare: a message without any path says nothing about it.
         let progress = !now.is_empty() && previous.as_ref().is_some_and(|p| *p != now);
+        // The limit only stops attempts without progress: a new set of files after the last counted
+        // attempt still earns a free rerun, and only the cap on all reruns stops it then.
+        if !progress && counted >= LINKER_LOCK_ATTEMPTS {
+            break;
+        }
         let exists = named.iter().any(|p| p.exists());
         reruns += 1;
         // let the scanner finish before touching anything

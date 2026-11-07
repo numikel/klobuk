@@ -480,6 +480,57 @@ fn the_same_files_count_again_after_a_rerun_that_made_progress() {
     assert!(tail.contains("rerun attempt 5/5 (counts)"), "{tail}");
 }
 
+/// Progress is judged on the attempt that just failed, so it still earns a rerun when the limit of
+/// five counted attempts is already used up: only the cap on all reruns stops it then.
+#[test]
+fn progress_on_the_last_counted_attempt_still_earns_a_free_rerun() {
+    let dir = tempfile::tempdir().unwrap();
+    // runs 1..=4 trip over a.exe (counted attempts 1..=4, the 4th rerun is the 5th attempt),
+    // run 5 trips over a new file: that rerun is free
+    let code = lock_gate(
+        &dir.path().join("deps"),
+        "(['a.exe'] if n < 5 else ['b%d.exe' % n])",
+        7,
+    );
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert_eq!(runs_of(dir.path()), 7, "{tail}");
+    assert!(!tail.contains("gives up"), "{tail}");
+}
+
+#[test]
+fn a_new_set_after_repeated_files_is_progress_even_at_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // a, b, b, b, b, c: the sixth run is the first to differ from its predecessor since the limit
+    let code = lock_gate(
+        &dir.path().join("deps"),
+        "(['a.exe'] if n < 2 else ['b.exe'] if n < 6 else ['c%d.exe' % n])",
+        8,
+    );
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(results[0].ok, "{tail}");
+    assert_eq!(runs_of(dir.path()), 8, "{tail}");
+}
+
+/// The give-up note must be true: when the last attempt did make progress, the cap is the reason.
+#[test]
+fn the_give_up_note_names_the_cap_not_the_attempts_when_the_last_attempt_made_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = lock_gate(
+        &dir.path().join("deps"),
+        "(['a.exe'] if n < 5 else ['b%d.exe' % n])",
+        u32::MAX,
+    );
+    let results = run_gates_with_pauses(&[spec("test", &py(&code), 30)], dir.path(), &QUICK);
+    let tail = &results[0].tail;
+    assert!(!results[0].ok);
+    assert_eq!(runs_of(dir.path()), 13, "{tail}");
+    assert!(tail.contains("cap of 12 reruns"), "{tail}");
+    assert!(!tail.contains("without progress"), "{tail}");
+}
+
 #[test]
 fn the_total_number_of_reruns_is_capped_even_when_every_attempt_reports_different_files() {
     let dir = tempfile::tempdir().unwrap();
