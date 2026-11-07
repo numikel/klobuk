@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use super::overlays::{self, is_chord, is_ctrl_c, InputTarget, Mode};
-use super::snapshot::{PanePreview, Snapshot};
+use super::snapshot::{IssueDetail, PanePreview, Snapshot};
 use super::theme::Theme;
 use super::views::{agents, board, config, inbox, log, now, queue};
 
@@ -159,6 +159,9 @@ pub struct App {
     pub(crate) scroll_max: Cell<u16>,
     /// The colours (or the lack of them); the entry points build it from `NO_COLOR`.
     pub theme: Theme,
+    /// The detail in the snapshot was carried over a store refresh and may be out of date: a comment
+    /// or a dependency status can have changed under the selection. Cleared by [`App::set_detail`].
+    detail_stale: bool,
 }
 
 impl App {
@@ -182,6 +185,7 @@ impl App {
             status_stamp: None,
             scroll_max: Cell::new(u16::MAX),
             theme: Theme::default(),
+            detail_stale: false,
         }
     }
 
@@ -209,11 +213,14 @@ impl App {
         }
     }
 
-    /// Swaps the data. What was loaded on demand (the Board detail, the pane preview) stays until the
-    /// event loop loads it again; the views clamp their selections when they read them.
+    /// Swaps the data. What was loaded on demand (the Board detail, the pane preview) stays on screen
+    /// until the event loop loads it again, so the panel does not blink; a carried-over detail is marked
+    /// stale and [`App::detail_wanted`] asks for it again. The views clamp their selections when they
+    /// read them.
     pub fn replace(&mut self, mut snap: Snapshot) {
         if snap.detail.is_none() {
             snap.detail = self.snap.detail.take();
+            self.detail_stale = snap.detail.is_some();
         }
         if snap.pane_preview.is_none() {
             snap.pane_preview = self.snap.pane_preview.take();
@@ -236,13 +243,28 @@ impl App {
         }
     }
 
-    /// The issue whose Board detail should be loaded: the selected one, when the Board is open and the
-    /// snapshot holds the detail of another issue. The event loop turns it into `Action::LoadDetail`.
+    /// The issue whose Board detail should be loaded: the selected one, while the Board's panel is open
+    /// and the snapshot holds the detail of another issue or one from before the last store refresh.
+    /// The event loop turns it into a load.
     pub fn detail_wanted(&self) -> Option<IssueId> {
         if self.view != View::Board || !self.board.detail {
             return None;
         }
-        board::selected_issue(&self.snap, &self.board).filter(|id| self.snap.detail_of(id).is_none())
+        board::selected_issue(&self.snap, &self.board)
+            .filter(|id| self.detail_stale || self.snap.detail_of(id).is_none())
+    }
+
+    /// Keeps a freshly loaded Board detail in the snapshot.
+    pub fn set_detail(&mut self, detail: IssueDetail) {
+        self.snap.detail = Some(detail);
+        self.detail_stale = false;
+    }
+
+    /// The reload of the Board detail failed: say so, and keep what is shown until the next store
+    /// refresh asks again (instead of retrying on every pass of the event loop).
+    pub fn detail_failed(&mut self, message: String) {
+        self.status = Some(format!("detail failed: {message}"));
+        self.detail_stale = false;
     }
 
     /// Feeds the pane text read for the open answer overlay; anything else ignores it.

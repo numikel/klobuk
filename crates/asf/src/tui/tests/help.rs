@@ -141,19 +141,19 @@ fn help_page_is_the_mockup_title_two_columns_of_groups_the_legend_and_its_own_hi
         "SYMBOLS   ● working   ■ needs you   ◆ being checked   ✓ done   ○ waiting"
     );
     assert!(lines[n - 2].starts_with("────────"));
-    assert!(
-        lines[n - 1].contains("j / k scroll") && lines[n - 1].contains("Esc / ? close"),
-        "{:?}",
-        lines[n - 1]
+    assert_eq!(
+        lines[n - 1].trim(),
+        "j/k scroll   Esc close   ? close",
+        "the mockup's hint row"
     );
-    // every group of the page, in two columns: the second column starts in the middle of the screen
+    // every group of the page that has keys today, in two columns: the second column starts in the
+    // middle of the screen (QUEUE returns when the Queue view binds keys of its own)
     let heading_at = |h: &str| lines.iter().position(|l| l.contains(h));
     for h in [
         "EVERYWHERE",
         "WHEN AN AGENT NEEDS YOU",
         "BOARD",
         "INBOX",
-        "QUEUE",
         "CONFIG",
     ] {
         assert!(heading_at(h).is_some(), "no heading {h}:\n{t}");
@@ -175,15 +175,53 @@ fn help_page_is_the_mockup_title_two_columns_of_groups_the_legend_and_its_own_hi
     assert!(t.contains("answer: shows the agent's question,"));
     assert!(t.contains("then 1-4, Enter or t to reply"));
     // on a short screen the tail is reached by scrolling
-    let short = render_to_text(&a, 100, 20);
+    let short = render_to_text(&a, 80, 20);
     assert!(!short.contains("back to the default"), "{short}");
     for _ in 0..200 {
         a.handle_key(key('j'));
     }
-    let end = render_to_text(&a, 100, 20);
+    let end = render_to_text(&a, 80, 20);
     assert!(end.contains("back to the default"), "scrolled to the end:\n{end}");
     a.handle_key(key('g'));
-    assert!(render_to_text(&a, 100, 20).contains("EVERYWHERE"));
+    assert!(render_to_text(&a, 80, 20).contains("EVERYWHERE"));
+}
+
+#[test]
+fn when_an_agent_needs_you_lists_a_f_r_v_x_in_the_mockup_order_and_r_says_both_things() {
+    use crate::tui::bindings::help_sections;
+    let sections = help_sections();
+    let needs = sections
+        .iter()
+        .find(|s| s.title == "WHEN AN AGENT NEEDS YOU")
+        .expect("the group is on the page");
+    let keys: Vec<&str> = needs.items.iter().map(|(k, _)| *k).collect();
+    assert_eq!(keys, ["a", "f", "r", "v", "x"]);
+    // `r` writes to the agent in four views and retries a merge in Now: one row says both
+    let r = &needs.items[2].1;
+    assert!(r.starts_with("send the agent a message"), "{r:?}");
+    assert!(r.contains("Now") && r.contains("merge"), "{r:?}");
+    // the QUEUE heading must not promise a key the Queue view does not have (there `r` replies)
+    assert!(
+        sections.iter().all(|s| s.title != "QUEUE"),
+        "{:?}",
+        sections.iter().map(|s| s.title).collect::<Vec<_>>()
+    );
+    // and the rendered page shows the rows in that order
+    let mut a = app();
+    a.handle_key(key('?'));
+    let t = render_to_text(&a, 120, 60);
+    let at = |needle: &str| {
+        t.find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{t}"))
+    };
+    let order = [
+        at("answer: shows"),
+        at("focus the agent's own"),
+        at("send the agent a message"),
+        at("check a failed run again"),
+        at("stop the agent (asks first)"),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}:\n{t}");
 }
 
 #[test]

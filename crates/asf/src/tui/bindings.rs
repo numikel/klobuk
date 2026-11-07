@@ -323,26 +323,52 @@ pub fn footer_hints(view: View, mode: ModeKind) -> Vec<&'static Binding> {
     context
 }
 
-/// One heading of the help page with its rows: `(key, help)`; a binding that several views share is
-/// listed once.
+/// One heading of the help page with its rows: `(key, help)`. A binding that several views share is
+/// listed once; a key that means different things in different views is one row, the meaning that
+/// holds in the most views first and the others as continuation lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelpSection {
     pub title: &'static str,
-    pub items: Vec<(&'static str, &'static str)>,
+    pub items: Vec<(&'static str, String)>,
 }
 
 /// The help page, grouped in [`Group::PAGE`] order: every binding of the views (keyboard in `Normal`
-/// mode), so the page cannot say anything the table does not.
+/// mode), so the page cannot say anything the table does not. The rows of WHEN AN AGENT NEEDS YOU are
+/// sorted by key, as the mockup lists them; the other groups keep table order.
 pub fn help_sections() -> Vec<HelpSection> {
     Group::PAGE
         .iter()
         .map(|g| {
-            let mut items: Vec<(&'static str, &'static str)> = Vec::new();
+            // key -> [(how many views it holds in, what it does)], in order of first appearance
+            let mut rows: Vec<(&'static str, Vec<(usize, &'static str)>)> = Vec::new();
             for x in all().filter(|x| x.group == *g && x.modes.contains(&ModeKind::Normal)) {
-                if !items.contains(&(x.key, x.help)) {
-                    items.push((x.key, x.help));
+                let reach = if x.views.is_empty() {
+                    usize::MAX
+                } else {
+                    x.views.len()
+                };
+                match rows.iter_mut().find(|(key, _)| *key == x.key) {
+                    Some((_, meanings)) => {
+                        // the same sentence in several views is one meaning that holds in all of them
+                        match meanings.iter_mut().find(|(_, help)| *help == x.help) {
+                            Some((seen, _)) => *seen = seen.saturating_add(reach),
+                            None => meanings.push((reach, x.help)),
+                        }
+                    }
+                    None => rows.push((x.key, vec![(reach, x.help)])),
                 }
             }
+            if *g == Group::NeedsYou {
+                rows.sort_by_key(|(key, _)| *key);
+            }
+            let items = rows
+                .into_iter()
+                .map(|(key, mut meanings)| {
+                    meanings.sort_by_key(|(reach, _)| std::cmp::Reverse(*reach)); // stable
+                    let help: Vec<&str> = meanings.into_iter().map(|(_, help)| help).collect();
+                    (key, help.join("\n"))
+                })
+                .collect();
             HelpSection {
                 title: g.title(),
                 items,

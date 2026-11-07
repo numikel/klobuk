@@ -803,7 +803,7 @@ fn the_banner_is_for_the_other_views_the_footer_and_help_know_the_new_view() {
     for needle in [
         "WHEN AN AGENT NEEDS YOU",
         "check a failed run again",
-        "try the merge again after a fix",
+        "Now, on a merge row: try it again",
         "stop the agent (asks first)",
         "jump to a view",
     ] {

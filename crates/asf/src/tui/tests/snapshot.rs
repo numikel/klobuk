@@ -216,6 +216,48 @@ fn what_was_loaded_on_demand_survives_a_refresh() {
 }
 
 #[test]
+fn a_refresh_asks_again_for_the_detail_of_the_issue_the_board_has_open() {
+    use crate::tui::snapshot::IssueDetail;
+    let mut a = app(); // the Board, its panel open on the selected issue
+    assert!(a.board.detail);
+    let open = crate::tui::views::board::selected_issue(&a.snap, &a.board).expect("a selection");
+    let detail = |comments: usize| IssueDetail {
+        issue: open.clone(),
+        comments: (0..comments)
+            .map(|n| {
+                question(
+                    n as i64 + 1,
+                    open.as_ref(),
+                    "Which crate?",
+                    "2026-11-06T10:00:00Z",
+                )
+            })
+            .collect(),
+        deps: vec![],
+    };
+    a.set_detail(detail(0));
+    assert_eq!(a.detail_wanted(), None, "fresh: nothing to load");
+
+    // a store refresh: the comments and dependency status may have changed under the selection
+    a.replace(snapshot());
+    assert_eq!(
+        a.snap.detail_of(&open).map(|d| d.comments.len()),
+        Some(0),
+        "the old detail stays on screen until the new one is there"
+    );
+    assert_eq!(a.detail_wanted(), Some(open.clone()), "a refresh makes it stale");
+
+    a.set_detail(detail(1));
+    assert_eq!(a.detail_wanted(), None, "loaded again");
+    assert_eq!(a.snap.detail_of(&open).map(|d| d.comments.len()), Some(1));
+
+    // only an open Board panel is worth a reload
+    a.replace(snapshot());
+    a.handle_key(code(KeyCode::Esc));
+    assert_eq!(a.detail_wanted(), None, "the panel is closed");
+}
+
+#[test]
 fn a_snapshot_built_by_hand_gets_its_review_round_and_needs_you_from_derive() {
     let mut s = working_desk();
     s.review_of.clear();

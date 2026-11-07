@@ -432,8 +432,8 @@ pub fn run_interactive(ctx: &Ctx, view: Option<View>) -> Result<(), AppError> {
 /// Loads the Board detail of `id` into the snapshot; a failure leaves the panel without it.
 fn load_detail_into(app: &mut App, ctx: &Ctx, id: &IssueId) {
     match load_detail(ctx, id) {
-        Ok(detail) => app.snap.detail = Some(detail),
-        Err(e) => app.status = Some(format!("detail failed: {}", e.message)),
+        Ok(detail) => app.set_detail(detail),
+        Err(e) => app.detail_failed(e.message),
     }
 }
 
@@ -500,10 +500,6 @@ fn event_loop(
                 }
             }
         }
-        // A view switch or a refresh can leave the Board without the detail of its selection.
-        if let Some(id) = app.detail_wanted() {
-            load_detail_into(app, ctx, &id);
-        }
         if let Some(msg) = background.as_mut().and_then(Background::poll) {
             background = None;
             app.busy = None;
@@ -526,6 +522,12 @@ fn event_loop(
             if with_agents {
                 last_agents = Instant::now();
             }
+        }
+        // A view switch leaves the Board without the detail of its selection, and a store refresh
+        // leaves it with one that may be out of date (a new QUESTION, a dependency that moved on):
+        // load it before the next draw so the panel never shows the old one for a whole interval.
+        if let Some(id) = app.detail_wanted() {
+            load_detail_into(app, ctx, &id);
         }
     }
 }

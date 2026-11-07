@@ -79,8 +79,10 @@ use ModeKind as M;
 /// The keys of the windows themselves (typing and the question are in the global table).
 pub const BINDINGS: &[Binding] = &[
     // ---- Help page ----
+    // The page's own hint row is "j/k scroll   Esc close   ? close" (the mockup), so the two closing
+    // keys are two hints.
     b(
-        "j / k",
+        "j/k",
         "scroll",
         "scroll the key reference",
         Group::Window,
@@ -89,7 +91,16 @@ pub const BINDINGS: &[Binding] = &[
         Slot::Hint,
     ),
     b(
-        "Esc / ?",
+        "Esc",
+        "close",
+        "close the key reference",
+        Group::Window,
+        ANY,
+        &[M::Help],
+        Slot::Hint,
+    ),
+    b(
+        "?",
         "close",
         "close the key reference",
         Group::Window,
@@ -659,7 +670,10 @@ fn help_view(frame: &mut Frame, area: Rect, view: View, scroll: u16, theme: &The
     frame.render_widget(Paragraph::new(Line::from(legend_spans)), legend);
     frame.render_widget(chrome::rule(area.width, theme), rule_bottom);
     frame.render_widget(
-        Paragraph::new(chrome::hints_line(&footer_hints(view, ModeKind::Help), theme)),
+        Paragraph::new(chrome::window_hints_line(
+            &footer_hints(view, ModeKind::Help),
+            theme,
+        )),
         hints,
     );
 }

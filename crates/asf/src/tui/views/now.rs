@@ -117,11 +117,13 @@ pub const BINDINGS: &[Binding] = &[
         Slot::None,
     ),
     b("x", "abort", HELP_ABORT, Group::NeedsYou, NOW, NORMAL, Slot::None),
+    // Listed under NEEDS YOU, where it works: on a merge row of this view. The Queue view's own `r`
+    // sends a message (QUEUE gets this key from the Queue task, when that view retries).
     b(
         "r",
         "retry",
-        "try the merge again after a fix",
-        Group::Queue,
+        "Now, on a merge row: try it again\nafter a fix",
+        Group::NeedsYou,
         NOW,
         NORMAL,
         Slot::None,

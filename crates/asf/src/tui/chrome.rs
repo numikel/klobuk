@@ -123,18 +123,19 @@ fn banner_line(needs: &[Need], width: usize, theme: &Theme) -> Line<'static> {
     Line::styled(format!("{head}{suffix}"), theme.warn())
 }
 
-/// `key label` pairs: the key accent + bold, the label dim, two blanks apart.
-pub fn hints_line(hints: &[&Binding], theme: &Theme) -> Line<'static> {
+/// The hint row of a window that draws its own (the help page): `key label` pairs, the key accent +
+/// bold, the label dim, three blanks apart as the mockup has them (the footer packs them closer).
+pub fn window_hints_line(hints: &[&Binding], theme: &Theme) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
-    spans.extend(hint_spans(hints, theme));
+    spans.extend(hint_spans(hints, theme, "   "));
     Line::from(spans)
 }
 
-fn hint_spans(hints: &[&Binding], theme: &Theme) -> Vec<Span<'static>> {
+fn hint_spans(hints: &[&Binding], theme: &Theme, gap: &'static str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, h) in hints.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(gap));
         }
         spans.push(Span::styled(h.key, theme.key()));
         spans.push(Span::raw(" "));
@@ -149,7 +150,7 @@ fn footer(app: &App) -> Paragraph<'static> {
     let hints = footer_hints(app.view, kind);
     let lead = |text: String| {
         let mut spans = vec![Span::raw(text)];
-        spans.extend(hint_spans(&hints, &app.theme));
+        spans.extend(hint_spans(&hints, &app.theme, "  "));
         Line::from(spans)
     };
     let line = match app.mode() {
