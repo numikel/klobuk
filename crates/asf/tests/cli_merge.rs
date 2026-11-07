@@ -1507,6 +1507,45 @@ fn two_failed_reviewer_starts_in_a_row_fail_the_item_with_a_blocker() {
 }
 
 #[test]
+fn a_human_retry_starts_the_count_of_failed_reviewer_starts_over() {
+    let f = setup();
+    require_review(&f);
+    short_start_window(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    failing_reviewer_starts(&f, 2);
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "failed"
+    );
+    assert_eq!(comments_of(&f, CommentType::Blocker).len(), 1);
+
+    // the human fixed the cause and retries; the first start afterwards fails again
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    failing_reviewer_starts(&f, 1);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(
+        res["items"][0]["state"], "queued",
+        "one failed start after a retry is the first of the new count, not the third: {res}"
+    );
+    let err = res["items"][0]["last_error"].as_str().unwrap();
+    assert!(err.contains("1 of 2"), "{err}");
+    assert_eq!(
+        comments_of(&f, CommentType::Blocker).len(),
+        1,
+        "no second BLOCKER"
+    );
+
+    // and the count still ends: a second failed start after the retry fails the item again
+    failing_reviewer_starts(&f, 1);
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "failed"
+    );
+    assert_eq!(comments_of(&f, CommentType::Blocker).len(), 2);
+}
+
+#[test]
 fn a_reviewer_that_started_resets_the_count_of_failed_starts() {
     let f = setup();
     require_review(&f);

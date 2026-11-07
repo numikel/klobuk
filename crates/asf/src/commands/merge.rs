@@ -25,6 +25,10 @@ const REVIEW_STARTED: &str = "merge.review_started";
 /// end of the history, with no started reviewer after them, are the ones that count in a row.
 const REVIEW_START_FAILED: &str = "merge.review_start_failed";
 
+/// Event `asf merge retry` appends: the human fixed the cause, so the failed starts before it no
+/// longer count towards `REVIEW_START_ATTEMPTS`.
+const MERGE_RETRIED: &str = "merge.retried";
+
 /// Failed reviewer starts in a row after which the item fails instead of going back to the queue.
 const REVIEW_START_ATTEMPTS: usize = 2;
 
@@ -121,6 +125,13 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
                     ..MergePatch::default()
                 },
             )?;
+            ctx.store.append_event(&NewEvent {
+                kind: MERGE_RETRIED.into(),
+                issue_id: Some(id.clone()),
+                run_id: item.run_id.clone(),
+                actor: Some(LANE_HUMAN.into()),
+                payload: serde_json::json!({ "from": item.state.to_string() }),
+            })?;
             if ctx.store.get_issue(id)?.map(|i| i.status) == Some(Status::Blocked) {
                 ctx.store.set_status(id, Status::Validating, LANE_ORCHESTRATOR)?;
             }
@@ -848,7 +859,7 @@ fn review_start_failed(ctx: &Ctx, item: &MergeItem, cause: &str) -> Result<Merge
 
 /// Failed reviewer starts of `id` since a reviewer last started: the failures at the end of the
 /// `merge.review_started` / `merge.review_start_failed` history, where a start with no failure after
-/// it (a reviewer that did come up) ends the streak.
+/// it (a reviewer that did come up) or a `merge.retried` ends the streak.
 fn failed_review_starts_in_a_row(ctx: &Ctx, id: &IssueId) -> Result<usize, AppError> {
     let mut streak = 0;
     let mut last_failed = false;
@@ -869,6 +880,12 @@ fn failed_review_starts_in_a_row(ctx: &Ctx, id: &IssueId) -> Result<usize, AppEr
                     streak += 1;
                     last_failed = true;
                 }
+                // a human retry ends the streak, even right after a failed start
+                MERGE_RETRIED => {
+                    streak = 0;
+                    last_failed = false;
+                }
+                // a human retry ends the streak, even right after a failed start
                 _ => {}
             }
         }
