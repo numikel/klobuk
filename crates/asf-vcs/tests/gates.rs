@@ -81,34 +81,54 @@ fn epoch_in(path: &std::path::Path) -> Option<f64> {
 
 /// Killing the gate must not wait for its descendants: a grandchild that inherited the output pipe
 /// keeps it open long after the gate itself is gone (`sh -c`, `cargo test`, ...). The clock starts
-/// when the grandchild runs, not when `run_gates` is called, so a slow process start under load
-/// cannot move the result.
+/// when the grandchild runs, not when `run_gates` is called.
+///
+/// The gate's timeout counts from before the process start, which takes seconds under parallel load
+/// (measured up to 6 s). A gate killed before `Popen` ran leaves no grandchild and proves nothing,
+/// so the gate stamps `parent` only after `Popen` returned (the grandchild then exists, and killing
+/// the gate does not kill it); without the stamp the scenario is run again in a fresh directory.
 #[test]
 fn returns_promptly_after_a_timeout_even_when_a_descendant_keeps_the_pipe_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let code = "import subprocess, sys, time\n\
-subprocess.Popen([sys.executable, '-c', \"import time; open('grandchild', 'w').write(str(time.time())); time.sleep(15)\"])\n\
-time.sleep(60)";
-    let results = run_gates(&[spec("tree", &py(code), 3)], dir.path());
-    let returned = epoch_now();
-    // the grandchild may still be starting when the gate is killed: wait for its timestamp
-    let marker = dir.path().join("grandchild");
-    let wait = std::time::Instant::now();
-    let grandchild_started = loop {
-        if let Some(t) = epoch_in(&marker) {
-            break t;
-        }
-        assert!(wait.elapsed().as_secs() < 30, "the grandchild never started");
-        std::thread::sleep(ms(50));
-    };
-    assert!(
-        returned - grandchild_started < 10.0,
-        "run_gates came back {:.1} s after the grandchild started; it slept 15 s holding the pipe",
-        returned - grandchild_started
+    const ATTEMPTS: u32 = 3;
+    const GRANDCHILD_SLEEP_S: u32 = 40;
+    let code = format!(
+        "import subprocess, sys, time\n\
+subprocess.Popen([sys.executable, '-c', \"import time; open('grandchild', 'w').write(str(time.time())); time.sleep({GRANDCHILD_SLEEP_S})\"])\n\
+open('parent', 'w').write('x')\n\
+time.sleep(120)"
     );
-    assert!(!results[0].ok);
-    assert_eq!(results[0].exit_code, None, "killed => no exit code");
-    assert!(results[0].tail.contains("timeout"), "{}", results[0].tail);
+    for attempt in 1..=ATTEMPTS {
+        let dir = tempfile::tempdir().unwrap();
+        let results = run_gates(&[spec("tree", &py(&code), 8)], dir.path());
+        let returned = epoch_now();
+        assert!(!results[0].ok);
+        assert_eq!(results[0].exit_code, None, "killed => no exit code");
+        assert!(results[0].tail.contains("timeout"), "{}", results[0].tail);
+        if !dir.path().join("parent").exists() {
+            eprintln!("attempt {attempt}/{ATTEMPTS}: the gate was killed before it started a grandchild");
+            continue;
+        }
+        // the grandchild exists but may still be starting: wait for its timestamp
+        let marker = dir.path().join("grandchild");
+        let wait = std::time::Instant::now();
+        let grandchild_started = loop {
+            if let Some(t) = epoch_in(&marker) {
+                break t;
+            }
+            assert!(
+                wait.elapsed().as_secs() < 60,
+                "the grandchild never wrote its timestamp"
+            );
+            std::thread::sleep(ms(50));
+        };
+        assert!(
+            returned - grandchild_started < 25.0,
+            "run_gates came back {:.1} s after the grandchild started; it slept {GRANDCHILD_SLEEP_S} s holding the pipe",
+            returned - grandchild_started
+        );
+        return;
+    }
+    panic!("the gate was killed before it could start a grandchild in all {ATTEMPTS} attempts");
 }
 
 #[test]
