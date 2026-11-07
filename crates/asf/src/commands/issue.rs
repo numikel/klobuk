@@ -361,6 +361,11 @@ struct FinishView {
 /// is never written by the store, so a question counts as answered only when an ANSWER comment
 /// replies to it (`--reply-to`).
 fn unanswered_questions(comments: &[Comment]) -> Vec<i64> {
+    open_questions(comments).iter().map(|q| q.id).collect()
+}
+
+/// The QUESTION comments to the human among `comments` that nobody has answered, oldest first.
+fn open_questions(comments: &[Comment]) -> Vec<&Comment> {
     comments
         .iter()
         .filter(|q| q.kind == CommentType::Question && q.to_lane == LANE_HUMAN && q.resolved_at.is_none())
@@ -369,8 +374,51 @@ fn unanswered_questions(comments: &[Comment]) -> Vec<i64> {
                 .iter()
                 .any(|a| a.kind == CommentType::Answer && a.reply_to == Some(q.id))
         })
-        .map(|q| q.id)
         .collect()
+}
+
+/// The `author` value a comment posted from `lane` carries (same rule as `Ctx::author`).
+fn lane_author(lane: &str) -> String {
+    match lane {
+        asf_core::LANE_ORCHESTRATOR | asf_core::LANE_HUMAN => lane.to_string(),
+        l => format!("agent:{l}"),
+    }
+}
+
+/// An ANSWER posted without `--reply-to` answers the open QUESTION that lane `to` asked on this
+/// issue. `None` when `to` has no open question (the ANSWER stays a plain comment); an error when
+/// it has several, so nothing is linked by accident.
+fn answered_question(comments: &[Comment], to: &str) -> Result<Option<i64>, AppError> {
+    let author = lane_author(to);
+    let open: Vec<&Comment> = open_questions(comments)
+        .into_iter()
+        .filter(|q| q.author == author)
+        .collect();
+    match open.as_slice() {
+        [] => Ok(None),
+        [q] => Ok(Some(q.id)),
+        many => {
+            let list = many
+                .iter()
+                .map(|q| format!("#{} ({})", q.id, excerpt(&q.body)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(AppError::usage(format!(
+                "{to} has {} open QUESTIONs on this issue: {list}; pick one with --reply-to <id>",
+                many.len()
+            )))
+        }
+    }
+}
+
+/// First line of `body`, cut to 60 characters, for one-line listings.
+fn excerpt(body: &str) -> String {
+    let line = body.lines().next().unwrap_or("").trim();
+    let mut out: String = line.chars().take(60).collect();
+    if line.chars().count() > 60 {
+        out.push_str("...");
+    }
+    out
 }
 
 fn finish(ctx: &Ctx, id: &IssueId, report: &Path) -> Result<Rendered, AppError> {
@@ -432,6 +480,10 @@ fn post(
     body: String,
     reply_to: Option<i64>,
 ) -> Result<Rendered, AppError> {
+    let reply_to = match reply_to {
+        None if kind == CommentType::Answer => answered_question(&ctx.store.comments(id)?, to.trim())?,
+        r => r,
+    };
     let c = ctx.store.add_comment(&NewComment {
         issue_id: id.clone(),
         author: ctx.author(),
@@ -440,10 +492,13 @@ fn post(
         body,
         reply_to,
     })?;
-    let text = format!(
+    let mut text = format!(
         "#{} {} {} -> to: {} on {}",
         c.id, c.author, c.kind, c.to_lane, c.issue_id
     );
+    if let (CommentType::Answer, Some(q)) = (c.kind, c.reply_to) {
+        text.push_str(&format!(", answers #{q}"));
+    }
     Rendered::new(&c, text)
 }
 

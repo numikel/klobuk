@@ -241,7 +241,7 @@ fn finish_is_refused_while_a_question_to_human_is_unanswered() {
         "a refused finish changes nothing"
     );
 
-    // an unrelated ANSWER (no reply_to) does not resolve it
+    // an ANSWER without reply_to that is not addressed to the asking lane does not resolve it
     r.ok(&[
         "--lane",
         "human",
@@ -251,7 +251,7 @@ fn finish_is_refused_while_a_question_to_human_is_unanswered() {
         "--type",
         "ANSWER",
         "--to",
-        &a,
+        "all",
         "--body",
         "general remark",
     ]);
@@ -299,6 +299,106 @@ fn finish_ignores_questions_that_are_not_to_human() {
     ]);
     let done = r.ok(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
     assert_eq!(done["issue"]["status"], "in-review");
+}
+
+// ---- ANSWER without --reply-to ----------------------------------------------------------------
+
+/// `asf issue comment <id> --type ANSWER --to <to> [extra...] --body <body>` from the human lane.
+fn answer_args<'a>(id: &'a str, to: &'a str, extra: &[&'a str], body: &'a str) -> Vec<&'a str> {
+    let mut args = vec![
+        "--lane", "human", "issue", "comment", id, "--type", "ANSWER", "--to", to,
+    ];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--body", body]);
+    args
+}
+
+#[test]
+fn answer_without_reply_to_resolves_the_only_open_question() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let report = report_file(&r, "report.md");
+    let qid = ask(&r, &a, "human", "which crate?");
+
+    let (code, _, _) = r.err(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(code, 3, "the open question blocks finish");
+
+    let ans = r.ok(&answer_args(&a, &a, &[], "asf-core"));
+    assert_eq!(ans["reply_to"].as_i64().unwrap().to_string(), qid, "{ans}");
+
+    let done = r.ok(&["--lane", &a, "issue", "finish", &a, "--report", &report]);
+    assert_eq!(done["issue"]["status"], "in-review");
+}
+
+#[test]
+fn answer_without_reply_to_says_which_question_it_answers() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let qid = ask(&r, &a, "human", "which crate?");
+
+    let out = r
+        .asf()
+        .args(answer_args(&a, &a, &[], "asf-core"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&format!("answers #{qid}")), "{stdout}");
+}
+
+#[test]
+fn answer_without_reply_to_with_several_open_questions_refuses_and_lists_them() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let q1 = ask(&r, &a, "human", "first question");
+    let q2 = ask(&r, &a, "human", "second question");
+
+    let (code, ecode, msg) = r.err(&answer_args(&a, &a, &[], "an answer"));
+    assert_eq!((code, ecode.as_str()), (2, "usage"), "{msg}");
+    assert!(
+        msg.contains(&format!("#{q1}")) && msg.contains(&format!("#{q2}")),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("first question") && msg.contains("--reply-to"),
+        "{msg}"
+    );
+    assert!(
+        comments_of(&r, &a).iter().all(|c| c["type"] != "ANSWER"),
+        "a refused answer is not stored"
+    );
+
+    // naming the question explicitly still works
+    let ans = r.ok(&answer_args(&a, &a, &["--reply-to", &q2], "an answer"));
+    assert_eq!(ans["reply_to"].as_i64().unwrap().to_string(), q2);
+}
+
+#[test]
+fn answer_without_reply_to_only_looks_at_the_addressed_lane() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let b = r.create_issue("b", &["--ready"]);
+    let qa = ask(&r, &a, "human", "from a");
+    // a second lane asks on the same issue (a's issue), so there are two open questions in all
+    let qb = r.ok(&[
+        "--lane", &b, "issue", "comment", &a, "--type", "QUESTION", "--to", "human", "--body", "from b",
+    ])["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+
+    let ans = r.ok(&answer_args(&a, &b, &[], "for b"));
+    assert_eq!(ans["reply_to"].as_i64().unwrap().to_string(), qb, "{ans}");
+    let ans = r.ok(&answer_args(&a, &a, &[], "for a"));
+    assert_eq!(ans["reply_to"].as_i64().unwrap().to_string(), qa, "{ans}");
+}
+
+#[test]
+fn answer_to_a_lane_without_an_open_question_stays_a_plain_comment() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let ans = r.ok(&answer_args(&a, &a, &[], "nothing was asked"));
+    assert!(ans["reply_to"].is_null(), "{ans}");
 }
 
 // ---- `asf issue scope add|rm` -----------------------------------------------------------------
