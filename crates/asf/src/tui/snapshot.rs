@@ -61,6 +61,10 @@ pub struct Snapshot {
     pub deps: Vec<Dep>,
     /// `[review] model`: what a reviewer run is shown with.
     pub review_model: String,
+    /// `[review] required`: every merge waits for a reviewer.
+    pub review_required: bool,
+    /// `[review] on_labels`: an issue with one of these labels waits for a reviewer too.
+    pub review_on_labels: Vec<String>,
     /// The latest run of every issue, finished ones included, ordered by issue id.
     // Read by the view tasks that follow (asf-39 .. asf-44): the snapshot is their contract.
     #[allow(dead_code)]
@@ -774,6 +778,8 @@ pub fn load_snapshot(
         blockers,
         deps: store.deps()?,
         review_model: ctx.config.review.model.clone(),
+        review_required: ctx.config.review.required,
+        review_on_labels: ctx.config.review.on_labels.clone(),
         last_runs,
         merged_today: Vec::new(),
         review_of,

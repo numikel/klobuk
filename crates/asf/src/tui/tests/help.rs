@@ -147,13 +147,14 @@ fn help_page_is_the_mockup_title_two_columns_of_groups_the_legend_and_its_own_hi
         "the mockup's hint row"
     );
     // every group of the page that has keys today, in two columns: the second column starts in the
-    // middle of the screen (QUEUE returns when the Queue view binds keys of its own)
+    // middle of the screen
     let heading_at = |h: &str| lines.iter().position(|l| l.contains(h));
     for h in [
         "EVERYWHERE",
         "WHEN AN AGENT NEEDS YOU",
         "BOARD",
         "INBOX",
+        "QUEUE",
         "CONFIG",
     ] {
         assert!(heading_at(h).is_some(), "no heading {h}:\n{t}");
@@ -200,12 +201,13 @@ fn when_an_agent_needs_you_lists_a_f_r_v_x_in_the_mockup_order_and_r_says_both_t
     let r = &needs.items[2].1;
     assert!(r.starts_with("send the agent a message"), "{r:?}");
     assert!(r.contains("Now") && r.contains("merge"), "{r:?}");
-    // the QUEUE heading must not promise a key the Queue view does not have (there `r` replies)
-    assert!(
-        sections.iter().all(|s| s.title != "QUEUE"),
-        "{:?}",
-        sections.iter().map(|s| s.title).collect::<Vec<_>>()
-    );
+    // the QUEUE heading lists the keys the Queue view has (there `r` retries, it does not reply)
+    let queue = sections
+        .iter()
+        .find(|s| s.title == "QUEUE")
+        .expect("a QUEUE heading");
+    let queue_keys: Vec<&str> = queue.items.iter().map(|(k, _)| *k).collect();
+    assert_eq!(queue_keys, ["r", "v", "Enter", "f"]);
     // and the rendered page shows the rows in that order
     let mut a = app();
     a.handle_key(key('?'));

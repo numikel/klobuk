@@ -223,7 +223,7 @@ fn every_view_renders_without_data_at_every_size_and_four_of_them_say_what_to_do
     for (view, sentence) in [
         (View::Agents, "No worker is running."),
         (View::Inbox, "Nothing needs you and nothing new to read."),
-        (View::Queue, "The merge queue is empty."),
+        (View::Queue, "Queue is empty."),
         (View::Log, "Nothing has happened yet."),
     ] {
         let mut a = App::new(Snapshot::default());

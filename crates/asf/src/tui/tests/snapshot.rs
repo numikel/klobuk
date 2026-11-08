@@ -194,6 +194,21 @@ fn the_loader_carries_deps_the_latest_run_per_issue_merged_today_review_links_an
 }
 
 #[test]
+fn the_loader_carries_whether_a_review_is_required_and_the_labels_that_ask_for_one() {
+    let (mut ctx, _) = story();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert!(
+        !s.review_required && s.review_on_labels.is_empty(),
+        "off by default"
+    );
+    ctx.config.review.required = true;
+    ctx.config.review.on_labels = vec!["risky".into()];
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert!(s.review_required);
+    assert_eq!(s.review_on_labels, ["risky"]);
+}
+
+#[test]
 fn the_detail_of_an_issue_is_loaded_on_demand_with_comments_and_dependency_status() {
     let (ctx, [a, b, ..]) = story();
     let d = load_detail(&ctx, &b).unwrap();
