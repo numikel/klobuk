@@ -11,9 +11,20 @@
 //!
 //! A scripted `prompt` entry `{"error":"stalled"|"timeout"}` types the text but does not submit it;
 //! `"swallow_enter": N` makes the input box ignore the first N Enters that follow.
+//!
+//! Herdr reports a state change late (up to ~90 s observed live), so the fake can lag too: a `prompt`
+//! entry with `"lag_ms": N` means the submission inside the prompt call did take effect, but the agent
+//! reports `working` only N ms later (nothing is left in the input box, no Enter is needed);
+//! `"enter_lag_ms": N` makes the Enter that finally submits take effect that late instead of at once.
+//! While such a change is pending, `wait` really waits for it (up to its timeout), like Herdr's
+//! `agent wait`; without one it answers at once, as before.
+//!
+//! A scripted `start_agent` entry `{"error":"pane_busy"}` is Herdr's `agent_pane_busy` refusal: the
+//! shell of a freshly created pane is not ready yet. It registers no agent.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asf_core::*;
 use serde::{Deserialize, Serialize};
@@ -33,6 +44,12 @@ struct Agent {
     /// Enters that the input box still ignores before one submits the pending text.
     #[serde(default)]
     swallow_enter: u32,
+    /// How late (ms) the Enter that submits the pending text shows up as `working`; 0 = at once.
+    #[serde(default)]
+    enter_lag_ms: u64,
+    /// Epoch ms at which a submission that already took effect becomes visible as `working`.
+    #[serde(default)]
+    working_at_ms: Option<u64>,
     pane_id: String,
     workspace_id: String,
     screen: String,
@@ -149,6 +166,22 @@ fn agent_mut<'a>(st: &'a mut State, name: &str) -> Result<&'a mut Agent, Runtime
         .ok_or_else(|| RuntimeError::NotFound(format!("agent {name} not found")))
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Makes a lagging state change visible once its time has come.
+fn settle(a: &mut Agent) {
+    if a.working_at_ms.is_some_and(|t| now_ms() >= t) {
+        a.working_at_ms = None;
+        a.info.state = AgentState::Working;
+        a.info.revision += 1;
+        a.info.state_change_seq = Some(a.info.revision);
+    }
+}
+
 impl AgentRuntime for FakeRuntime {
     fn health(&self) -> Result<RuntimeInfo, RuntimeError> {
         self.with("health", json!({}), |_| {
@@ -185,6 +218,16 @@ impl AgentRuntime for FakeRuntime {
                 .unwrap_or_default();
             let screen = st.script.screen.clone();
             let scripted = st.script.start_agent.pop_front();
+            if scripted
+                .as_ref()
+                .is_some_and(|v| v.get("error").and_then(Value::as_str) == Some("pane_busy"))
+            {
+                return Err(RuntimeError::Protocol(format!(
+                    "agent target pane {} is not an available shell ({})",
+                    r.pane_id,
+                    crate::herdr::PANE_BUSY_CODE
+                )));
+            }
             let agent = st.agents.entry(r.name.clone()).or_insert_with(|| Agent {
                 info: AgentInfo {
                     state: AgentState::Unknown,
@@ -193,6 +236,8 @@ impl AgentRuntime for FakeRuntime {
                 },
                 pending_enter: false,
                 swallow_enter: 0,
+                enter_lag_ms: 0,
+                working_at_ms: None,
                 pane_id: r.pane_id.clone(),
                 workspace_id,
                 screen,
@@ -252,6 +297,12 @@ impl AgentRuntime for FakeRuntime {
                     .get("swallow_enter")
                     .and_then(Value::as_u64)
                     .map_or(0, |n| n as u32);
+                a.enter_lag_ms = v.get("enter_lag_ms").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(lag) = v.get("lag_ms").and_then(Value::as_u64) {
+                    // the submission took effect after all; the runtime just reports it late
+                    a.pending_enter = false;
+                    a.working_at_ms = Some(now_ms() + lag);
+                }
                 return Err(if v.get("error").and_then(Value::as_str) == Some("timeout") {
                     RuntimeError::Timeout(format!(
                         "timed out waiting for agent status of {} (fake prompt)",
@@ -280,18 +331,26 @@ impl AgentRuntime for FakeRuntime {
         let args = json!({ "name": h.name, "until": until, "timeout_ms": timeout_ms });
         self.with("wait", args, |st| {
             let a = agent_mut(st, &h.name)?;
-            let ok = if until.is_empty() {
-                a.info.state.is_settled()
-            } else {
-                until.contains(&a.info.state)
-            };
-            if ok {
-                Ok(a.info.clone())
-            } else {
-                Err(RuntimeError::Timeout(format!(
-                    "agent {} is {} (fake wait)",
-                    h.name, a.info.state
-                )))
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                settle(a);
+                let ok = if until.is_empty() {
+                    a.info.state.is_settled()
+                } else {
+                    until.contains(&a.info.state)
+                };
+                if ok {
+                    return Ok(a.info.clone());
+                }
+                // only a pending, lagging change is worth waiting for; otherwise answer at once
+                let left = deadline.saturating_duration_since(Instant::now());
+                if a.working_at_ms.is_none() || left.is_zero() {
+                    return Err(RuntimeError::Timeout(format!(
+                        "agent {} is {} (fake wait)",
+                        h.name, a.info.state
+                    )));
+                }
+                std::thread::sleep(left.min(Duration::from_millis(20)));
             }
         })
     }
@@ -303,6 +362,7 @@ impl AgentRuntime for FakeRuntime {
             if let Some(v) = scripted {
                 FakeRuntime::apply_scripted(a, &v);
             }
+            settle(a);
             Ok(a.info.clone())
         })
     }
@@ -331,9 +391,13 @@ impl AgentRuntime for FakeRuntime {
                     a.swallow_enter -= 1;
                 } else {
                     a.pending_enter = false;
-                    a.info.state = AgentState::Working;
-                    a.info.revision += 1;
-                    a.info.state_change_seq = Some(a.info.revision);
+                    if a.enter_lag_ms > 0 {
+                        a.working_at_ms = Some(now_ms() + a.enter_lag_ms);
+                    } else {
+                        a.info.state = AgentState::Working;
+                        a.info.revision += 1;
+                        a.info.state_change_seq = Some(a.info.revision);
+                    }
                 }
             }
             Ok(())

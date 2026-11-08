@@ -19,12 +19,16 @@ use crate::output::{AppError, ErrorCode};
 pub const RUNS_DIR: &str = "runs";
 pub const HOOK_TIMEOUT_S: u64 = 30;
 const TRUST_MARKERS: [&str; 2] = ["trust this folder", "Yes, I trust"];
-/// Submit-key presses a kick-off gets before the start gives up.
-const KICKOFF_ENTERS: usize = 3;
-/// Look-and-wait rounds of that check (`unknown` states use rounds without a key press).
-const KICKOFF_ROUNDS: usize = 6;
-/// How long one round waits for the agent to leave `idle`; Claude normally does within a second.
-const KICKOFF_WAIT_MS: u64 = 5_000;
+/// Extra submit-key presses a kick-off gets, after a full wait, before the start gives up. The
+/// submission inside `agent prompt` counts as the first press; Herdr may report its effect up to
+/// ~90 s late, so a second key must not follow while that one may still be landing.
+const KICKOFF_ENTERS: usize = 1;
+/// Characters of the kick-off line that identify it on the pane text.
+const KICKOFF_PROBE_CHARS: usize = 40;
+/// How long `agent start` is retried while Herdr says the pane's shell is not ready yet (capped by
+/// `start_timeout_ms`), and how often.
+const PANE_BUSY_WAIT_MS: u64 = 15_000;
+const PANE_BUSY_POLL_MS: u64 = 500;
 
 pub struct Worker<'a> {
     pub ctx: &'a Ctx,
@@ -467,7 +471,7 @@ impl<'a> Worker<'a> {
         let give_up =
             |run: &Run, handle: &AgentHandle, e: RuntimeError| self.start_failed(l, run, handle, e, fail_run);
         let mut trusted = false;
-        let _up = match self.rt.start_agent(&start) {
+        let _up = match self.start_agent_patiently(&start) {
             Ok(a) => a,
             Err(RuntimeError::NotReady(msg)) => {
                 let screen = self.rt.read(&handle, 60).unwrap_or_default();
@@ -612,9 +616,30 @@ impl<'a> Worker<'a> {
     /// `start_agent`, and when Herdr's startup detection times out, a re-read of the agent instead of
     /// a verdict: it may be up and ready (`await_started`).
     fn start_and_await(&self, start: &StartAgent, handle: &AgentHandle) -> Result<AgentInfo, RuntimeError> {
-        match self.rt.start_agent(start) {
+        match self.start_agent_patiently(start) {
             Err(RuntimeError::Timeout(msg)) => self.await_started(handle, msg),
             other => other,
+        }
+    }
+
+    /// `start_agent`, polled while Herdr refuses it because the shell of the fresh pane is not ready
+    /// yet (`agent_pane_busy`, seen under load right after `workspace create`). The polling lasts at
+    /// most `PANE_BUSY_WAIT_MS` and never longer than `start_timeout_ms`; any other outcome, or a pane
+    /// that is still busy at the end, is returned as it came.
+    fn start_agent_patiently(&self, start: &StartAgent) -> Result<AgentInfo, RuntimeError> {
+        let budget = self.ctx.config.worker.start_timeout_ms.min(PANE_BUSY_WAIT_MS);
+        let deadline = std::time::Instant::now() + Duration::from_millis(budget);
+        loop {
+            match self.rt.start_agent(start) {
+                Err(e) if asf_runtime::herdr::is_pane_busy(&e) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(e);
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(PANE_BUSY_POLL_MS)));
+                }
+                other => return other,
+            }
         }
     }
 
@@ -631,49 +656,59 @@ impl<'a> Worker<'a> {
             self.ctx.config.worker.prompt_timeout_ms,
         ) {
             Ok(a) => Ok(a),
-            Err(RuntimeError::Timeout(_) | RuntimeError::Stalled(_)) => self.ensure_submitted(handle),
+            Err(RuntimeError::Timeout(_) | RuntimeError::Stalled(_)) => self.ensure_submitted(handle, text),
             Err(e) => Err(e),
         }
     }
 
-    /// After a kick-off that Herdr could not see start: the prompt is accepted once the agent is
-    /// `working`, `blocked` (a dialog took over, the watch loop answers it) or `done`. An `idle` agent
-    /// still has the text in its input box, so the submit key is pressed again, at most
-    /// `KICKOFF_ENTERS` times, each followed by a bounded wait. `unknown` gets a wait but no key: Enter
-    /// on a dialog Herdr cannot classify could answer it with its default. Whatever is left ends in a
-    /// `Timeout` naming the last state seen, which becomes the BLOCKER text.
-    fn ensure_submitted(&self, handle: &AgentHandle) -> Result<AgentInfo, RuntimeError> {
-        let window = self.ctx.config.worker.prompt_timeout_ms.min(KICKOFF_WAIT_MS);
+    /// After a kick-off that Herdr could not see start. The runtime reports a state change late (up to
+    /// ~90 s observed live), so the first thing to do is wait, for as long as the start itself may take
+    /// (`start_timeout_ms`), for the agent to turn `working`, `blocked` (a dialog took over, the watch
+    /// loop answers it) or `done`. Only an agent that is still `idle` after that, with the kick-off line
+    /// still on the pane, gets the submit key, once (`KICKOFF_ENTERS`), followed by one more full wait.
+    /// `unknown` gets no key at all: Enter on a dialog Herdr cannot classify could answer it with its
+    /// default. Whatever is left ends in a `Timeout` naming the last state seen, which becomes the
+    /// BLOCKER text.
+    fn ensure_submitted(&self, handle: &AgentHandle, text: &str) -> Result<AgentInfo, RuntimeError> {
+        let window = self.ctx.config.worker.start_timeout_ms;
         let taken = [AgentState::Working, AgentState::Blocked, AgentState::Done];
         let mut pressed = 0;
-        let mut last = AgentState::Unknown;
-        for _ in 0..KICKOFF_ROUNDS {
-            let info = self.rt.info(handle)?;
-            last = info.state;
-            let wait_for: &[AgentState] = match info.state {
-                AgentState::Working | AgentState::Blocked | AgentState::Done => return Ok(info),
-                AgentState::Idle if pressed >= KICKOFF_ENTERS => break,
-                AgentState::Idle => {
-                    self.rt.send_keys(handle, &["enter"])?;
-                    pressed += 1;
-                    &taken
-                }
-                AgentState::Unknown => &[
-                    AgentState::Idle,
-                    AgentState::Working,
-                    AgentState::Blocked,
-                    AgentState::Done,
-                ],
-            };
-            match self.rt.wait(handle, wait_for, window) {
+        loop {
+            match self.rt.wait(handle, &taken, window) {
                 Ok(a) if taken.contains(&a.state) => return Ok(a),
                 Ok(_) | Err(RuntimeError::Timeout(_)) => {}
                 Err(e) => return Err(e),
             }
+            let info = self.rt.info(handle)?;
+            if taken.contains(&info.state) {
+                return Ok(info);
+            }
+            if info.state != AgentState::Idle
+                || pressed >= KICKOFF_ENTERS
+                || !self.kickoff_in_input_box(handle, text)
+            {
+                return Err(RuntimeError::Timeout(format!(
+                    "kick-off prompt not submitted: agent still {} after {pressed} submit key press(es)",
+                    info.state
+                )));
+            }
+            self.rt.send_keys(handle, &["enter"])?;
+            pressed += 1;
         }
-        Err(RuntimeError::Timeout(format!(
-            "kick-off prompt not submitted: agent still {last} after {pressed} submit key press(es)"
-        )))
+    }
+
+    /// Second signal next to the agent state: is the kick-off line still on the pane? A line that is
+    /// gone was submitted or cleared, so another Enter has nothing to submit. The pane text keeps the
+    /// line after a submission too (it moves into the history), so this can only withhold the key,
+    /// never prove a success. An unreadable or blank pane counts as "still there": the key is pressed.
+    fn kickoff_in_input_box(&self, handle: &AgentHandle, text: &str) -> bool {
+        let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let Ok(screen) = self.rt.read(handle, 60) else {
+            return true;
+        };
+        let screen = squash(&screen);
+        let probe: String = squash(text).chars().take(KICKOFF_PROBE_CHARS).collect();
+        screen.is_empty() || screen.contains(&probe)
     }
 
     /// `start_agent` timed out: Herdr's startup detection gave up, but the agent may still be coming

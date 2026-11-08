@@ -324,3 +324,95 @@ fn start_timeout_then_idle_by_script_or_a_clean_restart_on_a_fresh_workspace() {
     assert_eq!(starts.len(), 2);
     assert_eq!(starts[1].args["pane_id"], "f:p2");
 }
+
+#[test]
+fn a_lagging_submission_shows_up_as_working_only_after_the_lag() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "prompt": [{"error": "stalled", "lag_ms": 400}] }))
+        .unwrap();
+    let h = started(&rt, dir.path());
+    assert!(matches!(
+        rt.prompt(&h, "go", &[AgentState::Working], 1).unwrap_err(),
+        RuntimeError::Stalled(_)
+    ));
+    assert_eq!(
+        rt.info(&h).unwrap().state,
+        AgentState::Idle,
+        "the runtime does not know yet"
+    );
+    // a wait shorter than the lag gives up, a longer one sees the change
+    let t = std::time::Instant::now();
+    assert!(matches!(
+        rt.wait(&h, &[AgentState::Working], 50).unwrap_err(),
+        RuntimeError::Timeout(_)
+    ));
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(300),
+        "the short wait ends at its own timeout"
+    );
+    let up = rt.wait(&h, &[AgentState::Working], 5_000).unwrap();
+    assert_eq!(up.state, AgentState::Working);
+    assert!(
+        t.elapsed() >= std::time::Duration::from_millis(300),
+        "it really waited for the lag"
+    );
+    // the submission had gone through: an extra Enter changes nothing
+    rt.send_keys(&h, &["enter"]).unwrap();
+    assert_eq!(rt.info(&h).unwrap().state, AgentState::Working);
+}
+
+#[test]
+fn an_enter_can_take_effect_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "prompt": [{"error": "timeout", "enter_lag_ms": 300}] }))
+        .unwrap();
+    let h = started(&rt, dir.path());
+    assert!(rt.prompt(&h, "go", &[AgentState::Working], 1).is_err());
+    // nothing pending yet, so a wait answers at once
+    let t = std::time::Instant::now();
+    assert!(rt.wait(&h, &[AgentState::Working], 5_000).is_err());
+    assert!(t.elapsed() < std::time::Duration::from_millis(200));
+    rt.send_keys(&h, &["enter"]).unwrap();
+    assert_eq!(rt.info(&h).unwrap().state, AgentState::Idle, "late, not instant");
+    assert_eq!(
+        rt.wait(&h, &[AgentState::Working], 5_000).unwrap().state,
+        AgentState::Working
+    );
+}
+
+#[test]
+fn script_can_refuse_the_start_because_the_pane_shell_is_not_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = FakeRuntime::new(dir.path().join("fake.json"));
+    rt.script(serde_json::json!({ "start_agent": [{"error": "pane_busy"}] }))
+        .unwrap();
+    let ws = rt
+        .open_workspace(&OpenWorkspace {
+            cwd: dir.path().to_path_buf(),
+            label: "x".into(),
+            env: vec![],
+        })
+        .unwrap();
+    let start = StartAgent {
+        name: "a".into(),
+        pane_id: ws.pane_id,
+        args: vec![],
+        timeout_ms: 1,
+    };
+    let e = rt.start_agent(&start).unwrap_err();
+    assert!(
+        matches!(&e, RuntimeError::Protocol(m) if m.contains("agent_pane_busy")),
+        "{e:?}"
+    );
+    assert!(
+        matches!(rt.info(&handle("a")).unwrap_err(), RuntimeError::NotFound(_)),
+        "a refused start registers no agent"
+    );
+    assert_eq!(
+        rt.start_agent(&start).unwrap().state,
+        AgentState::Idle,
+        "the next try works"
+    );
+}

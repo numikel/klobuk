@@ -503,31 +503,108 @@ fn enters(f: &F) -> usize {
         .count()
 }
 
+/// Sets `[worker] start_timeout_ms`, the window every wait of the start flow uses.
+fn start_window(f: &F, ms: u64) {
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("auto_trust = true"), "config template changed");
+    std::fs::write(
+        &cfg,
+        s.replace(
+            "auto_trust = true",
+            &format!(
+                "start_timeout_ms = {ms}
+auto_trust = true"
+            ),
+        ),
+    )
+    .unwrap();
+}
+
+/// `timeout_ms` of every `wait` call, in order.
+fn wait_timeouts(f: &F) -> Vec<u64> {
+    fake(f)
+        .log()
+        .iter()
+        .filter(|e| e.op == "wait")
+        .filter_map(|e| e.args["timeout_ms"].as_u64())
+        .collect()
+}
+
+fn no_blocker(f: &F) -> bool {
+    store(f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .iter()
+        .all(|c| c.kind != CommentType::Blocker)
+}
+
 #[test]
-fn start_presses_enter_again_when_the_input_box_swallows_the_first_one() {
-    // the asf-72 / asf-36 shape: the kick-off is typed, the prompt stalls, and the Enter that
-    // follows is swallowed as well; the agent sits idle with the text in its input box
+fn start_presses_one_extra_enter_after_waiting_the_whole_start_window() {
+    // the prompt stalled and its Enter was lost: the box still holds the text
     let f = setup();
+    start_window(&f, 4_321);
     fake(&f)
-        .script(serde_json::json!({ "prompt": [{"error": "stalled", "swallow_enter": 1}] }))
+        .script(serde_json::json!({ "prompt": [{"error": "stalled"}] }))
         .unwrap();
     let res = f.repo.ok(&["run", "start", &f.issue]);
     assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(enters(&f), 1);
+    let log = fake(&f).log();
+    let i_wait = log.iter().position(|e| e.op == "wait").expect("a wait first");
+    let i_enter = log.iter().position(|e| e.op == "send_keys").unwrap();
+    assert!(
+        i_wait < i_enter,
+        "the wait comes before the extra press: {:?}",
+        ops(&f)
+    );
     assert_eq!(
-        enters(&f),
-        2,
-        "the submit key is pressed until the agent leaves idle"
+        wait_timeouts(&f)[0],
+        4_321,
+        "the wait is as long as the start window, not a few seconds"
     );
     assert_eq!(count_op(&f, "prompt"), 1, "the prompt is never typed twice");
-    assert_eq!(count_op(&f, "start_agent"), 1);
+    assert!(no_blocker(&f));
+}
+
+#[test]
+fn start_succeeds_when_the_runtime_reports_working_late_after_the_prompts_own_submit() {
+    // the asf-109 shape: the submission inside `agent prompt` worked, Herdr says so 1.5 s late
+    // (live it was up to 90 s); pressing Enter would only land in an empty box
+    let f = setup();
+    start_window(&f, 5_000);
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "stalled", "lag_ms": 1500}] }))
+        .unwrap();
+    let t = std::time::Instant::now();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
     assert!(
-        store(&f)
-            .comments(&f.issue.parse().unwrap())
-            .unwrap()
-            .iter()
-            .all(|c| c.kind != CommentType::Blocker),
-        "no BLOCKER"
+        t.elapsed() >= std::time::Duration::from_millis(1_400),
+        "it waited for the runtime"
     );
+    assert_eq!(
+        enters(&f),
+        0,
+        "no key while the first submission may still be landing"
+    );
+    assert_eq!(count_op(&f, "prompt"), 1);
+    assert_eq!(count_op(&f, "close_workspace"), 0);
+    assert!(no_blocker(&f));
+}
+
+#[test]
+fn start_succeeds_when_the_extra_enter_is_reported_late_too() {
+    let f = setup();
+    start_window(&f, 5_000);
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "stalled", "enter_lag_ms": 1500}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(enters(&f), 1, "one extra press, then it waits for the answer");
+    assert_eq!(wait_timeouts(&f), [5_000, 5_000]);
+    assert!(no_blocker(&f));
 }
 
 #[test]
@@ -548,7 +625,7 @@ fn start_does_not_trust_a_prompt_call_that_timed_out() {
 }
 
 #[test]
-fn start_blocks_when_the_kickoff_stays_unsent_after_every_submit_key() {
+fn start_blocks_when_the_kickoff_stays_unsent_after_the_extra_submit_key() {
     let f = setup();
     fake(&f)
         .script(serde_json::json!({ "prompt": [{"error": "stalled", "swallow_enter": 99}] }))
@@ -556,7 +633,17 @@ fn start_blocks_when_the_kickoff_stays_unsent_after_every_submit_key() {
     let (code, ecode, msg) = f.repo.err(&["run", "start", &f.issue]);
     assert_eq!((code, ecode.as_str()), (1, "blocked"), "{msg}");
     assert!(msg.contains("not submitted"), "{msg}");
-    assert_eq!(enters(&f), 3, "three submit keys, not an endless loop");
+    assert!(msg.contains("1 submit key press"), "{msg}");
+    assert_eq!(
+        enters(&f),
+        1,
+        "one extra submit key after a real wait, not a burst"
+    );
+    assert_eq!(
+        wait_timeouts(&f),
+        [90_000, 90_000],
+        "a full start window before the key and another one after it"
+    );
     assert_eq!(count_op(&f, "prompt"), 1);
     assert_eq!(active_run(&f).state, RunState::Blocked);
     let cs = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
@@ -744,6 +831,42 @@ fn a_start_that_fails_for_another_reason_is_not_retried() {
     assert_eq!(count_op(&f, "start_agent"), 1);
     assert_eq!(count_op(&f, "close_workspace"), 0);
     assert!(start_retries(&f).is_empty());
+}
+
+// ---- a pane whose shell is not ready yet ----------------------------------------------------------
+
+#[test]
+fn start_polls_a_pane_that_is_not_an_available_shell_yet() {
+    // 2026-11-08: `agent start` right after `workspace create` answered agent_pane_busy under load
+    let f = setup();
+    start_window(&f, 5_000);
+    fake(&f)
+        .script(serde_json::json!({ "start_agent": [{"error": "pane_busy"}, {"error": "pane_busy"}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(count_op(&f, "start_agent"), 3, "two refusals, then the start");
+    assert_eq!(count_op(&f, "open_workspace"), 1, "same workspace, no new pane");
+    assert_eq!(count_op(&f, "close_workspace"), 0);
+    assert!(no_blocker(&f));
+}
+
+#[test]
+fn start_blocks_when_the_pane_never_becomes_a_shell() {
+    let f = setup();
+    start_window(&f, 1_200);
+    fake(&f)
+        .script(serde_json::json!({ "start_agent": vec![serde_json::json!({"error": "pane_busy"}); 60] }))
+        .unwrap();
+    let (code, ecode, msg) = f.repo.err(&["run", "start", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (1, "blocked"), "{msg}");
+    assert!(msg.contains("agent_pane_busy"), "{msg}");
+    let tries = count_op(&f, "start_agent");
+    assert!(
+        (2..=6).contains(&tries),
+        "polled for a bounded time, not once and not forever: {tries}"
+    );
+    assert_eq!(active_run(&f).state, RunState::Blocked);
 }
 
 // ---- `asf run verify`-------------------------------------------------------------------------

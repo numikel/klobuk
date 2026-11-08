@@ -11,6 +11,16 @@ use crate::exec::{Exec, SystemExec};
 
 pub const REQUIRED_PROTOCOL: i64 = 22;
 
+/// Herdr's refusal of `agent start` while the shell of a pane is not ready yet ("agent target pane
+/// … is not an available shell"). It is transient: right after `workspace create`, under load, the
+/// shell needs a few seconds. It comes back as a `Protocol` error that names this code.
+pub const PANE_BUSY_CODE: &str = "agent_pane_busy";
+
+/// Whether `e` is Herdr's transient "pane is not an available shell yet" refusal.
+pub fn is_pane_busy(e: &RuntimeError) -> bool {
+    matches!(e, RuntimeError::Protocol(m) if m.contains(PANE_BUSY_CODE))
+}
+
 pub struct HerdrRuntime<E: Exec = SystemExec> {
     bin: String,
     exec: E,
@@ -354,4 +364,21 @@ impl<E: Exec> AgentRuntime for HerdrRuntime<E> {
 
 fn path_arg(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_busy_pane_refusal_is_told_apart_from_other_protocol_errors() {
+        let busy = map_error(
+            PANE_BUSY_CODE,
+            "agent target pane w73:p1 is not an available shell",
+        );
+        assert!(is_pane_busy(&busy), "{busy:?}");
+        assert!(!is_pane_busy(&map_error("agent_not_ready", "starting")));
+        assert!(!is_pane_busy(&map_error("pane_not_found", "no such pane")));
+        assert!(!is_pane_busy(&RuntimeError::Timeout("agent_pane_busy".into())));
+    }
 }
