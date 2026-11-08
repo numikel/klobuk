@@ -4,8 +4,10 @@
 //! The row model (`running`, `up_next`, `done_today`, and the NEEDS YOU list the snapshot carries) is a
 //! pure function of a [`Snapshot`], so the key handling walks the same rows the renderer draws.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use asf_core::config::NotifyCfg;
+use asf_core::remind::{due, WaitKind, Waiting};
 use asf_core::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -25,6 +27,16 @@ use crate::tui::theme::{Mark, Theme};
 
 /// How many up-next ids the one-line summary names.
 const UP_NEXT_IDS: usize = 3;
+
+/// The Config row that holds `[notify] after_minutes`, the wait after which a row is overdue.
+const AFTER_MINUTES_KEY: &str = "notify.after_minutes";
+
+/// Shown before the age of an overdue NEEDS YOU row, so the mark never depends on colour alone.
+const OVERDUE_MARK: &str = "!";
+
+/// Width of the age cell of a NEEDS YOU row: the mark or two blanks, then the age (at most `59 min`),
+/// and a gap before the key.
+const AGE_W: usize = 10;
 
 /// Selection over the NEEDS YOU rows followed by the RUNNING rows.
 #[derive(Debug, Clone, Default)]
@@ -270,6 +282,47 @@ pub fn selected_row(snap: &Snapshot, state: &State) -> Option<NowRow> {
     }
 }
 
+/// `[notify] after_minutes` as the snapshot's Config rows hold it (`0` = reminders, and so the marks,
+/// are off). A snapshot without that row has the default; a value that does not parse marks nothing.
+fn after_minutes(snap: &Snapshot) -> u64 {
+    match snap.config.iter().find(|r| r.key == AFTER_MINUTES_KEY) {
+        None => NotifyCfg::default().after_minutes,
+        Some(row) => row.raw.trim().parse().unwrap_or(0),
+    }
+}
+
+/// What `need` waits on, in the words of the reminder rules.
+fn wait_kind(source: &NeedSource) -> WaitKind {
+    match source {
+        NeedSource::BlockedRun => WaitKind::RunBlocked,
+        NeedSource::Question(_) => WaitKind::Question,
+        NeedSource::Run(RunState::Failed) => WaitKind::RunFailed,
+        NeedSource::Run(RunState::Stalled) => WaitKind::RunStalled,
+        NeedSource::Run(_) => WaitKind::RunOverBudget,
+        NeedSource::Merge(MergeState::Failed) => WaitKind::MergeFailed,
+        NeedSource::Merge(_) => WaitKind::MergeBlocked,
+    }
+}
+
+/// Whether `need` has waited at least `[notify] after_minutes`. It asks [`due`] with nothing reminded
+/// yet, so the threshold is the one `asf serve` applies when it sends the first reminder.
+pub fn is_overdue(snap: &Snapshot, need: &Need) -> bool {
+    let Some(now) = parse_time(&snap.now) else {
+        return false;
+    };
+    let cfg = NotifyCfg {
+        after_minutes: after_minutes(snap),
+        ..NotifyCfg::default()
+    };
+    let waiting = [Waiting {
+        issue: need.issue.clone(),
+        kind: wait_kind(&need.source),
+        since: need.since.clone(),
+        reason: String::new(),
+    }];
+    !due(&waiting, &BTreeMap::new(), now, &cfg).is_empty()
+}
+
 fn title(text: String, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(format!(" {text}"), theme.bold()))
 }
@@ -304,13 +357,25 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
     if needs.is_empty() {
         lines.push(Line::from(Span::styled("   Nothing needs you.", theme.dim())));
     }
-    // fixed columns: margin 1, selector 2, mark 2, id, gap 2, label 15, gap 2, age 8, key 8
-    let text_w = width.saturating_sub(1 + 2 + 2 + id_w + 2 + 15 + 2 + 8 + 8).max(8);
+    // fixed columns: margin 1, selector 2, mark 2, id, gap 2, label 15, gap 2, age 10, key 8
+    let text_w = width
+        .saturating_sub(1 + 2 + 2 + id_w + 2 + 15 + 2 + AGE_W + 8)
+        .max(8);
     for (i, n) in needs.iter().enumerate() {
         if i == selected {
             selected_line = lines.len();
         }
         let mark = Mark::Needs;
+        // an overdue row prefixes its age with `!` in the attention style (the banner's); the other
+        // rows get blanks of the same width, so the ages line up
+        let (waited, waited_style) = if is_overdue(snap, n) {
+            (
+                format!("{OVERDUE_MARK} {}", age(&snap.now, &n.since)),
+                theme.warn(),
+            )
+        } else {
+            (format!("  {}", age(&snap.now, &n.since)), Style::default())
+        };
         lines.push(
             Line::from(vec![
                 Span::raw(format!(" {}", select_marker(i))),
@@ -318,7 +383,7 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
                 Span::styled(format!("{}  ", fit(n.issue.as_str(), id_w)), theme.bold()),
                 Span::raw(fit(&n.label, 15)),
                 Span::raw(format!("{}  ", fit(&n.text, text_w))),
-                Span::raw(fit(&age(&snap.now, &n.since), 8)),
+                Span::styled(fit(&waited, AGE_W), waited_style),
                 Span::styled(n.act.hint(), theme.key()),
             ])
             .style(row_style(i)),

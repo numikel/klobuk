@@ -812,3 +812,133 @@ fn the_banner_is_for_the_other_views_the_footer_and_help_know_the_new_view() {
     }
     assert!(all().any(|b| b.key == "1-7"));
 }
+
+/// [`busy_desk`] with `[notify] after_minutes` set as given. At [`NOW`] its NEEDS YOU rows have waited
+/// asf-5 2 h, asf-4 1 h, asf-3 40 min, asf-6 12 min, asf-1 10 min, asf-8 5 min, asf-2 4 min, asf-7 <1 min.
+fn remind_app(after_minutes: u64) -> App {
+    let mut s = busy_desk();
+    s.config = config_rows(&format!("[notify]\nafter_minutes = {after_minutes}\n"));
+    App::new(s)
+}
+
+#[test]
+fn a_row_that_waited_past_the_reminder_time_shows_a_bang_before_its_age_in_the_attention_style() {
+    let a = remind_app(15);
+    let t = render_to_text(&a, 120, 30);
+    let warn = Theme::default().warn();
+    for (issue, age) in [("asf-5", "2 h"), ("asf-4", "1 h"), ("asf-3", "40 min")] {
+        let row = row_of(&t, issue);
+        assert!(row.contains(&format!("! {age} ")), "{issue}: {row:?}");
+        assert!(
+            row.find('!') < row.find(age),
+            "{issue}: the bang comes before the age: {row:?}"
+        );
+        // the bang and the age are drawn in the style of the waiting banner
+        for part in ["!", age] {
+            let (fg, m) = cell_style(&a, &format!("{issue} "), part);
+            assert_eq!(Some(fg), warn.fg, "{issue}: {part:?}");
+            assert!(m.contains(warn.add_modifier), "{issue}: {part:?}");
+        }
+    }
+    for (issue, age) in [
+        ("asf-6", "12 min"),
+        ("asf-1", "10 min"),
+        ("asf-8", "5 min"),
+        ("asf-2", "4 min"),
+        ("asf-7", "<1 min"),
+    ] {
+        let row = row_of(&t, issue);
+        assert!(row.contains(age) && !row.contains('!'), "{issue}: {row:?}");
+        let (fg, m) = cell_style(&a, &format!("{issue} "), age);
+        assert_ne!(Some(fg), warn.fg, "{issue}: a young row is not styled");
+        assert!(!m.contains(Modifier::BOLD), "{issue}");
+    }
+}
+
+#[test]
+fn a_wait_of_exactly_the_reminder_time_is_overdue_and_one_minute_less_is_not() {
+    // asf-1 has been blocked since 11:50, ten minutes before NOW
+    let at = render_to_text(&remind_app(10), 120, 30);
+    assert!(row_of(&at, "asf-1").contains("! 10 min"), "{at}");
+    assert!(!row_of(&at, "asf-8").contains('!'), "5 min < 10:\n{at}");
+    let past = render_to_text(&remind_app(11), 120, 30);
+    assert!(!row_of(&past, "asf-1").contains('!'), "{past}");
+    // the Now view and `asf serve` apply one rule: a row is overdue when `due` would remind about it
+    let s = remind_app(10).snap;
+    let overdue: Vec<String> = s
+        .needs_you
+        .iter()
+        .filter(|n| now::is_overdue(&s, n))
+        .map(|n| n.issue.to_string())
+        .collect();
+    assert_eq!(overdue, ["asf-5", "asf-4", "asf-3", "asf-6", "asf-1"]);
+}
+
+#[test]
+fn zero_minutes_marks_nothing() {
+    let t = render_to_text(&remind_app(0), 120, 30);
+    assert!(t.contains("NEEDS YOU (8)"), "{t}");
+    assert!(!t.contains('!'), "reminders are off, so are the marks:\n{t}");
+}
+
+#[test]
+fn without_colours_the_bang_is_still_there() {
+    let mut a = remind_app(15);
+    a.theme = Theme::new(false);
+    let t = render_to_text(&a, 120, 30);
+    assert!(row_of(&t, "asf-3").contains("! 40 min"), "{t}");
+    assert!(!row_of(&t, "asf-6").contains('!'), "{t}");
+    // no colour at all, only the bold of the theme's attention style
+    let (fg, m) = cell_style(&a, "asf-3 ", "!");
+    assert_eq!(fg, Color::Reset);
+    assert!(m.contains(Modifier::BOLD));
+}
+
+#[test]
+fn marking_rows_keeps_their_order_and_the_columns_of_the_key() {
+    let order = [
+        "asf-5", "asf-4", "asf-3", "asf-6", "asf-1", "asf-8", "asf-2", "asf-7",
+    ];
+    let mut key_columns = Vec::new();
+    for after in [0, 15] {
+        let t = render_to_text(&remind_app(after), 120, 30);
+        let at: Vec<usize> = order
+            .iter()
+            .map(|i| t.find(&format!("■ {i} ")).unwrap_or_else(|| panic!("{i}:\n{t}")))
+            .collect();
+        assert!(
+            at.windows(2).all(|w| w[0] < w[1]),
+            "oldest first, marked or not:\n{t}"
+        );
+        // asf-4 (marked at 15) and asf-8 (never) both end in `a answer`, in the same column
+        let col = |i: &str| row_of(&t, i).find("a answer").unwrap();
+        assert_eq!(col("asf-4"), col("asf-8"), "{t}");
+        key_columns.push(col("asf-4"));
+    }
+    assert_eq!(key_columns[0], key_columns[1], "marks do not move the key");
+}
+
+#[test]
+fn the_widest_age_still_leaves_a_gap_before_the_key() {
+    let mut s = busy_desk();
+    s.config = config_rows("[notify]\nafter_minutes = 15\n");
+    // the question of asf-2 has waited 59 min
+    s.questions[0].created_at = "2026-11-06T11:01:00Z".into();
+    let t = render_to_text(&App::new(s), 120, 30);
+    assert!(row_of(&t, "asf-2").contains("! 59 min  a answer"), "{t}");
+}
+
+#[test]
+fn a_snapshot_without_the_config_row_uses_the_default_and_an_unreadable_one_marks_nothing() {
+    let mut s = busy_desk();
+    s.config = vec![];
+    let t = render_to_text(&App::new(s.clone()), 120, 30);
+    assert!(
+        row_of(&t, "asf-3").contains("! 40 min"),
+        "the default is 15:\n{t}"
+    );
+    assert!(!row_of(&t, "asf-6").contains('!'), "{t}");
+    s.config = config_rows("[notify");
+    let t = render_to_text(&App::new(s), 120, 30);
+    assert!(!t.contains('!'), "{t}");
+}
