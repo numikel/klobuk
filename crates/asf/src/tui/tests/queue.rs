@@ -546,6 +546,41 @@ fn a_failure_marks_its_stage_and_dots_the_stages_after_it() {
 }
 
 #[test]
+fn a_stale_failing_gate_does_not_hide_the_error_the_item_stopped_with() {
+    use Stage::*;
+    // `asf merge retry` clears the error but keeps the gate results, and a rebase failure keeps them too:
+    // the item failed in `test`, was retried, and then hit a rebase conflict
+    let stale = vec![
+        gate("fmt", true, ""),
+        gate(
+            "test",
+            false,
+            "test old_one ... FAILED\ntest old_two ... FAILED\n",
+        ),
+    ];
+    let mut s = queue_desk();
+    let mut m = queue_item(9, "asf-26", MergeState::Blocked, "2026-11-06T11:00:00Z");
+    m.last_error = Some("rebase of feat/asf-26 onto main conflicts in: a.rs".into());
+    m.gate_results = stale.clone();
+    assert_eq!(
+        stages(&s, &m),
+        [Failed("conflict".into()), After, After, After, After]
+    );
+    // the detail lines name the conflict, not the tests of the old run
+    s.queue = vec![m.clone()];
+    let t = render_to_text(&queue_app(s), 120, 40);
+    assert!(row_with(&t, "▸ ■ asf-26").contains("✗ conflict"), "{t}");
+    assert!(!t.contains("old_one") && !t.contains("tests failed"), "{t}");
+    // a scope failure after the retry is a failure of the gates stage, but not of the `test` gate
+    m.last_error = Some("feat/asf-26 touches files outside scope [src/**]: x".into());
+    assert_eq!(stages(&queue_desk(), &m)[1], Failed("scope".into()));
+    // while the gate failure the error names still wins, with the gate it names
+    m.last_error = Some("gate `test` failed (exit Some(101)) after rebase:\nboom".into());
+    m.gate_results = vec![gate("fmt", false, ""), gate("test", false, "")];
+    assert_eq!(stages(&queue_desk(), &m)[1], Failed("test".into()));
+}
+
+#[test]
 fn failed_test_names_come_from_libtest_lines_and_the_failures_section_without_repeats() {
     let out = "running 3 tests\ntest a::ok ... ok\ntest a::first ... FAILED\ntest b::second ... FAILED\n\nfailures:\n\n---- a::first stdout ----\nboom\n\nfailures:\n    a::first\n    b::second\n\ntest result: FAILED. 1 passed; 2 failed";
     assert_eq!(failed_tests(out), ["a::first", "b::second"]);

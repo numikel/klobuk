@@ -191,10 +191,29 @@ fn gates_done(item: &MergeItem) -> Stage {
     }
 }
 
+/// The failing gate the item stopped at. `asf merge retry` clears the error but keeps the gate results,
+/// and a rebase or scope failure keeps them too, so a failed gate is only the cause when the error says
+/// so (`gate `<name>` failed …`, `commands/merge.rs`). An item with no error at all falls back to the
+/// first failing gate.
+fn failed_gate(item: &MergeItem) -> Option<&GateResult> {
+    let bad = |name: Option<&str>| {
+        item.gate_results
+            .iter()
+            .find(|g| !g.ok && name.is_none_or(|n| g.name == n))
+    };
+    match item.last_error.as_deref().and_then(first_line) {
+        None => bad(None),
+        Some(error) => {
+            let name = error.strip_prefix("gate `")?.split('`').next()?;
+            bad(Some(name)).or_else(|| bad(None))
+        }
+    }
+}
+
 /// The stage a failed or blocked item stopped at, and what to call it. The queue records no stage, so
 /// it is read from the gate results and from the text of the error (`commands/merge.rs`).
 fn failure(item: &MergeItem) -> (usize, String) {
-    if let Some(bad) = item.gate_results.iter().find(|g| !g.ok) {
+    if let Some(bad) = failed_gate(item) {
         return (1, bad.name.clone());
     }
     let error = item.last_error.as_deref().and_then(first_line).unwrap_or("");
@@ -367,10 +386,7 @@ pub fn failed_tests(output: &str) -> Vec<String> {
 
 /// `2 tests failed: a, b`, from the failing gate's output (else from the error); `None` without names.
 fn failed_tests_line(item: &MergeItem) -> Option<String> {
-    let source = item
-        .gate_results
-        .iter()
-        .find(|g| !g.ok)
+    let source = failed_gate(item)
         .map(|g| g.tail.as_str())
         .or(item.last_error.as_deref())?;
     let names = failed_tests(source);
