@@ -19,8 +19,8 @@ use crate::tui::app::{Action, View};
 use crate::tui::bindings::*;
 use crate::tui::overlays::InputTarget;
 use crate::tui::snapshot::{
-    age, answer_blocked, first_line, fit, move_selection, reply_input, text_width, trunc, Need, NeedSource,
-    Snapshot,
+    age, answer_blocked, first_line, fit, move_selection, parse_time, reply_input, text_width, trunc, Need,
+    NeedSource, Snapshot,
 };
 use crate::tui::theme::{Mark, Theme};
 
@@ -130,8 +130,24 @@ pub const BINDINGS: &[Binding] = &[
 // Rows
 // ---------------------------------------------------------------------------------------------
 
-/// The comment that stands for `need`: the question itself, or the newest BLOCKER of the issue (it
-/// carries the full gate output, or the worker screen of a blocked run).
+/// How much earlier than `need.since` a BLOCKER may be stamped and still belong to the failure: the
+/// queue and the worker post it and move the state in one step, but the two timestamps can straddle
+/// a second.
+const POSTED_WITH_SLACK_SECS: i64 = 5;
+
+/// True when `c` was posted for the failure that has waited since `since`, not for an earlier one
+/// (the snapshot keeps read BLOCKERs, and a retried merge can fail again for another reason).
+/// A timestamp that does not parse is given the benefit of the doubt.
+fn posted_for(c: &Comment, since: &str) -> bool {
+    match (parse_time(&c.created_at), parse_time(since)) {
+        (Some(posted), Some(since)) => (since - posted).whole_seconds() <= POSTED_WITH_SLACK_SECS,
+        _ => true,
+    }
+}
+
+/// The comment that stands for `need`: the question itself, or the newest BLOCKER of the issue that
+/// was posted for this failure (it carries the full gate output, or the worker screen of a blocked
+/// run). An older BLOCKER is a failure that was fixed since: it is information, not this item.
 fn need_comment<'a>(snap: &'a Snapshot, need: &Need) -> Option<&'a Comment> {
     match need.source {
         NeedSource::Question(id) => snap.questions.iter().chain(&snap.inbox).find(|c| c.id == id),
@@ -139,7 +155,9 @@ fn need_comment<'a>(snap: &'a Snapshot, need: &Need) -> Option<&'a Comment> {
             .blockers
             .iter()
             .chain(&snap.inbox)
-            .filter(|c| c.kind == CommentType::Blocker && c.issue_id == need.issue)
+            .filter(|c| {
+                c.kind == CommentType::Blocker && c.issue_id == need.issue && posted_for(c, &need.since)
+            })
             .max_by_key(|c| c.id),
     }
 }
@@ -321,10 +339,11 @@ pub fn summarize(snap: &Snapshot, need: &Need) -> Summary {
                 .find(|r| r.issue_id == need.issue)
                 .and_then(|r| r.exit_reason.as_deref())
         };
-        let found = need_comment(snap, need)
-            .map(|c| c.body.as_str())
+        // what the queue / the run kept is the current account of the failure; the BLOCKER (when it
+        // belongs to this failure) holds the same gate tail
+        let found = kept
             .into_iter()
-            .chain(kept)
+            .chain(need_comment(snap, need).map(|c| c.body.as_str()))
             .find_map(|body| gate_summary(body, merge));
         if let Some(summary) = found {
             return summary;
@@ -592,7 +611,10 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
     if snap.needs_you.is_empty() && snap.inbox.is_empty() {
         frame.render_widget(
             Paragraph::new(dim_line(
-                " Nothing needs you and nothing new to read. Questions, blockers and results from the workers appear here.",
+                &trunc(
+                    " Nothing needs you and nothing new to read. Questions, blockers and results appear here.",
+                    width,
+                ),
                 theme,
             )),
             area,

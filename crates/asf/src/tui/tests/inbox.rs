@@ -283,13 +283,27 @@ fn sixty_two_unread_comments_scroll_with_the_selection_in_both_layouts() {
 
 #[test]
 fn an_empty_inbox_says_what_will_appear_and_is_secondary_text() {
-    for width in [100u16, 120] {
+    for width in [80u16, 100, 120] {
         let a = view_of(Snapshot::default());
         let t = render_to_text(&a, width, 30);
         assert!(
             t.contains("Nothing needs you and nothing new to read."),
             "{width}:\n{t}"
         );
+        // the whole explanation is on screen at 100 columns and up; narrower, it ends in an ellipsis
+        let line = t
+            .lines()
+            .find(|l| l.contains("Nothing needs you"))
+            .expect("the empty line");
+        assert!(text_width(line.trim_end()) <= width as usize, "{width}: {line:?}");
+        if width >= 100 {
+            assert!(
+                line.contains("appear here."),
+                "{width}: the line is cut: {line:?}"
+            );
+        } else {
+            assert!(line.trim_end().ends_with('…'), "{width}: {line:?}");
+        }
         assert!(
             !t.contains("NEEDS YOU") && !t.contains("FOR YOUR INFORMATION"),
             "{t}"
@@ -445,12 +459,88 @@ fn a_blocker_that_is_not_a_gate_failure_gets_no_summary() {
     assert!(inbox::gate_summary("", false).is_none());
 }
 
+/// A merge that failed at the gate (BLOCKER at 11:20), was fixed and retried with `v`, and then
+/// failed for another reason at 11:58 (`last_error` only, the queue posts no BLOCKER for it).
+fn retried_merge(last_error: &str) -> Snapshot {
+    let mut s = desk(live(&["asf-25"]));
+    s.queue.push(merge_item(
+        1,
+        "asf-25",
+        MergeState::Failed,
+        Some(last_error),
+        "2026-11-06T11:58:00Z",
+    ));
+    let old = at(
+        comment("asf-25", CommentType::Blocker, MERGE_BODY),
+        5,
+        "2026-11-06T11:20:00Z",
+    );
+    s.blockers = vec![old.clone()];
+    s.inbox = vec![];
+    s.derive();
+    s
+}
+
+#[test]
+fn a_blocker_older_than_the_failure_is_not_its_summary_nor_what_enter_opens() {
+    let mut a = view_of(retried_merge(
+        "fast-forward of main to feat/asf-25 failed: main moved while the merge ran",
+    ));
+    let t = render_to_text(&a, 120, 30);
+    assert!(
+        t.contains("fast-forward of main to feat/asf-25 failed"),
+        "the real error is on screen:\n{t}"
+    );
+    assert!(
+        !t.contains("Merge failed: gate") && !t.contains("2 tests failed"),
+        "the old gate output is not the summary:\n{t}"
+    );
+    assert!(
+        !t.contains("Enter full output"),
+        "no comment belongs to this failure, so no Enter hint:\n{t}"
+    );
+    // Enter opens nothing: the old BLOCKER is another failure
+    let act = a.handle_key(code(KeyCode::Enter));
+    assert!(
+        !matches!(a.mode(), Mode::Comment { .. }),
+        "{act:?} {:?}",
+        a.mode()
+    );
+}
+
+#[test]
+fn a_gate_failure_is_summarised_from_the_error_the_queue_kept_before_any_blocker() {
+    // the retry failed at the gate again, with other tests; the queue's error is the newest account
+    let again = MERGE_BODY
+        .replace("start_retry_once", "start_other")
+        .replace("start_gives_up_after_second_timeout", "start_third");
+    let a = view_of(retried_merge(&again));
+    let t = render_to_text(&a, 120, 30);
+    assert!(
+        t.contains("2 tests failed: start_other, start_third"),
+        "the new failure wins over the older BLOCKER:\n{t}"
+    );
+    assert!(!t.contains("start_retry_once"), "{t}");
+}
+
+#[test]
+fn a_blocker_posted_with_the_failure_still_opens_with_enter() {
+    // the mockup desk: BLOCKER and queue item carry the same minute
+    let mut a = mockup_app();
+    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::None);
+    assert_eq!(opened_comment_id(&a), 5);
+}
+
 #[test]
 fn a_failed_run_is_summarised_as_a_verification_failure_and_v_checks_it_again() {
     let mut s = desk(live(&["asf-3"]));
     let mut failed = run_at("asf-3", RunState::Failed, "2026-11-06T11:00:00Z");
     failed.finished_at = Some("2026-11-06T11:20:00Z".into());
-    failed.exit_reason = Some("gate `clippy` failed (exit Some(101)):\nerror: could not compile".into());
+    // `worker.rs` keeps the same text in the run's exit_reason as in the BLOCKER (`problems.join`)
+    failed.exit_reason = Some(
+        "gate `clippy` failed (exit Some(101)):\nwarning: unused variable: `x`\nerror: could not compile `asf` (lib) due to 1 previous error"
+            .into(),
+    );
     s.failed_runs.push(failed);
     let blocker = at(
         comment("asf-3", CommentType::Blocker, VERIFY_BODY),
