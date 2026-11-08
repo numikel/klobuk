@@ -86,6 +86,8 @@ fn queue_desk() -> Snapshot {
         actor: None,
         payload: serde_json::json!({}),
     });
+    // the mockup runs the gates on main after each merge (`[merge] verify_main_after = true`)
+    s.verify_main_after = true;
     s.derive();
     s
 }
@@ -231,6 +233,70 @@ fn merged_today_lists_sha_review_outcome_main_state_and_age() {
     let t = render_to_text(&queue_app(s), 120, 40);
     assert!(row_with(&t, "✓ asf-24").contains("main red"), "{t}");
     assert!(!row_with(&t, "✓ asf-24").contains("gates on main green"));
+}
+
+#[test]
+fn merged_today_says_nothing_about_main_when_no_gate_ever_ran_there() {
+    let mut s = queue_desk();
+    s.verify_main_after = false;
+    let t = render_to_text(&queue_app(s), 120, 40);
+    let one = row_with(&t, "✓ asf-24");
+    in_order(one, &["9c1e4aa", "review approve", "18 min ago"]);
+    let two = row_with(&t, "✓ asf-22");
+    in_order(two, &["f2b84da", "no review (review was off)", "4 h ago"]);
+    assert!(
+        !t.contains("gates on main green"),
+        "an unchecked main is not green:\n{t}"
+    );
+    // a red main is still a fact, whatever the config says now
+    let mut s = queue_desk();
+    s.verify_main_after = false;
+    s.merged_today[0].last_error = Some("main red after merge: gate `test` failed (exit 101)".into());
+    let t = render_to_text(&queue_app(s), 120, 40);
+    assert!(row_with(&t, "✓ asf-24").contains("main red"), "{t}");
+}
+
+#[test]
+fn the_main_gates_stage_is_not_needed_when_the_gates_do_not_run_on_main() {
+    use Stage::*;
+    let mut off = queue_desk();
+    off.verify_main_after = false;
+    let on = queue_desk();
+    let item = |state: MergeState| {
+        let mut m = queue_item(9, "asf-26", state, "2026-11-06T11:00:00Z");
+        m.gate_results = vec![gate("fmt", true, "")];
+        m
+    };
+    for state in [
+        MergeState::Queued,
+        MergeState::Rebasing,
+        MergeState::Gating,
+        MergeState::Reviewing,
+        MergeState::PrOpen,
+        MergeState::Merging,
+    ] {
+        assert_eq!(stages(&off, &item(state))[4], NotNeeded, "{state:?} off");
+        assert_eq!(stages(&on, &item(state))[4], Pending, "{state:?} on");
+    }
+    // a merged item: checked and green, or never checked
+    assert_eq!(stages(&on, &item(MergeState::Merged))[4], Done("done".into()));
+    assert_eq!(stages(&off, &item(MergeState::Merged))[4], NotNeeded);
+    // a red main is shown either way
+    let mut red = item(MergeState::Merged);
+    red.last_error = Some("main red after merge".into());
+    assert_eq!(stages(&off, &red)[4], Failed("main red".into()));
+    // the rendered cell is the dim dash, not an open circle: `… merge  main gates  age` ends with
+    // `○ – 1 min` (merge still ahead, main gates not needed), and with the gates on, with `○ ○ 1 min`
+    let tail = |snap: Snapshot| {
+        let t = render_to_text(&queue_app(snap), 120, 40);
+        let words: Vec<String> = item_row(&t, "asf-28")
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        words[words.len() - 4..].to_vec()
+    };
+    assert_eq!(tail(off), ["○", "–", "1", "min"]);
+    assert_eq!(tail(on), ["○", "○", "1", "min"]);
 }
 
 #[test]

@@ -209,6 +209,16 @@ fn the_loader_carries_whether_a_review_is_required_and_the_labels_that_ask_for_o
 }
 
 #[test]
+fn the_loader_carries_whether_the_gates_run_on_main_after_a_merge() {
+    let (mut ctx, _) = story();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert!(!s.verify_main_after, "off by default");
+    ctx.config.merge.verify_main_after = true;
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert!(s.verify_main_after);
+}
+
+#[test]
 fn the_detail_of_an_issue_is_loaded_on_demand_with_comments_and_dependency_status() {
     let (ctx, [a, b, ..]) = story();
     let d = load_detail(&ctx, &b).unwrap();

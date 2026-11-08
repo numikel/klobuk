@@ -65,6 +65,8 @@ pub struct Snapshot {
     pub review_required: bool,
     /// `[review] on_labels`: an issue with one of these labels waits for a reviewer too.
     pub review_on_labels: Vec<String>,
+    /// `[merge] verify_main_after`: the gates run on main after each merge. Off, nothing ever checks main.
+    pub verify_main_after: bool,
     /// The latest run of every issue, finished ones included, ordered by issue id.
     // Read by the view tasks that follow (asf-39 .. asf-44): the snapshot is their contract.
     #[allow(dead_code)]
@@ -780,6 +782,7 @@ pub fn load_snapshot(
         review_model: ctx.config.review.model.clone(),
         review_required: ctx.config.review.required,
         review_on_labels: ctx.config.review.on_labels.clone(),
+        verify_main_after: ctx.config.merge.verify_main_after,
         last_runs,
         merged_today: Vec::new(),
         review_of,

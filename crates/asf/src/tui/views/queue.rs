@@ -174,6 +174,16 @@ fn review_behind(snap: &Snapshot, item: &MergeItem) -> Stage {
     }
 }
 
+/// The main-gates stage of an item that has not merged: to come, or `–` when `[merge] verify_main_after`
+/// is off and no gate will ever run on main.
+fn main_ahead(snap: &Snapshot) -> Stage {
+    if snap.verify_main_after {
+        Stage::Pending
+    } else {
+        Stage::NotNeeded
+    }
+}
+
 fn gates_done(item: &MergeItem) -> Stage {
     match item.gate_results.len() {
         0 => Stage::Done("done".into()),
@@ -216,52 +226,56 @@ fn failure(item: &MergeItem) -> (usize, String) {
 pub fn stages(snap: &Snapshot, item: &MergeItem) -> [Stage; 5] {
     use Stage::*;
     let done = || Done("done".into());
+    let main = main_ahead(snap);
     match item.state {
-        MergeState::Queued => [Pending, Pending, review_ahead(snap, item), Pending, Pending],
+        MergeState::Queued => [Pending, Pending, review_ahead(snap, item), Pending, main],
         MergeState::Rebasing => [
             Running("rebasing".into()),
             Pending,
             review_ahead(snap, item),
             Pending,
-            Pending,
+            main,
         ],
         MergeState::Gating => [
             done(),
             Running("running".into()),
             review_ahead(snap, item),
             Pending,
-            Pending,
+            main,
         ],
         MergeState::Reviewing => {
             let mut detail = snap.review_model.clone();
             if let Some(round) = review_round(snap, &item.issue_id) {
                 detail.push_str(&format!(" · round {round}"));
             }
-            [done(), gates_done(item), Running(detail), Pending, Pending]
+            [done(), gates_done(item), Running(detail), Pending, main]
         }
         MergeState::PrOpen => [
             done(),
             gates_done(item),
             review_behind(snap, item),
             Running("PR open".into()),
-            Pending,
+            main,
         ],
         MergeState::Merging => [
             done(),
             gates_done(item),
             review_behind(snap, item),
             Running("merging".into()),
-            Pending,
+            main,
         ],
         MergeState::Merged => [
             done(),
             gates_done(item),
             review_behind(snap, item),
             done(),
+            // a red main is a fact whatever the config says now; green only if it was checked
             if item.last_error.is_some() {
                 Failed("main red".into())
-            } else {
+            } else if snap.verify_main_after {
                 done()
+            } else {
+                NotNeeded
             },
         ],
         MergeState::Skipped => [After, After, After, After, After],
@@ -566,19 +580,22 @@ fn detail_lines(e: &Entry, cols: &Cols, avail: usize, theme: &Theme) -> Vec<Line
     lines
 }
 
-/// `review approve` or `no review (review was off)`, then the state of main.
+/// `review approve` or `no review (review was off)`, then the state of main: `main red`, or
+/// `gates on main green` when `[merge] verify_main_after` ran them. With it off nothing checked main,
+/// so nothing is said about it (as in the mockup's rows without a main part).
 fn merged_text(snap: &Snapshot, item: &MergeItem) -> String {
     let review = if review_seen(snap, &item.issue_id) {
         "review approve"
     } else {
         "no review (review was off)"
     };
-    let main = if item.last_error.is_some() {
-        "main red"
+    if item.last_error.is_some() {
+        format!("{review} · main red")
+    } else if snap.verify_main_after {
+        format!("{review} · gates on main green")
     } else {
-        "gates on main green"
-    };
-    format!("{review} · {main}")
+        review.to_string()
+    }
 }
 
 fn merged_line(snap: &Snapshot, item: &MergeItem, id: usize, edge: usize, theme: &Theme) -> Line<'static> {
