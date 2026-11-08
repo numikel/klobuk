@@ -9,6 +9,21 @@ fn notify_defaults_are_fifteen_then_thirty_and_no_command() {
 }
 
 #[test]
+fn on_new_defaults_to_true_and_can_be_switched_off_on_its_own() {
+    assert!(Config::from_toml("").unwrap().notify.on_new);
+    assert!(
+        Config::from_toml("[notify]\nafter_minutes = 0\n")
+            .unwrap()
+            .notify
+            .on_new
+    );
+    let c = Config::from_toml("[notify]\non_new = false\n").unwrap();
+    assert!(!c.notify.on_new);
+    assert_eq!(c.notify.after_minutes, 15, "the reminders keep their defaults");
+    assert!(Config::from_toml("[notify]\non_new = \"no\"\n").is_err());
+}
+
+#[test]
 fn notify_section_overrides_and_keeps_the_other_defaults() {
     let c =
         Config::from_toml("[notify]\nafter_minutes = 5\ncommand = [\"pwsh\", \"-File\", \"notify.ps1\"]\n")
@@ -50,6 +65,7 @@ fn a_command_without_a_program_is_refused() {
 fn the_template_documents_notify_and_still_parses_to_the_defaults() {
     let t = Config::default_toml();
     assert!(t.contains("[notify]"), "{t}");
+    assert!(t.contains("on_new = true"), "{t}");
     assert!(t.contains("after_minutes = 15"), "{t}");
     assert!(t.contains("every_minutes = 30"), "{t}");
     assert!(

@@ -33,6 +33,10 @@ const EDITABLE: &[(&str, &str)] = &[
         "run the gates in the repo root after each merge",
     ),
     (
+        "notify.on_new",
+        "notify at once when something new waits for you (false: only reminders)",
+    ),
+    (
         "notify.after_minutes",
         "minutes before `asf serve` first reminds you of something waiting (0: off)",
     ),
@@ -195,6 +199,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 12);
+        assert_eq!(EDITABLE.len(), 13);
     }
 }

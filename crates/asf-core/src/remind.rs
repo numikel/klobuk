@@ -3,8 +3,11 @@
 //! Pure: the adapter (`asf serve`) collects the [`Waiting`] things, folds the store's event log into
 //! an [`EventIndex`], passes "now" in and acts on the [`Reminder`]s [`due`] returns. Nothing here
 //! reads a clock, a file or the store, so every rule is tested with fixed times.
+//!
+//! Two kinds of nudge share one record (the `attention.reminded` event): the [`Alert`] at the moment
+//! something new starts to wait ([`alerts`]), and the [`Reminder`] when it keeps waiting ([`due`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -34,14 +37,61 @@ pub enum WaitKind {
     RunOverBudget,
     RunFailed,
     Question,
+    /// A BLOCKER comment addressed to the human. Only ever announced ([`alerts`]): whether it still
+    /// blocks is not something the store can say, so it never ages into a reminder.
+    Blocker,
 }
 str_enum!(WaitKind, "wait kind", {
     IssueBlocked => "issue_blocked", MergeFailed => "merge_failed", MergeBlocked => "merge_blocked",
     RunBlocked => "run_blocked", RunStalled => "run_stalled", RunOverBudget => "run_over_budget",
-    RunFailed => "run_failed", Question => "question",
+    RunFailed => "run_failed", Question => "question", Blocker => "blocker",
 });
 
 impl WaitKind {
+    /// What follows `asf <id>` in the title of an [`Alert`]: `asf asf-27 asks`, `... merge failed`.
+    fn headline(self) -> &'static str {
+        match self {
+            WaitKind::Question => "asks",
+            WaitKind::Blocker | WaitKind::IssueBlocked | WaitKind::RunBlocked => "is blocked",
+            WaitKind::MergeFailed => "merge failed",
+            WaitKind::MergeBlocked => "merge blocked",
+            WaitKind::RunStalled => "is stalled",
+            WaitKind::RunOverBudget => "is over budget",
+            WaitKind::RunFailed => "run failed",
+        }
+    }
+
+    /// The body of an [`Alert`] when the wait carries no text of its own.
+    fn fallback(self) -> &'static str {
+        match self {
+            WaitKind::Question => "asked a question",
+            WaitKind::Blocker => "reported a blocker",
+            WaitKind::IssueBlocked => "the issue is blocked",
+            WaitKind::RunBlocked => "the worker waits for input",
+            WaitKind::RunStalled => "the worker stopped making progress",
+            WaitKind::RunOverBudget => "the worker went over budget",
+            WaitKind::RunFailed => "the run failed",
+            WaitKind::MergeFailed => "the merge failed",
+            WaitKind::MergeBlocked => "the merge is blocked",
+        }
+    }
+
+    /// Which wait leads an [`Alert`] when one issue has several new ones at once (lower first): what a
+    /// person wrote beats what a machine noticed, and the cause (a run) beats its consequences.
+    fn urgency(self) -> u8 {
+        match self {
+            WaitKind::Question => 0,
+            WaitKind::Blocker => 1,
+            WaitKind::RunBlocked => 2,
+            WaitKind::RunFailed => 3,
+            WaitKind::RunStalled => 4,
+            WaitKind::RunOverBudget => 5,
+            WaitKind::MergeFailed => 6,
+            WaitKind::MergeBlocked => 7,
+            WaitKind::IssueBlocked => 8,
+        }
+    }
+
     /// The words that follow the issue id in a reminder: `asf-27 <phrase> for 45 min: …`.
     fn phrase(self) -> &'static str {
         match self {
@@ -53,6 +103,7 @@ impl WaitKind {
             WaitKind::RunOverBudget => "has had a worker over budget",
             WaitKind::RunFailed => "has had a failed run",
             WaitKind::Question => "has had an unanswered question",
+            WaitKind::Blocker => "has had a blocker",
         }
     }
 }
@@ -66,6 +117,10 @@ pub struct Waiting {
     pub since: String,
     /// A few plain words on why (see [`first_line`]); may be empty.
     pub reason: String,
+    /// Identity of this episode of waiting (`question:42`, `merge:7:failed@2026-11-07T09:00:00Z`).
+    /// Stable across ticks and restarts, and different for the next episode, so [`alerts`] can tell
+    /// "already announced" from "new". Reminders ignore it.
+    pub key: String,
 }
 
 /// A reminder that is due now.
@@ -78,28 +133,52 @@ pub struct Reminder {
     pub text: String,
 }
 
-/// What the event log says about reminders and run states, built by feeding events in order.
+/// What the event log says about reminders and state changes, built by feeding events in order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventIndex {
-    /// Time (RFC 3339) of the latest `attention.reminded` event per issue.
+    /// Time (RFC 3339) of the latest `attention.reminded` event per issue: an [`Alert`] or a [`Reminder`].
     pub reminded: BTreeMap<IssueId, String>,
     /// Per run id: the state it last entered and when (from `run.state` events).
     pub run_states: BTreeMap<String, (String, String)>,
+    /// `(issue, key)` of every wait an [`Alert`] has already announced (the `keys` of the events).
+    pub announced: BTreeSet<(IssueId, String)>,
+    /// When a thing last entered a state, from `issue.status`, `merge.state` and `run.state` events:
+    /// `("issue:asf-3", "blocked")`, `("merge:7", "failed")`, `("run:<id>", "stalled")` -> time.
+    entered: BTreeMap<(String, String), String>,
 }
 
 impl EventIndex {
     /// Folds one event in; events must arrive in `seq` order so the latest one wins.
     pub fn absorb(&mut self, e: &Event) {
+        let to = e.payload.get("to").and_then(|v| v.as_str());
         match e.kind.as_str() {
             EVENT_REMINDED => {
                 if let Some(issue) = &e.issue_id {
                     self.reminded.insert(issue.clone(), e.ts.clone());
+                    let keys = e.payload.get("keys").and_then(|v| v.as_array());
+                    for key in keys.into_iter().flatten().filter_map(|k| k.as_str()) {
+                        self.announced.insert((issue.clone(), key.to_string()));
+                    }
                 }
             }
             "run.state" => {
-                if let (Some(run), Some(to)) = (&e.run_id, e.payload.get("to").and_then(|v| v.as_str())) {
+                if let (Some(run), Some(to)) = (&e.run_id, to) {
                     self.run_states
                         .insert(run.clone(), (to.to_string(), e.ts.clone()));
+                    self.entered
+                        .insert((format!("run:{run}"), to.to_string()), e.ts.clone());
+                }
+            }
+            "issue.status" => {
+                if let (Some(issue), Some(to)) = (&e.issue_id, to) {
+                    self.entered
+                        .insert((format!("issue:{issue}"), to.to_string()), e.ts.clone());
+                }
+            }
+            "merge.state" => {
+                if let (Some(id), Some(to)) = (e.payload.get("merge_id").and_then(|v| v.as_i64()), to) {
+                    self.entered
+                        .insert((format!("merge:{id}"), to.to_string()), e.ts.clone());
                 }
             }
             _ => {}
@@ -113,6 +192,84 @@ impl EventIndex {
             .filter(|(s, _)| s == state)
             .map(|(_, ts)| ts.as_str())
     }
+
+    /// When issue `issue` last got status `status`, if the log says so.
+    pub fn issue_entered(&self, issue: &IssueId, status: &str) -> Option<&str> {
+        self.entered_at(&format!("issue:{issue}"), status)
+    }
+
+    /// When merge item `merge` last got state `state`, if the log says so.
+    pub fn merge_entered(&self, merge: i64, state: &str) -> Option<&str> {
+        self.entered_at(&format!("merge:{merge}"), state)
+    }
+
+    fn entered_at(&self, subject: &str, state: &str) -> Option<&str> {
+        self.entered
+            .get(&(subject.to_string(), state.to_string()))
+            .map(String::as_str)
+    }
+}
+
+/// A new wait to tell the human about right now: one per issue, however many new things it has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Alert {
+    pub issue: IssueId,
+    /// The kind of the wait that leads the alert (see [`WaitKind::urgency`]).
+    pub kind: WaitKind,
+    /// `asf asf-27 asks`, `asf asf-27 is blocked`, `asf asf-27 merge failed`.
+    pub title: String,
+    /// The first line of the question, blocker or error; a short stock phrase when there is none.
+    pub body: String,
+    /// `title: body`: the sentence for `ASF_REMIND_TEXT` and the tick report.
+    pub text: String,
+    /// The [`Waiting::key`] of every new wait of the issue, all announced by this one alert.
+    pub keys: Vec<String>,
+}
+
+/// The alerts for the waits `announced` does not cover yet, ordered by issue.
+///
+/// An issue with several new waits at once (a failed run, its failed merge item and the BLOCKER
+/// comment that explains them) gets one alert, led by the most telling wait; every one of them is
+/// listed in [`Alert::keys`] so the next tick does not announce the leftovers.
+pub fn alerts(waiting: &[Waiting], announced: &BTreeSet<(IssueId, String)>) -> Vec<Alert> {
+    let mut fresh: BTreeMap<&IssueId, Vec<&Waiting>> = BTreeMap::new();
+    for w in waiting {
+        if !announced.contains(&(w.issue.clone(), w.key.clone())) {
+            fresh.entry(&w.issue).or_default().push(w);
+        }
+    }
+    fresh
+        .into_iter()
+        .filter_map(|(issue, mut ws)| {
+            // The most telling wait first; among equals the newest.
+            ws.sort_by(|a, b| {
+                (a.kind.urgency(), std::cmp::Reverse(&a.since), &a.key).cmp(&(
+                    b.kind.urgency(),
+                    std::cmp::Reverse(&b.since),
+                    &b.key,
+                ))
+            });
+            let lead = ws.first()?;
+            let title = format!("asf {issue} {}", lead.kind.headline());
+            let reason = first_line(&lead.reason);
+            let body = if reason.is_empty() {
+                lead.kind.fallback().to_string()
+            } else {
+                reason
+            };
+            let mut keys: Vec<String> = ws.iter().map(|w| w.key.clone()).collect();
+            keys.sort();
+            keys.dedup();
+            Some(Alert {
+                issue: issue.clone(),
+                kind: lead.kind,
+                text: format!("{title}: {body}"),
+                title,
+                body,
+                keys,
+            })
+        })
+        .collect()
 }
 
 fn parse_ts(s: &str) -> Option<OffsetDateTime> {
@@ -128,6 +285,8 @@ fn parse_ts(s: &str) -> Option<OffsetDateTime> {
 ///   `every_minutes` (`reminded` is [`EventIndex::reminded`]); `every_minutes == 0`
 ///   means "once": no repeat while the same wait lasts.
 /// - A reminder older than the wait itself belongs to an earlier episode and does not count.
+///   An [`Alert`] is recorded as a reminder, so the first reminder is counted from the alert.
+/// - [`WaitKind::Blocker`] never reminds.
 ///
 /// Oldest wait first.
 pub fn due(
@@ -144,6 +303,10 @@ pub fn due(
 
     let mut oldest: BTreeMap<&IssueId, (OffsetDateTime, &Waiting)> = BTreeMap::new();
     for w in waiting {
+        // A blocker comment is announced once ([`alerts`]); it has no end the store could see.
+        if w.kind == WaitKind::Blocker {
+            continue;
+        }
         let Some(since) = parse_ts(&w.since) else {
             continue;
         };

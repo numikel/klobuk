@@ -139,7 +139,7 @@ fn unparsable_document_is_a_parse_error() {
 }
 
 #[test]
-fn editable_keys_are_exactly_the_twelve_named_in_the_briefs() {
+fn editable_keys_are_exactly_the_thirteen_named_in_the_briefs() {
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
     assert_eq!(
         keys,
@@ -154,6 +154,7 @@ fn editable_keys_are_exactly_the_twelve_named_in_the_briefs() {
             "scheduler.max_parallel",
             "merge.target",
             "merge.verify_main_after",
+            "notify.on_new",
             "notify.after_minutes",
             "notify.every_minutes",
         ]
@@ -175,6 +176,7 @@ fn every_editable_key_accepts_its_default_value() {
         ("scheduler.max_parallel", "3"),
         ("merge.target", "local"),
         ("merge.verify_main_after", "false"),
+        ("notify.on_new", "true"),
         ("notify.after_minutes", "15"),
         ("notify.every_minutes", "30"),
     ] {

@@ -300,8 +300,12 @@ pub struct NotifyCfg {
     pub after_minutes: u64,
     /// Repeat every this many minutes while the thing still waits; `0` reminds only once.
     pub every_minutes: u64,
-    /// Optional program run once per reminder, without a shell. Empty: no command.
+    /// Optional program run once per notification or reminder, without a shell. Empty: no command.
     pub command: Vec<String>,
+    /// Notify at once, one time, when something new starts to wait for the human (a question or
+    /// blocker to them, a blocked or failed run, a failed or blocked merge, a blocked issue).
+    /// Independent of `after_minutes`: `false` switches only these immediate notifications off.
+    pub on_new: bool,
 }
 
 impl Default for NotifyCfg {
@@ -310,6 +314,7 @@ impl Default for NotifyCfg {
             after_minutes: 15,
             every_minutes: 30,
             command: Vec::new(),
+            on_new: true,
         }
     }
 }
@@ -399,10 +404,11 @@ model = "claude-haiku-5-5"
 budget_usd = 1.0          # per planning step
 max_turns = 15
 
-[notify]                  # `asf serve` reminds you while something waits for you (blocked issue, failed merge, stalled run, unanswered question)
-after_minutes = 15 # first reminder after this long; 0 switches reminders off
+[notify]                  # `asf serve` tells you when something starts to wait for you and reminds you while it still does (blocked issue, failed merge, stalled run, question)
+on_new = true      # notify at once, one time, when something new waits for you; false switches only that off
+after_minutes = 15 # first reminder after this long; 0 switches reminders off (not the immediate notification)
 every_minutes = 30 # then again this often while it still waits; 0 reminds only once
-# command = ["pwsh", "-File", "notify.ps1"]  # optional, run once per reminder without a shell (10 s limit) with
+# command = ["pwsh", "-File", "notify.ps1"]  # optional, run once per notification or reminder without a shell (10 s limit) with
 #                                            # ASF_REMIND_ISSUE, ASF_REMIND_KIND, ASF_REMIND_AGE_MINUTES, ASF_REMIND_TEXT set
 "#;
 

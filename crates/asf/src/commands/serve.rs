@@ -9,8 +9,9 @@
 //! without restarting the loop. Tick reports and the summary carry `questions_waiting`: the
 //! unanswered QUESTIONs to the human plus the runs in `blocked`, i.e. what waits for the operator.
 //!
-//! The loop also reminds the human of what waits too long (`[notify]`, see `remind`): each tick
-//! report lists the `reminders` sent in that tick. One-shot commands never remind, only `serve`.
+//! The loop also tells the human what waits for them (`[notify]`, see `remind`): each tick report
+//! lists the `alerts` sent for things that just started to wait and the `reminders` for things that
+//! waited too long. One-shot commands never notify, only `serve`.
 
 use std::io::Write;
 use std::time::Duration;
@@ -38,6 +39,9 @@ pub struct TickReport {
     pub start_errors: Vec<serde_json::Value>,
     /// Unanswered QUESTIONs to the human plus runs in `blocked`; always present, `0` when none.
     pub questions_waiting: usize,
+    /// Notifications sent in this tick for things that just started to wait for the human
+    /// (`[notify] on_new`).
+    pub alerts: Vec<remind::Sent>,
     /// Reminders sent in this tick for things that waited too long (`[notify]`).
     pub reminders: Vec<remind::Sent>,
 }
@@ -90,8 +94,9 @@ fn tick(ctx: &Ctx, dispatch: bool, reminders: &mut RemindState) -> Result<TickRe
             }
         }
     }
-    // Last, so the reminders see the state this tick has just produced.
-    let reminders = remind::send_due(ctx, &*worker.rt, reminders, time::OffsetDateTime::now_utc())?;
+    // Last, so the notifications see the state this tick has just produced.
+    let remind::Notices { alerts, reminders } =
+        remind::send_due(ctx, &*worker.rt, reminders, time::OffsetDateTime::now_utc())?;
     Ok(TickReport {
         promoted,
         closed_epics,
@@ -100,6 +105,7 @@ fn tick(ctx: &Ctx, dispatch: bool, reminders: &mut RemindState) -> Result<TickRe
         started,
         start_errors,
         questions_waiting: questions_waiting(ctx)?,
+        alerts,
         reminders,
     })
 }
@@ -132,23 +138,15 @@ fn text(t: &TickReport) -> String {
     for e in &t.start_errors {
         s.push_str(&format!("\nstart failed {}: {}", e["issue"], e["message"]));
     }
-    for r in &t.reminders {
-        s.push_str(&format!(
-            "
-reminded: {}",
-            r.text
-        ));
-        if let Some(e) = &r.notify_error {
-            s.push_str(&format!(
-                "
-  notification failed: {e}"
-            ));
-        }
-        if let Some(e) = &r.command_error {
-            s.push_str(&format!(
-                "
-  command failed: {e}"
-            ));
+    for (label, list) in [("notified", &t.alerts), ("reminded", &t.reminders)] {
+        for r in list {
+            s.push_str(&format!("\n{label}: {}", r.text));
+            if let Some(e) = &r.notify_error {
+                s.push_str(&format!("\n  notification failed: {e}"));
+            }
+            if let Some(e) = &r.command_error {
+                s.push_str(&format!("\n  command failed: {e}"));
+            }
         }
     }
     s.push_str(&waiting_line(t.questions_waiting));
@@ -337,6 +335,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
                     || !t.merge.items.is_empty()
                     || !t.started.is_empty()
                     || !t.start_errors.is_empty()
+                    || !t.alerts.is_empty()
                     || !t.reminders.is_empty()
                 {
                     print_ok(cli.json, cli.quiet, &Rendered::new(&t, text(&t))?);

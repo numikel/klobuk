@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use asf_core::config::NotifyCfg;
 use asf_core::remind::{
-    due, first_line, human_age, reminder_text, EventIndex, WaitKind, Waiting, EVENT_REMINDED,
+    alerts, due, first_line, human_age, reminder_text, EventIndex, WaitKind, Waiting, EVENT_REMINDED,
 };
 use asf_core::{Event, IssueId};
 use time::format_description::well_known::Rfc3339;
@@ -27,6 +27,7 @@ fn waiting(n: u32, kind: WaitKind, minutes_ago: i64, reason: &str) -> Waiting {
         kind,
         since: ts(t0() - Duration::minutes(minutes_ago)),
         reason: reason.into(),
+        key: format!("{kind}:{n}@{minutes_ago}"),
     }
 }
 
@@ -35,6 +36,7 @@ fn cfg(after: u64, every: u64) -> NotifyCfg {
         after_minutes: after,
         every_minutes: every,
         command: Vec::new(),
+        on_new: true,
     }
 }
 
@@ -208,7 +210,8 @@ fn wait_kinds_round_trip_through_their_names() {
         serde_json::to_string(&WaitKind::RunOverBudget).unwrap(),
         "\"run_over_budget\""
     );
-    assert_eq!(WaitKind::ALL.len(), 8);
+    assert_eq!(WaitKind::ALL.len(), 9);
+    assert_eq!(serde_json::to_string(&WaitKind::Blocker).unwrap(), "\"blocker\"");
 }
 
 #[test]
@@ -323,4 +326,220 @@ fn the_index_feeds_due_so_a_restart_does_not_repeat_early() {
         1,
         "30 min after the last reminder"
     );
+}
+
+// ---- alerts: telling the human the moment something new waits ----
+
+fn none() -> BTreeSet<(IssueId, String)> {
+    BTreeSet::new()
+}
+
+fn announced(w: &Waiting) -> BTreeSet<(IssueId, String)> {
+    [(w.issue.clone(), w.key.clone())].into_iter().collect()
+}
+
+#[test]
+fn a_new_wait_gets_one_alert_with_a_title_for_a_human_in_a_hurry() {
+    let cases = [
+        (WaitKind::Question, "asf asf-7 asks"),
+        (WaitKind::Blocker, "asf asf-7 is blocked"),
+        (WaitKind::IssueBlocked, "asf asf-7 is blocked"),
+        (WaitKind::RunBlocked, "asf asf-7 is blocked"),
+        (WaitKind::MergeFailed, "asf asf-7 merge failed"),
+        (WaitKind::MergeBlocked, "asf asf-7 merge blocked"),
+        (WaitKind::RunStalled, "asf asf-7 is stalled"),
+        (WaitKind::RunOverBudget, "asf asf-7 is over budget"),
+        (WaitKind::RunFailed, "asf asf-7 run failed"),
+    ];
+    assert_eq!(cases.len(), WaitKind::ALL.len(), "every kind has a title");
+    for (kind, title) in cases {
+        let a = alerts(&[waiting(7, kind, 0, "Which branch?")], &none());
+        assert_eq!(a.len(), 1, "{kind}");
+        assert_eq!(a[0].issue, id(7));
+        assert_eq!(a[0].kind, kind);
+        assert_eq!(a[0].title, title);
+        assert_eq!(a[0].body, "Which branch?");
+        assert_eq!(a[0].text, format!("{title}: Which branch?"));
+    }
+}
+
+#[test]
+fn the_body_is_one_short_line_and_never_empty() {
+    let long = format!("rebase conflict in a.rs\nstack\n{}", "x".repeat(300));
+    let a = alerts(&[waiting(1, WaitKind::MergeFailed, 0, &long)], &none());
+    assert_eq!(a[0].body, "rebase conflict in a.rs");
+
+    let a = alerts(&[waiting(1, WaitKind::MergeFailed, 0, &"y".repeat(300))], &none());
+    assert_eq!(a[0].body.chars().count(), 120, "cut like a reminder reason");
+
+    for kind in WaitKind::ALL {
+        let a = alerts(&[waiting(1, *kind, 0, "  \n ")], &none());
+        assert!(!a[0].body.trim().is_empty(), "{kind} has a stock body");
+        assert!(!a[0].body.contains('\n'));
+    }
+}
+
+#[test]
+fn a_wait_that_was_announced_is_not_announced_again() {
+    let w = waiting(1, WaitKind::Question, 5, "q");
+    assert!(alerts(std::slice::from_ref(&w), &announced(&w)).is_empty());
+
+    // the next episode has another key: a new question on the same issue is news again
+    let next = waiting(1, WaitKind::Question, 1, "another");
+    let a = alerts(&[w.clone(), next.clone()], &announced(&w));
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].body, "another");
+    assert_eq!(a[0].keys, [next.key]);
+}
+
+#[test]
+fn a_key_announced_for_another_issue_does_not_count() {
+    let w = waiting(1, WaitKind::Question, 5, "q");
+    let mut other = w.clone();
+    other.issue = id(2);
+    assert_eq!(alerts(&[other], &announced(&w)).len(), 1);
+}
+
+#[test]
+fn several_new_waits_of_one_issue_make_one_alert_that_covers_them_all() {
+    let w = [
+        waiting(1, WaitKind::IssueBlocked, 3, "gate failed"),
+        waiting(1, WaitKind::MergeFailed, 3, "rebase conflict"),
+        waiting(1, WaitKind::RunFailed, 3, "verification failed"),
+        waiting(1, WaitKind::Blocker, 3, "Verification of asf-1 failed"),
+        waiting(2, WaitKind::RunStalled, 1, "no output"),
+    ];
+    let a = alerts(&w, &none());
+    assert_eq!(a.len(), 2, "{a:?}");
+    assert_eq!(a[0].issue, id(1));
+    assert_eq!(a[0].kind, WaitKind::Blocker, "what a person wrote leads");
+    assert_eq!(a[0].keys.len(), 4, "all four are announced by the one alert");
+    assert_eq!(a[1].issue, id(2));
+}
+
+#[test]
+fn a_question_leads_and_among_equals_the_newest_wins() {
+    let w = [
+        waiting(1, WaitKind::RunFailed, 10, "run"),
+        waiting(1, WaitKind::Question, 9, "older question"),
+        waiting(1, WaitKind::Question, 2, "newer question"),
+    ];
+    let a = alerts(&w, &none());
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].kind, WaitKind::Question);
+    assert_eq!(a[0].body, "newer question");
+}
+
+#[test]
+fn the_event_index_remembers_which_waits_an_alert_announced() {
+    let mut ix = EventIndex::default();
+    ix.absorb(&event(
+        EVENT_REMINDED,
+        Some(1),
+        None,
+        "2026-11-07T09:00:00Z",
+        serde_json::json!({"kind": "question", "age_minutes": 0, "keys": ["question:5", "run:r1:failed@x"]}),
+    ));
+    // an ordinary reminder carries no keys and announces nothing
+    ix.absorb(&event(
+        EVENT_REMINDED,
+        Some(2),
+        None,
+        "2026-11-07T09:05:00Z",
+        serde_json::json!({"kind": "issue_blocked", "age_minutes": 20}),
+    ));
+    assert_eq!(ix.announced.len(), 2);
+    assert!(ix.announced.contains(&(id(1), "question:5".to_string())));
+    assert!(ix.announced.contains(&(id(1), "run:r1:failed@x".to_string())));
+    assert_eq!(
+        ix.reminded[&id(1)],
+        "2026-11-07T09:00:00Z",
+        "an alert is a reminder for the countdown"
+    );
+    assert_eq!(ix.reminded[&id(2)], "2026-11-07T09:05:00Z");
+}
+
+#[test]
+fn the_first_reminder_is_counted_from_the_alert() {
+    // the wait is 40 min old; the alert went out 10 min ago: next nudge 30 min after the alert
+    let mut ix = EventIndex::default();
+    ix.absorb(&event(
+        EVENT_REMINDED,
+        Some(1),
+        None,
+        &ts(t0() - Duration::minutes(10)),
+        serde_json::json!({"kind": "issue_blocked", "age_minutes": 0, "keys": ["k"]}),
+    ));
+    let w = [waiting(1, WaitKind::IssueBlocked, 40, "x")];
+    assert!(due(&w, &ix.reminded, t0(), &cfg(15, 30)).is_empty());
+    assert_eq!(
+        due(&w, &ix.reminded, t0() + Duration::minutes(20), &cfg(15, 30)).len(),
+        1
+    );
+}
+
+#[test]
+fn the_index_knows_when_an_issue_or_a_merge_item_entered_a_state() {
+    let mut ix = EventIndex::default();
+    ix.absorb(&event(
+        "issue.status",
+        Some(3),
+        None,
+        "2026-11-07T08:00:00Z",
+        serde_json::json!({"from": "in_progress", "to": "blocked"}),
+    ));
+    ix.absorb(&event(
+        "issue.status",
+        Some(3),
+        None,
+        "2026-11-07T08:30:00Z",
+        serde_json::json!({"from": "blocked", "to": "in_progress"}),
+    ));
+    ix.absorb(&event(
+        "issue.status",
+        Some(3),
+        None,
+        "2026-11-07T09:00:00Z",
+        serde_json::json!({"from": "in_progress", "to": "blocked"}),
+    ));
+    ix.absorb(&event(
+        "merge.state",
+        Some(3),
+        None,
+        "2026-11-07T09:10:00Z",
+        serde_json::json!({"merge_id": 12, "from": "queued", "to": "failed"}),
+    ));
+    ix.absorb(&event(
+        "run.state",
+        Some(3),
+        Some("r9"),
+        "2026-11-07T09:20:00Z",
+        serde_json::json!({"from": "working", "to": "stalled"}),
+    ));
+    assert_eq!(
+        ix.issue_entered(&id(3), "blocked"),
+        Some("2026-11-07T09:00:00Z"),
+        "the latest entry"
+    );
+    assert_eq!(ix.issue_entered(&id(4), "blocked"), None);
+    assert_eq!(ix.merge_entered(12, "failed"), Some("2026-11-07T09:10:00Z"));
+    assert_eq!(ix.merge_entered(13, "failed"), None);
+    assert_eq!(ix.run_entered("r9", "stalled"), Some("2026-11-07T09:20:00Z"));
+}
+
+#[test]
+fn a_blocker_comment_is_announced_but_never_reminded() {
+    let w = [waiting(1, WaitKind::Blocker, 600, "scope too narrow")];
+    assert!(due(&w, &BTreeMap::new(), t0(), &cfg(15, 30)).is_empty());
+    assert_eq!(alerts(&w, &BTreeSet::new()).len(), 1);
+
+    // and it does not hide the real wait of its issue from the reminders
+    let w = [
+        waiting(1, WaitKind::Blocker, 600, "scope too narrow"),
+        waiting(1, WaitKind::IssueBlocked, 40, "x"),
+    ];
+    let r = due(&w, &BTreeMap::new(), t0(), &cfg(15, 30));
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].kind, WaitKind::IssueBlocked);
+    assert_eq!(r[0].age_minutes, 40);
 }

@@ -20,11 +20,12 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_twelve_editable_keys_with_current_values() {
+fn show_lists_the_thirteen_editable_keys_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 12, "{res}");
+    assert_eq!(rows.len(), 13, "{res}");
+    assert_eq!(entry(rows, "notify.on_new")["value"], true);
     assert_eq!(entry(rows, "notify.after_minutes")["value"], 15);
     assert_eq!(entry(rows, "notify.every_minutes")["value"], 30);
 
@@ -230,6 +231,29 @@ fn set_changes_the_reminder_minutes_and_keeps_the_commented_command() {
     let rows = rows.as_array().unwrap();
     assert_eq!(entry(rows, "notify.after_minutes")["value"], 5);
     assert_eq!(entry(rows, "notify.every_minutes")["value"], 0);
+}
+
+#[test]
+fn set_switches_the_immediate_notification_off_without_touching_the_reminders() {
+    let r = Repo::initialised();
+    let res = r.ok(&["config", "set", "notify.on_new", "false"]);
+    assert_eq!(res["old"], true, "{res}");
+    assert_eq!(res["new"], false, "{res}");
+
+    let after = String::from_utf8(config_bytes(&r)).unwrap();
+    assert!(after.contains("on_new = false"), "{after}");
+    assert!(after.contains("after_minutes = 15"), "{after}");
+    assert!(
+        after.contains("notify at once"),
+        "the comment on the line stays: {after}"
+    );
+    let rows = r.ok(&["config", "show"]);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(entry(rows, "notify.on_new")["value"], false);
+    assert_eq!(entry(rows, "notify.after_minutes")["value"], 15);
+
+    let (code, _, _) = r.err(&["config", "set", "notify.on_new", "maybe"]);
+    assert_eq!(code, 1, "only a boolean is accepted");
 }
 
 #[test]

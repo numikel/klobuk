@@ -200,6 +200,8 @@ fn until_done_with_dispatch_is_stuck_only_when_the_plan_has_no_slot() {
     let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
     repo.ok(&["issue", "status", &a, "blocked"]);
     repo.create_issue("b", &["--dep", &a, "--scope", "src/b.rs"]);
+    // this test is about `stuck`: no alert report may precede the single summary object
+    set_notify(&repo, "[notify]\non_new = false\n");
     let (v, code) = repo.json(&["serve", "--until-done", "--dispatch"]);
     assert_eq!(code, 3, "{v}");
     assert_eq!(v["ok"], true, "{v}");
@@ -557,6 +559,7 @@ fn set_notify(repo: &Repo, section: &str) {
 #[test]
 fn serve_reminds_once_about_a_blocked_issue_and_a_restart_does_not_repeat_it() {
     let (repo, id) = repo_with_an_old_blocked_issue();
+    set_notify(&repo, "[notify]\non_new = false\n");
     let res = repo.ok(&["serve", "--once"]);
     let sent = res["reminders"].as_array().unwrap_or_else(|| panic!("{res}"));
     assert_eq!(sent.len(), 1, "{res}");
@@ -585,6 +588,7 @@ fn serve_reminds_once_about_a_blocked_issue_and_a_restart_does_not_repeat_it() {
 #[test]
 fn serve_prints_the_reminder_in_the_human_report() {
     let (repo, id) = repo_with_an_old_blocked_issue();
+    set_notify(&repo, "[notify]\non_new = false\n");
     let out = repo.asf().args(["serve", "--once"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8_lossy(&out.stdout);
@@ -597,9 +601,10 @@ fn serve_prints_the_reminder_in_the_human_report() {
 #[test]
 fn zero_after_minutes_switches_reminders_off() {
     let (repo, _) = repo_with_an_old_blocked_issue();
-    set_notify(&repo, "[notify]\nafter_minutes = 0\n");
+    set_notify(&repo, "[notify]\nafter_minutes = 0\non_new = false\n");
     let res = repo.ok(&["serve", "--once"]);
     assert_eq!(res["reminders"], serde_json::json!([]), "{res}");
+    assert_eq!(res["alerts"], serde_json::json!([]), "{res}");
     assert!(notifications(&repo).is_empty());
 }
 
@@ -611,7 +616,7 @@ fn a_notify_command_runs_without_a_shell_and_its_failure_never_fails_the_tick() 
     set_notify(
         &repo,
         &format!(
-            "[notify]\ncommand = [\"git\", \"init\", \"-q\", \"{}\"]\n",
+            "[notify]\non_new = false\ncommand = [\"git\", \"init\", \"-q\", \"{}\"]\n",
             proof.to_string_lossy().replace('\\', "/")
         ),
     );
@@ -626,7 +631,10 @@ fn a_notify_command_runs_without_a_shell_and_its_failure_never_fails_the_tick() 
 
     // a program that does not exist: reported in the tick, exit code still 0, reminder still recorded
     let (repo, _) = repo_with_an_old_blocked_issue();
-    set_notify(&repo, "[notify]\ncommand = [\"asf-no-such-program-xyz\"]\n");
+    set_notify(
+        &repo,
+        "[notify]\non_new = false\ncommand = [\"asf-no-such-program-xyz\"]\n",
+    );
     let (v, code) = repo.json(&["serve", "--once"]);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["ok"], true, "{v}");
@@ -647,4 +655,122 @@ fn a_fresh_wait_is_not_reminded_yet() {
     repo.ok(&["issue", "status", &id, "blocked"]);
     let res = repo.ok(&["serve", "--once"]);
     assert_eq!(res["reminders"], serde_json::json!([]), "{res}");
+}
+
+// ---- on_new: the notification at the moment something new waits for the human ----
+
+fn comment_to_human(repo: &Repo, id: &str, kind: &str, body: &str) {
+    repo.ok(&[
+        "issue", "comment", id, "--type", kind, "--to", "human", "--body", body,
+    ]);
+}
+
+#[test]
+fn serve_notifies_at_once_about_a_new_wait_and_a_restart_neither_repeats_nor_loses_it() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    let res = repo.ok(&["serve", "--once"]);
+    let alerts = res["alerts"].as_array().unwrap_or_else(|| panic!("{res}"));
+    assert_eq!(alerts.len(), 1, "{res}");
+    assert_eq!(alerts[0]["issue"], id.as_str(), "{res}");
+    assert_eq!(alerts[0]["kind"], "blocker", "the BLOCKER comment leads: {res}");
+    assert_eq!(alerts[0]["age_minutes"], 0, "{res}");
+    assert_eq!(
+        alerts[0]["text"],
+        format!("asf {id} is blocked: gate test timed out"),
+        "{res}"
+    );
+    assert_eq!(alerts[0]["notify_error"], serde_json::Value::Null, "{res}");
+    assert_eq!(
+        res["reminders"],
+        serde_json::json!([]),
+        "an alert is not also a reminder: {res}"
+    );
+
+    let n = notifications(&repo);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!(n[0]["title"], format!("asf {id} is blocked"));
+    assert_eq!(n[0]["body"], "gate test timed out", "first line only");
+    assert_eq!(n[0]["sound"], "request", "the attention sound, not the done one");
+
+    // a new `asf serve` process: what was announced comes back from the store
+    let again = repo.ok(&["serve", "--once"]);
+    assert_eq!(again["alerts"], serde_json::json!([]), "{again}");
+    assert_eq!(
+        again["reminders"],
+        serde_json::json!([]),
+        "the first reminder is counted from the notification, not from the 2020 wait: {again}"
+    );
+    assert_eq!(notifications(&repo).len(), 1, "no second notification");
+
+    // something new on the same issue is announced in the next tick
+    comment_to_human(&repo, &id, "QUESTION", "Which branch should I use?");
+    let next = repo.ok(&["serve", "--once"]);
+    assert_eq!(next["alerts"].as_array().map(Vec::len), Some(1), "{next}");
+    assert_eq!(next["alerts"][0]["kind"], "question", "{next}");
+    assert_eq!(
+        next["alerts"][0]["text"],
+        format!("asf {id} asks: Which branch should I use?")
+    );
+    assert_eq!(notifications(&repo).len(), 2);
+}
+
+#[test]
+fn something_posted_while_serve_was_not_running_is_announced_by_the_next_serve() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let id = repo.create_issue("asks later", &[]);
+    assert_eq!(repo.ok(&["serve", "--once"])["alerts"], serde_json::json!([]));
+    comment_to_human(&repo, &id, "QUESTION", "Scope question?");
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["alerts"][0]["kind"], "question", "{res}");
+    assert_eq!(notifications(&repo).len(), 1);
+}
+
+#[test]
+fn zero_after_minutes_keeps_the_immediate_notification_and_on_new_false_keeps_the_reminders() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    set_notify(&repo, "[notify]\nafter_minutes = 0\n");
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["alerts"].as_array().map(Vec::len), Some(1), "{res}");
+    assert_eq!(res["reminders"], serde_json::json!([]), "{res}");
+
+    let (repo, id2) = repo_with_an_old_blocked_issue();
+    set_notify(&repo, "[notify]\non_new = false\n");
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["alerts"], serde_json::json!([]), "{res}");
+    assert_eq!(res["reminders"][0]["issue"], id2.as_str(), "{res}");
+    let _ = id;
+}
+
+#[test]
+fn the_notify_command_also_runs_for_an_immediate_notification() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    let proof = repo.path().join("proof-alert");
+    set_notify(
+        &repo,
+        &format!(
+            "[notify]\ncommand = [\"git\", \"init\", \"-q\", \"{}\"]\n",
+            proof.to_string_lossy().replace('\\', "/")
+        ),
+    );
+    let res = repo.ok(&["serve", "--once"]);
+    assert_eq!(res["alerts"][0]["issue"], id.as_str(), "{res}");
+    assert_eq!(
+        res["alerts"][0]["command_error"],
+        serde_json::Value::Null,
+        "{res}"
+    );
+    assert!(proof.join(".git").exists(), "the command did not run");
+}
+
+#[test]
+fn serve_prints_the_notification_in_the_human_report() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    let out = repo.asf().args(["serve", "--once"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("notified: asf {id} is blocked: gate test timed out")),
+        "{text}"
+    );
 }
