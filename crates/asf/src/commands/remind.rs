@@ -102,8 +102,9 @@ struct Words<'a> {
 /// Sends the alerts and reminders that are due now. A failing notification or command is recorded
 /// in the returned [`Sent`] and never turns into an error; only a store failure does.
 ///
-/// Alerts go first and count as a reminder, so a wait is never both alerted and reminded in the
-/// same tick and its first reminder is counted from the alert.
+/// Alerts go first. The first reminder of a wait is counted from its alert by `after_minutes`
+/// (so a wait is never both alerted and reminded in the same tick); repeats are `every_minutes`
+/// apart, and `every_minutes = 0` still allows that one reminder.
 pub fn send_due(
     ctx: &Ctx,
     rt: &dyn AgentRuntime,
@@ -128,14 +129,20 @@ pub fn send_due(
                 body: &a.body,
                 text: &a.text,
             };
-            let sent = deliver(ctx, rt, state, (&a.issue, a.kind, 0), &words, payload)?;
+            let sent = deliver(ctx, rt, (&a.issue, a.kind, 0), &words, payload)?;
+            // Counted from now on, whatever timestamp the store gave the event: the first
+            // reminder of this wait comes `after_minutes` after it.
+            state
+                .index
+                .alerted
+                .insert(a.issue.clone(), asf_core::now_rfc3339());
             for key in a.keys {
                 state.index.announced.insert((a.issue.clone(), key));
             }
             out.alerts.push(sent);
         }
     }
-    for r in remind::due(&waiting, &state.index.reminded, now, cfg) {
+    for r in remind::due(&waiting, &state.index.reminded, &state.index.alerted, now, cfg) {
         let title = format!("asf {} needs you", r.issue);
         let words = Words {
             title: &title,
@@ -143,18 +150,21 @@ pub fn send_due(
             text: &r.text,
         };
         let payload = serde_json::json!({ "kind": r.kind, "age_minutes": r.age_minutes });
-        let sent = deliver(ctx, rt, state, (&r.issue, r.kind, r.age_minutes), &words, payload)?;
+        let sent = deliver(ctx, rt, (&r.issue, r.kind, r.age_minutes), &words, payload)?;
+        state
+            .index
+            .reminded
+            .insert(r.issue.clone(), asf_core::now_rfc3339());
         out.reminders.push(sent);
     }
     Ok(out)
 }
 
 /// Notifies through the runtime, runs `[notify] command` and records the event.
-/// `about` is `(issue, kind, age_minutes)`.
+/// `about` is `(issue, kind, age_minutes)`. The caller notes the time in the [`EventIndex`].
 fn deliver(
     ctx: &Ctx,
     rt: &dyn AgentRuntime,
-    state: &mut RemindState,
     about: (&IssueId, WaitKind, u64),
     words: &Words,
     payload: serde_json::Value,
@@ -182,11 +192,6 @@ fn deliver(
         actor: Some(LANE_ORCHESTRATOR.into()),
         payload,
     })?;
-    // Counted from now on, whatever timestamp the store gave the event.
-    state
-        .index
-        .reminded
-        .insert(issue.clone(), asf_core::now_rfc3339());
     Ok(Sent {
         issue: issue.clone(),
         kind,
@@ -1223,18 +1228,52 @@ mod flow_tests {
         let mut state = RemindState::new();
         assert_eq!(tick(&fx, &mut state, later(0)).alerts.len(), 1);
 
-        // the wait is 20 min old, past after_minutes, but the notification went out just now
-        assert_eq!(tick(&fx, &mut state, later(20)), Notices::default());
+        // the first reminder is `after_minutes` (15) after the notification, not `every_minutes`
+        assert_eq!(tick(&fx, &mut state, later(14)), Notices::default());
         let mut restarted = RemindState::new();
         assert_eq!(
-            tick(&fx, &mut restarted, later(25)),
+            tick(&fx, &mut restarted, later(14)),
             Notices::default(),
             "a restart keeps counting from the notification"
         );
-        let due = tick(&fx, &mut restarted, later(31));
+        let due = tick(&fx, &mut restarted, later(16));
         assert!(due.alerts.is_empty());
-        assert_eq!(due.reminders.len(), 1, "30 min after the notification");
+        assert_eq!(due.reminders.len(), 1, "15 min after the notification");
         assert_eq!(due.reminders[0].issue, id);
+        assert_eq!(notify_log(&fx).len(), 2);
+
+        // later ones are `every_minutes` (30) apart. The store stamps events with the real clock
+        // while `later` is simulated, so the last reminder counts as made at the start of the
+        // test: the exact repeat rule is pinned with fixed times in the core tests.
+        assert_eq!(tick(&fx, &mut restarted, later(25)), Notices::default());
+        assert_eq!(tick(&fx, &mut restarted, later(31)).reminders.len(), 1);
+        assert_eq!(notify_log(&fx).len(), 3);
+    }
+
+    #[test]
+    fn zero_every_minutes_still_sends_the_one_reminder_after_the_notification() {
+        let fx = {
+            let mut fx = alerting();
+            fx.ctx.config.notify.after_minutes = 15;
+            fx.ctx.config.notify.every_minutes = 0;
+            fx
+        };
+        let id = issue(&fx, "b", Status::Blocked);
+        let mut state = RemindState::new();
+        assert_eq!(tick(&fx, &mut state, later(0)).alerts.len(), 1);
+        assert_eq!(tick(&fx, &mut state, later(14)), Notices::default());
+
+        let due = tick(&fx, &mut state, later(16));
+        assert_eq!(due.reminders.len(), 1, "on_new does not switch the reminder off");
+        assert_eq!(due.reminders[0].issue, id);
+
+        assert_eq!(
+            tick(&fx, &mut state, later(600)),
+            Notices::default(),
+            "0 reminds only once"
+        );
+        let mut restarted = RemindState::new();
+        assert_eq!(tick(&fx, &mut restarted, later(601)), Notices::default());
         assert_eq!(notify_log(&fx).len(), 2);
     }
 

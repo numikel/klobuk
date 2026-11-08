@@ -136,8 +136,12 @@ pub struct Reminder {
 /// What the event log says about reminders and state changes, built by feeding events in order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventIndex {
-    /// Time (RFC 3339) of the latest `attention.reminded` event per issue: an [`Alert`] or a [`Reminder`].
+    /// Time (RFC 3339) of the latest [`Reminder`] per issue: an `attention.reminded` event that is
+    /// not an alert. Only these start the `every_minutes` countdown.
     pub reminded: BTreeMap<IssueId, String>,
+    /// Time (RFC 3339) of the latest [`Alert`] per issue: an `attention.reminded` event with
+    /// `"immediate": true`. The first reminder is counted from it, by `after_minutes`.
+    pub alerted: BTreeMap<IssueId, String>,
     /// Per run id: the state it last entered and when (from `run.state` events).
     pub run_states: BTreeMap<String, (String, String)>,
     /// `(issue, key)` of every wait an [`Alert`] has already announced (the `keys` of the events).
@@ -154,7 +158,13 @@ impl EventIndex {
         match e.kind.as_str() {
             EVENT_REMINDED => {
                 if let Some(issue) = &e.issue_id {
-                    self.reminded.insert(issue.clone(), e.ts.clone());
+                    let immediate = e.payload.get("immediate").and_then(|v| v.as_bool()) == Some(true);
+                    let latest = if immediate {
+                        &mut self.alerted
+                    } else {
+                        &mut self.reminded
+                    };
+                    latest.insert(issue.clone(), e.ts.clone());
                     let keys = e.payload.get("keys").and_then(|v| v.as_array());
                     for key in keys.into_iter().flatten().filter_map(|k| k.as_str()) {
                         self.announced.insert((issue.clone(), key.to_string()));
@@ -281,17 +291,20 @@ fn parse_ts(s: &str) -> Option<OffsetDateTime> {
 /// - `after_minutes == 0` switches everything off.
 /// - An issue waits on at most one thing: the oldest of its [`Waiting`] entries (ties: the kind
 ///   that sorts first), so a failed run and a failed merge item of one issue remind once.
-/// - A wait of at least `after_minutes` is due unless the issue was reminded within
-///   `every_minutes` (`reminded` is [`EventIndex::reminded`]); `every_minutes == 0`
-///   means "once": no repeat while the same wait lasts.
-/// - A reminder older than the wait itself belongs to an earlier episode and does not count.
-///   An [`Alert`] is recorded as a reminder, so the first reminder is counted from the alert.
+/// - The first reminder of a wait comes `after_minutes` after the wait began or after the
+///   [`Alert`] that announced it (`alerted` is [`EventIndex::alerted`]), whichever is later.
+/// - Later ones come `every_minutes` after the last reminder (`reminded` is
+///   [`EventIndex::reminded`]); `every_minutes == 0` means "once": the reminder after the alert
+///   is the only one while the same wait lasts.
+/// - A reminder or alert older than the wait itself belongs to an earlier episode and does not
+///   count.
 /// - [`WaitKind::Blocker`] never reminds.
 ///
 /// Oldest wait first.
 pub fn due(
     waiting: &[Waiting],
     reminded: &BTreeMap<IssueId, String>,
+    alerted: &BTreeMap<IssueId, String>,
     now: OffsetDateTime,
     cfg: &NotifyCfg,
 ) -> Vec<Reminder> {
@@ -331,6 +344,15 @@ pub fn due(
             .filter(|t| *t >= since);
         if let Some(t) = last {
             if every_secs == 0 || (now - t).whole_seconds() < every_secs {
+                continue;
+            }
+        } else if let Some(a) = alerted
+            .get(issue)
+            .and_then(|t| parse_ts(t))
+            .filter(|t| *t >= since)
+        {
+            // No reminder yet: the delay runs from the alert that told the human about the wait.
+            if (now - a).whole_seconds() < after_secs {
                 continue;
             }
         }

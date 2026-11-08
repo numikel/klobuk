@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use asf_core::config::NotifyCfg;
 use asf_core::remind::{
-    alerts, due, first_line, human_age, reminder_text, EventIndex, WaitKind, Waiting, EVENT_REMINDED,
+    alerts, due as due_after_alerts, first_line, human_age, reminder_text, EventIndex, Reminder, WaitKind,
+    Waiting, EVENT_REMINDED,
 };
 use asf_core::{Event, IssueId};
 use time::format_description::well_known::Rfc3339;
@@ -45,6 +46,16 @@ fn reminded(pairs: &[(u32, i64)]) -> BTreeMap<IssueId, String> {
         .iter()
         .map(|(n, ago)| (id(*n), ts(t0() - Duration::minutes(*ago))))
         .collect()
+}
+
+/// `due` for the world without alerts: the old tests say nothing about them.
+fn due(
+    waiting: &[Waiting],
+    reminded: &BTreeMap<IssueId, String>,
+    now: OffsetDateTime,
+    cfg: &NotifyCfg,
+) -> Vec<Reminder> {
+    due_after_alerts(waiting, reminded, &BTreeMap::new(), now, cfg)
 }
 
 fn issues(r: &[asf_core::remind::Reminder]) -> Vec<String> {
@@ -438,7 +449,7 @@ fn the_event_index_remembers_which_waits_an_alert_announced() {
         Some(1),
         None,
         "2026-11-07T09:00:00Z",
-        serde_json::json!({"kind": "question", "age_minutes": 0, "keys": ["question:5", "run:r1:failed@x"]}),
+        serde_json::json!({"kind": "question", "age_minutes": 0, "keys": ["question:5", "run:r1:failed@x"], "immediate": true}),
     ));
     // an ordinary reminder carries no keys and announces nothing
     ix.absorb(&event(
@@ -452,30 +463,123 @@ fn the_event_index_remembers_which_waits_an_alert_announced() {
     assert!(ix.announced.contains(&(id(1), "question:5".to_string())));
     assert!(ix.announced.contains(&(id(1), "run:r1:failed@x".to_string())));
     assert_eq!(
-        ix.reminded[&id(1)],
+        ix.alerted[&id(1)],
         "2026-11-07T09:00:00Z",
-        "an alert is a reminder for the countdown"
+        "an alert is kept apart from the reminders"
+    );
+    assert!(
+        !ix.reminded.contains_key(&id(1)),
+        "an alert is not a reminder: it must not start the every_minutes countdown"
     );
     assert_eq!(ix.reminded[&id(2)], "2026-11-07T09:05:00Z");
+    assert!(!ix.alerted.contains_key(&id(2)));
 }
 
-#[test]
-fn the_first_reminder_is_counted_from_the_alert() {
-    // the wait is 40 min old; the alert went out 10 min ago: next nudge 30 min after the alert
+/// An index that saw one alert for issue 1, `minutes_ago` before `t0()`.
+fn alerted_ago(minutes_ago: i64) -> EventIndex {
     let mut ix = EventIndex::default();
     ix.absorb(&event(
         EVENT_REMINDED,
         Some(1),
         None,
-        &ts(t0() - Duration::minutes(10)),
-        serde_json::json!({"kind": "issue_blocked", "age_minutes": 0, "keys": ["k"]}),
+        &ts(t0() - Duration::minutes(minutes_ago)),
+        serde_json::json!({"kind": "issue_blocked", "age_minutes": 0, "keys": ["k"], "immediate": true}),
     ));
+    ix
+}
+
+fn due_at(w: &[Waiting], ix: &EventIndex, minutes_after_t0: i64, c: &NotifyCfg) -> usize {
+    due_after_alerts(
+        w,
+        &ix.reminded,
+        &ix.alerted,
+        t0() + Duration::minutes(minutes_after_t0),
+        c,
+    )
+    .len()
+}
+
+#[test]
+fn the_first_reminder_is_counted_from_the_alert_by_after_minutes() {
+    // the wait is 40 min old; the alert went out 10 min ago: the reminder comes after_minutes
+    // (15) after the alert, not every_minutes (30)
+    let ix = alerted_ago(10);
     let w = [waiting(1, WaitKind::IssueBlocked, 40, "x")];
-    assert!(due(&w, &ix.reminded, t0(), &cfg(15, 30)).is_empty());
+    let c = cfg(15, 30);
+    assert_eq!(due_at(&w, &ix, 0, &c), 0, "10 min after the alert");
+    assert_eq!(due_at(&w, &ix, 4, &c), 0, "14 min after the alert");
+    assert_eq!(due_at(&w, &ix, 5, &c), 1, "15 min after the alert");
+}
+
+#[test]
+fn an_alert_does_not_postpone_a_reminder_that_is_due_long_after_it() {
+    // alerted 20 min ago: the first reminder is due now, whatever every_minutes says
+    let ix = alerted_ago(20);
+    let w = [waiting(1, WaitKind::IssueBlocked, 40, "x")];
+    assert_eq!(due_at(&w, &ix, 0, &cfg(15, 30)), 1);
     assert_eq!(
-        due(&w, &ix.reminded, t0() + Duration::minutes(20), &cfg(15, 30)).len(),
-        1
+        due_at(&w, &ix, 0, &cfg(15, 120)),
+        1,
+        "every_minutes is for the repeats"
     );
+}
+
+#[test]
+fn zero_interval_still_sends_the_one_reminder_after_an_alert() {
+    let ix = alerted_ago(10);
+    let w = [waiting(1, WaitKind::IssueBlocked, 40, "x")];
+    let c = cfg(15, 0);
+    assert_eq!(due_at(&w, &ix, 0, &c), 0, "too soon after the alert");
+    assert_eq!(
+        due_at(&w, &ix, 5, &c),
+        1,
+        "the once, after_minutes after the alert"
+    );
+
+    // once that reminder is out, "once" means once
+    let mut ix = ix;
+    ix.absorb(&event(
+        EVENT_REMINDED,
+        Some(1),
+        None,
+        &ts(t0() + Duration::minutes(5)),
+        serde_json::json!({"kind": "issue_blocked", "age_minutes": 45}),
+    ));
+    assert_eq!(due_at(&w, &ix, 600, &c), 0);
+}
+
+#[test]
+fn repeats_count_from_the_last_reminder_not_from_the_alert() {
+    let mut ix = alerted_ago(60);
+    ix.absorb(&event(
+        EVENT_REMINDED,
+        Some(1),
+        None,
+        &ts(t0() - Duration::minutes(10)),
+        serde_json::json!({"kind": "issue_blocked", "age_minutes": 50}),
+    ));
+    let w = [waiting(1, WaitKind::IssueBlocked, 70, "x")];
+    let c = cfg(15, 30);
+    assert_eq!(due_at(&w, &ix, 0, &c), 0, "reminded 10 min ago");
+    assert_eq!(due_at(&w, &ix, 19, &c), 0, "29 min after the reminder");
+    assert_eq!(due_at(&w, &ix, 20, &c), 1, "30 min after the reminder");
+}
+
+#[test]
+fn an_alert_from_an_earlier_wait_does_not_delay_a_new_one() {
+    // alerted 100 min ago, the current wait began 20 min ago: the alert belongs to another episode
+    let ix = alerted_ago(100);
+    let w = [waiting(1, WaitKind::IssueBlocked, 20, "x")];
+    assert_eq!(due_at(&w, &ix, 0, &cfg(15, 30)), 1);
+}
+
+#[test]
+fn an_alert_for_a_wait_that_has_not_yet_reached_the_delay_keeps_it_quiet() {
+    // alerted the moment the wait began (5 min ago): nothing is due until 15 min in
+    let ix = alerted_ago(5);
+    let w = [waiting(1, WaitKind::IssueBlocked, 5, "x")];
+    assert_eq!(due_at(&w, &ix, 0, &cfg(15, 30)), 0);
+    assert_eq!(due_at(&w, &ix, 10, &cfg(15, 30)), 1);
 }
 
 #[test]

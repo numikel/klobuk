@@ -406,7 +406,7 @@ max_turns = 15
 
 [notify]                  # `asf serve` tells you when something starts to wait for you and reminds you while it still does (blocked issue, failed merge, stalled run, question)
 on_new = true      # notify at once, one time, when something new waits for you; false switches only that off
-after_minutes = 15 # first reminder after this long; 0 switches reminders off (not the immediate notification)
+after_minutes = 15 # first reminder this long after the notification; 0 switches reminders off (not the immediate notification)
 every_minutes = 30 # then again this often while it still waits; 0 reminds only once
 # command = ["pwsh", "-File", "notify.ps1"]  # optional, run once per notification or reminder without a shell (10 s limit) with
 #                                            # ASF_REMIND_ISSUE, ASF_REMIND_KIND, ASF_REMIND_AGE_MINUTES, ASF_REMIND_TEXT set
