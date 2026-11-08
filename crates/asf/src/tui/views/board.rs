@@ -1,9 +1,11 @@
 //! The Board view: issues grouped under their epic, one header per epic with a progress bar, and (from 120
-//! columns) a bordered detail panel of the selected row next to the list.
+//! columns) a bordered detail panel of the selected row next to the list. `b` switches to a kanban, one
+//! column per status; both layouts share the selection, the filter, the detail and the action keys.
 //!
 //! The row model ([`Listing`]) is a pure function of the snapshot and the [`State`] (folds and filter),
-//! so the key handling walks exactly the rows the renderer draws. An epic is never an issue row: it is a
-//! group header only, and it is not counted in the status counts.
+//! so the key handling walks exactly the rows the renderer draws; the kanban ([`Kanban`]) is built the
+//! same way. An epic is never an issue row or a card: it is a group header only, and it is not counted in
+//! the status counts.
 
 use std::collections::BTreeMap;
 
@@ -34,12 +36,47 @@ const LABEL_W: usize = 12;
 const ROW_FIXED: usize = 3 + 1 + 1 + 1 + 1 + 2 + LABEL_W + 1;
 /// Width of the labels (`Depends on`, `Scope`) in the detail.
 const FIELD_W: usize = 12;
+/// Share of the width the kanban gets next to the detail panel: seven columns need more than the list.
+const KANBAN_SHARE: u16 = 70;
+/// The kanban columns, left to right (`cancelled` is not shown anywhere on the Board).
+const COLUMNS: [Status; 7] = [
+    Status::Backlog,
+    Status::Ready,
+    Status::InProgress,
+    Status::Blocked,
+    Status::InReview,
+    Status::Validating,
+    Status::Done,
+];
+/// Index of `done` in [`COLUMNS`]: its newest [`DONE_CAP`] cards are shown.
+const DONE_COL: usize = 6;
+/// Done cards shown (newest first) unless a filter is typed; the rest is `+K more`.
+const DONE_CAP: usize = 5;
+/// Lines of a card: the id, two title lines and a blank line between cards.
+const CARD_H: usize = 4;
+
+/// How the Board lays the issues out. It lives in the TUI state for the session, not in the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoardLayout {
+    /// Issues under their epic, with a progress bar per epic (the default).
+    #[default]
+    Epics,
+    /// One column per status.
+    Kanban,
+}
 
 /// Selection, folds, filter and whether the full-screen detail is open.
 #[derive(Debug, Clone)]
 pub struct State {
     /// Index into the visible rows (headers included); clamped when read.
     pub selected: usize,
+    /// The layout `b` switched to.
+    pub layout: BoardLayout,
+    /// Kanban cursor: the column (index into [`COLUMNS`]) and the card in it; both clamped when read.
+    col: usize,
+    card: usize,
+    /// The done column shows all its cards: a selection reached one beyond the newest [`DONE_CAP`].
+    done_open: bool,
     /// The detail of the selected issue is wanted (the event loop loads it: `App::detail_wanted`).
     pub detail: bool,
     /// The detail fills the whole area (Enter); Esc comes back.
@@ -55,6 +92,10 @@ impl Default for State {
     fn default() -> State {
         State {
             selected: 0,
+            layout: BoardLayout::default(),
+            col: 0,
+            card: 0,
+            done_open: false,
             detail: true,
             full: false,
             filter: String::new(),
@@ -90,13 +131,15 @@ pub const BINDINGS: &[Binding] = &[
     ),
     b(
         "h / l",
-        "fold epic",
-        "fold / unfold the epic the selection is in",
+        "fold or column",
+        "fold / unfold the epic the selection is in\n(kanban: move to the next column)",
         Group::Board,
         BOARD,
         NORMAL,
         Slot::Hint,
     ),
+    // Not a footer hint: the first line of the Board already says `/ filter`, and the footer has room
+    // for five contextual hints only.
     b(
         "/",
         "filter",
@@ -104,7 +147,7 @@ pub const BINDINGS: &[Binding] = &[
         Group::Board,
         BOARD,
         NORMAL,
-        Slot::Hint,
+        Slot::None,
     ),
     b(
         "s",
@@ -128,6 +171,15 @@ pub const BINDINGS: &[Binding] = &[
         "Enter",
         "full details",
         "full details of the selected issue\n(Esc comes back)",
+        Group::Board,
+        BOARD,
+        NORMAL,
+        Slot::Hint,
+    ),
+    b(
+        "b",
+        "layout",
+        "switch between the epic list\nand a kanban with a column per status",
         Group::Board,
         BOARD,
         NORMAL,
@@ -358,6 +410,69 @@ impl<'a> Listing<'a> {
     }
 }
 
+/// The kanban: the cards of every [`COLUMNS`] status that match the filter. Epics and cancelled issues are
+/// not cards. A column runs oldest id first, `done` newest first and capped at [`DONE_CAP`].
+struct Kanban<'a> {
+    columns: Vec<Vec<&'a Issue>>,
+    /// Done cards left out by the cap.
+    capped: usize,
+}
+
+impl<'a> Kanban<'a> {
+    fn build(snap: &'a Snapshot, state: &State) -> Kanban<'a> {
+        let needle = state.filter.trim().to_lowercase();
+        let filtering = !needle.is_empty();
+        let mut columns: Vec<Vec<&Issue>> = vec![Vec::new(); COLUMNS.len()];
+        for i in snap
+            .issues
+            .iter()
+            .filter(|i| i.kind != IssueType::Epic && i.status != Status::Cancelled)
+            .filter(|i| !filtering || issue_hit(i, &needle))
+        {
+            if let Some(c) = COLUMNS.iter().position(|s| *s == i.status) {
+                columns[c].push(i);
+            }
+        }
+        for cards in &mut columns {
+            cards.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        columns[DONE_COL].reverse();
+        let mut capped = 0;
+        // a filter shows its matches wherever they are, like it does in the epic list
+        if !filtering && !state.done_open && columns[DONE_COL].len() > DONE_CAP {
+            capped = columns[DONE_COL].len() - DONE_CAP;
+            columns[DONE_COL].truncate(DONE_CAP);
+        }
+        Kanban { columns, capped }
+    }
+
+    /// The `(column, card)` the cursor rests on: an empty column hands it to the nearest one with cards
+    /// (to the right first); `None` when there is no card at all.
+    fn cursor(&self, state: &State) -> Option<(usize, usize)> {
+        let col = state.col.min(COLUMNS.len() - 1);
+        let col = (col..COLUMNS.len())
+            .chain((0..col).rev())
+            .find(|c| !self.columns[*c].is_empty())?;
+        Some((col, state.card.min(self.columns[col].len() - 1)))
+    }
+
+    fn id_at(&self, (col, card): (usize, usize)) -> IssueId {
+        self.columns[col][card].id.clone()
+    }
+
+    fn position(&self, id: &IssueId) -> Option<(usize, usize)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .find_map(|(c, cards)| cards.iter().position(|i| &i.id == id).map(|card| (c, card)))
+    }
+
+    /// Cards on the board, the capped ones not counted.
+    fn total(&self) -> usize {
+        self.columns.iter().map(Vec::len).sum()
+    }
+}
+
 /// Issues in board order: group by group, as listed (folds and the filter do not apply). Epics are
 /// headers, not issues, and cancelled issues are not listed.
 #[cfg(test)]
@@ -379,14 +494,39 @@ pub fn selected(snap: &Snapshot, state: &State) -> usize {
         .min(Listing::build(snap, state).rows.len().saturating_sub(1))
 }
 
-/// The issue the selection points at; an epic header stands for its epic, `No epic` for nothing.
+/// The issue the selection points at; in the epic list a header stands for its epic and `No epic` for
+/// nothing, in the kanban only a card is selected.
 pub fn selected_issue(snap: &Snapshot, state: &State) -> Option<IssueId> {
-    let listing = Listing::build(snap, state);
-    listing.id_at(state.selected.min(listing.rows.len().saturating_sub(1)))
+    match state.layout {
+        BoardLayout::Epics => {
+            let listing = Listing::build(snap, state);
+            listing.id_at(state.selected.min(listing.rows.len().saturating_sub(1)))
+        }
+        BoardLayout::Kanban => {
+            let kanban = Kanban::build(snap, state);
+            kanban.cursor(state).map(|at| kanban.id_at(at))
+        }
+    }
 }
 
-/// Moves the selection to `id`, opening its group (and dropping a filter that hides it). It stays where
-/// it was when the Board does not list `id`.
+/// Points the kanban cursor at `id`. The done column opens up when the card is older than its cap; the
+/// cursor stays where it was when the kanban has no card `id` (an epic, a cancelled issue).
+fn point_kanban(state: &mut State, snap: &Snapshot, id: &IssueId) {
+    if Kanban::build(snap, state).position(id).is_none() {
+        state.done_open = true;
+        if Kanban::build(snap, state).position(id).is_none() {
+            state.done_open = false;
+            return;
+        }
+    }
+    if let Some((col, card)) = Kanban::build(snap, state).position(id) {
+        state.col = col;
+        state.card = card;
+    }
+}
+
+/// Moves the selection to `id` in both layouts, opening its group (and dropping a filter that hides it).
+/// It stays where it was when the Board does not list `id`.
 pub fn select(state: &mut State, snap: &Snapshot, id: &IssueId) {
     state.full = false;
     for g in groups(snap) {
@@ -403,6 +543,7 @@ pub fn select(state: &mut State, snap: &Snapshot, id: &IssueId) {
     if let Some(at) = at {
         state.selected = at;
     }
+    point_kanban(state, snap, id);
 }
 
 /// `asking` for a blocked run, `merge failed` for a failed or blocked merge item, else the status.
@@ -456,9 +597,16 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
 }
 
 fn list_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
-    let listing_rows = Listing::build(snap, state).rows.len();
-    if let Some(i) = move_selection(&key, state.selected, listing_rows) {
-        state.selected = i;
+    let moved = match state.layout {
+        BoardLayout::Epics => {
+            let listing_rows = Listing::build(snap, state).rows.len();
+            move_selection(&key, state.selected, listing_rows)
+                .map(|i| state.selected = i)
+                .is_some()
+        }
+        BoardLayout::Kanban => kanban_move(&key, snap, state),
+    };
+    if moved {
         return Action::None;
     }
     let sel = selected_issue(snap, state);
@@ -488,8 +636,13 @@ fn list_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
             state.full = false;
             Action::None
         }
+        // in the kanban `kanban_move` took h and l above
         (KeyCode::Char('h'), _) => fold(snap, state, true),
         (KeyCode::Char('l'), _) => fold(snap, state, false),
+        (KeyCode::Char('b'), _) => {
+            toggle_layout(snap, state);
+            Action::None
+        }
         (KeyCode::Char('s'), Some(id)) if epic => {
             Action::Status(format!("{id} is an epic; only ready tasks can be started"))
         }
@@ -513,6 +666,77 @@ fn list_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
         (KeyCode::Char('r'), Some(id)) => reply_input(id),
         (KeyCode::Char('x'), Some(id)) => abort_run(snap, id),
         _ => Action::None,
+    }
+}
+
+/// The navigation keys of the kanban: `j`/`k`/`g`/`G`/arrows inside the column, `h`/`l`/Left/Right to the
+/// next column that has cards (so the cursor always rests on a card; the row is kept when it fits).
+/// Returns whether `key` navigates.
+fn kanban_move(key: &KeyEvent, snap: &Snapshot, state: &mut State) -> bool {
+    let kanban = Kanban::build(snap, state);
+    let step: isize = match key.code {
+        KeyCode::Char('h') | KeyCode::Left => -1,
+        KeyCode::Char('l') | KeyCode::Right => 1,
+        _ => 0,
+    };
+    let Some((col, card)) = kanban.cursor(state) else {
+        return step != 0 || move_selection(key, 0, 0).is_some();
+    };
+    if step == 0 {
+        return match move_selection(key, card, kanban.columns[col].len()) {
+            Some(at) => {
+                state.col = col;
+                state.card = at;
+                true
+            }
+            None => false,
+        };
+    }
+    let mut next = col as isize + step;
+    while let Some(cards) = usize::try_from(next).ok().and_then(|c| kanban.columns.get(c)) {
+        if !cards.is_empty() {
+            state.col = next as usize;
+            state.card = card.min(cards.len() - 1);
+            break;
+        }
+        next += step;
+    }
+    true
+}
+
+/// `b`: the other layout, with the selected issue still selected. In the epic list an epic header
+/// stands for its first card.
+fn toggle_layout(snap: &Snapshot, state: &mut State) {
+    let keep = selected_issue(snap, state);
+    state.done_open = false;
+    match state.layout {
+        BoardLayout::Epics => {
+            state.layout = BoardLayout::Kanban;
+            let kanban = Kanban::build(snap, state);
+            let card = keep.and_then(|id| match snap.issue(&id) {
+                Some(i) if i.kind == IssueType::Epic => groups(snap)
+                    .into_iter()
+                    .find(|g| g.key().as_ref() == Some(&id))
+                    .and_then(|g| {
+                        g.members
+                            .iter()
+                            .find(|m| kanban.position(&m.id).is_some())
+                            .map(|m| m.id.clone())
+                    }),
+                _ => Some(id),
+            });
+            if let Some(id) = card {
+                point_kanban(state, snap, &id);
+            }
+        }
+        BoardLayout::Kanban => {
+            state.layout = BoardLayout::Epics;
+            if let Some(id) = keep {
+                let full = state.full;
+                select(state, snap, &id);
+                state.full = full;
+            }
+        }
     }
 }
 
@@ -547,7 +771,11 @@ fn clear_filter(snap: &Snapshot, state: &mut State) {
     state.typing = false;
     match keep {
         Some(id) => select(state, snap, &id),
-        None => state.selected = 0,
+        None => {
+            state.selected = 0;
+            state.col = 0;
+            state.card = 0;
+        }
     }
 }
 
@@ -577,6 +805,12 @@ fn type_key(key: KeyEvent, snap: &Snapshot, state: &mut State) {
 
 /// After the filter text changed: the first match is selected (the top again once the filter is empty).
 fn retarget(snap: &Snapshot, state: &mut State) {
+    if state.layout == BoardLayout::Kanban {
+        let kanban = Kanban::build(snap, state);
+        state.col = kanban.columns.iter().position(|c| !c.is_empty()).unwrap_or(0);
+        state.card = 0;
+        return;
+    }
     let listing = Listing::build(snap, state);
     state.selected = if state.filter.trim().is_empty() {
         0
@@ -596,6 +830,14 @@ fn retarget(snap: &Snapshot, state: &mut State) {
 pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, theme: &Theme) {
     let [top, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     frame.render_widget(Paragraph::new(counts_line(snap, state, theme)), top);
+    match state.layout {
+        BoardLayout::Epics => render_epics(frame, rest, snap, state, theme),
+        BoardLayout::Kanban => render_kanban(frame, rest, snap, state, theme),
+    }
+}
+
+/// The epic list, with the detail panel next to it from [`PANEL_MIN_WIDTH`] columns.
+fn render_epics(frame: &mut Frame, rest: Rect, snap: &Snapshot, state: &State, theme: &Theme) {
     let listing = Listing::build(snap, state);
     let at = state.selected.min(listing.rows.len().saturating_sub(1));
     let id = listing.id_at(at);
@@ -610,6 +852,175 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
     } else {
         render_list(frame, rest, snap, &listing, at, theme);
     }
+}
+
+/// The kanban, with the same detail panel (and the same full-screen detail) as the epic list.
+fn render_kanban(frame: &mut Frame, rest: Rect, snap: &Snapshot, state: &State, theme: &Theme) {
+    let kanban = Kanban::build(snap, state);
+    let cursor = kanban.cursor(state);
+    let id = cursor.map(|at| kanban.id_at(at));
+    if state.full && id.is_some() {
+        render_detail(frame, rest, snap, id.as_ref(), true, theme);
+        return;
+    }
+    if rest.width >= PANEL_MIN_WIDTH && id.is_some() {
+        let [board, panel] =
+            Layout::horizontal([Constraint::Percentage(KANBAN_SHARE), Constraint::Fill(1)]).areas(rest);
+        render_columns(frame, board, snap, state, &kanban, theme);
+        render_detail(frame, panel, snap, id.as_ref(), false, theme);
+    } else {
+        render_columns(frame, rest, snap, state, &kanban, theme);
+    }
+}
+
+/// `area` cut into one rectangle per column, a blank column between them; the remainder goes to the
+/// leftmost columns.
+fn column_rects(area: Rect) -> Vec<Rect> {
+    let n = COLUMNS.len() as u16;
+    let usable = area.width.saturating_sub(n - 1);
+    let (each, extra) = (usable / n, usable % n);
+    let mut x = area.x;
+    (0..n)
+        .map(|c| {
+            let width = each + u16::from(c < extra);
+            let rect = Rect::new(x, area.y, width, area.height);
+            x += width + 1;
+            rect
+        })
+        .collect()
+}
+
+/// `in-progress 3` when it fits, else the status alone (cut with `…` when even that does not fit).
+fn column_title(status: Status, count: usize, width: usize) -> String {
+    let full = format!("{status} {count}");
+    if text_width(&full) <= width {
+        full
+    } else {
+        trunc(&status.to_string(), width)
+    }
+}
+
+fn render_columns(
+    frame: &mut Frame,
+    area: Rect,
+    snap: &Snapshot,
+    state: &State,
+    kanban: &Kanban<'_>,
+    theme: &Theme,
+) {
+    let cursor = kanban.cursor(state);
+    for (c, rect) in column_rects(area).into_iter().enumerate() {
+        let width = rect.width as usize;
+        let count = kanban.columns[c].len() + if c == DONE_COL { kanban.capped } else { 0 };
+        let mut header = Line::styled(fit(&column_title(COLUMNS[c], count, width), width), theme.bold());
+        if cursor.is_some_and(|(col, _)| col == c) {
+            header = header.style(theme.bold().patch(theme.selected()));
+        }
+        let selected = cursor.and_then(|(col, card)| (col == c).then_some(card));
+        let mut lines = vec![header];
+        lines.extend(column_body(
+            snap,
+            &kanban.columns[c],
+            if c == DONE_COL { kanban.capped } else { 0 },
+            selected,
+            rect.height.saturating_sub(1) as usize,
+            width,
+            theme,
+        ));
+        frame.render_widget(Paragraph::new(lines), rect);
+    }
+    if kanban.total() == 0 && area.height > 2 {
+        let text = if state.filter.trim().is_empty() {
+            "No issues yet. Create one with `asf issue create`."
+        } else {
+            "Nothing matches the filter. Press Esc to clear it."
+        };
+        let line = Line::styled(
+            format!(" {}", trunc(text, (area.width as usize).saturating_sub(2))),
+            theme.dim(),
+        );
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x, area.y + 2, area.width, 1));
+    }
+}
+
+/// The lines under a column header, `height` lines at most. When the cards do not all fit, the window
+/// scrolls just far enough to show the selected card, `↑ N` stands for the cards above it and `+K more`
+/// for those below it (and for the `capped` done cards that are not listed at all).
+fn column_body(
+    snap: &Snapshot,
+    cards: &[&Issue],
+    capped: usize,
+    selected: Option<usize>,
+    height: usize,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let all_fit = capped == 0 && cards.len() <= height / CARD_H;
+    let page = if all_fit {
+        cards.len()
+    } else {
+        (height.saturating_sub(2) / CARD_H).max(1)
+    };
+    let first = if all_fit {
+        0
+    } else {
+        selected.map_or(0, |s| (s + 1).saturating_sub(page))
+    };
+    let shown = &cards[first.min(cards.len())..(first + page).min(cards.len())];
+    let mut lines = Vec::new();
+    if first > 0 {
+        lines.push(Line::styled(format!("↑ {first}"), theme.dim()));
+    }
+    for (n, issue) in shown.iter().enumerate() {
+        lines.extend(card_lines(snap, issue, selected == Some(first + n), width, theme));
+        lines.push(Line::raw(""));
+    }
+    let below = cards.len() - (first + shown.len()).min(cards.len()) + capped;
+    if below > 0 {
+        lines.push(Line::styled(format!("+{below} more"), theme.dim()));
+    }
+    lines
+}
+
+/// A card: the status symbol and id, then the title on two lines (cut with `…`). The selected card is
+/// highlighted across all three lines and marked `▸`.
+fn card_lines(
+    snap: &Snapshot,
+    issue: &Issue,
+    selected: bool,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mark = issue_mark(snap, issue);
+    let text = width.saturating_sub(1).max(1);
+    let wrapped = wrap_text(&issue.title, text);
+    let second = if wrapped.len() > 2 {
+        trunc(&wrapped[1..].join(" "), text)
+    } else {
+        wrapped.get(1).cloned().unwrap_or_default()
+    };
+    let title_style = if issue.status == Status::Done {
+        theme.dim()
+    } else {
+        Style::default()
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw(if selected { "▸" } else { " " }),
+            Span::styled(mark.glyph(), theme.mark(mark)),
+            Span::raw(" "),
+            Span::styled(trunc(issue.id.as_str(), width.saturating_sub(3)), theme.bold()),
+        ]),
+        Line::styled(
+            format!(" {}", trunc(wrapped.first().map_or("", String::as_str), text)),
+            title_style,
+        ),
+        Line::styled(format!(" {second}"), title_style),
+    ];
+    if selected {
+        lines = lines.into_iter().map(|l| l.style(theme.selected())).collect();
+    }
+    lines
 }
 
 /// `backlog 5 · ready 0 · ...     / filter`: tasks and reviews per status (epics are headers and not

@@ -1013,29 +1013,543 @@ fn a_long_list_scrolls_to_keep_the_selection_on_screen() {
 
 #[test]
 fn the_footer_names_the_keys_of_the_board_and_the_help_page_lists_them() {
-    let footer = footer_line(&board_app(round4()), 120);
-    for hint in [
-        "h / l fold epic",
-        "/ filter",
-        "s start",
-        "a answer",
-        "Enter full details",
-        "? help  q quit",
-    ] {
-        assert!(footer.contains(hint), "{hint:?} in {footer:?}");
+    for width in [100, 120] {
+        let footer = footer_line(&board_app(round4()), width);
+        for hint in [
+            "h / l fold or column",
+            "s start",
+            "a answer",
+            "Enter full details",
+            "b layout",
+            "? help  q quit",
+        ] {
+            assert!(footer.contains(hint), "{width}: {hint:?} in {footer:?}");
+        }
+        // `/ filter` is not in the footer: the first line of the Board says it
+        let top = line_with(&render_to_text(&board_app(round4()), width, 30), "/ filter");
+        assert!(top.contains("backlog 5"), "{top:?}");
     }
     assert!(footer_hints(View::Board, ModeKind::Normal).len() <= 7);
     let mut a = board_app(round4());
     a.handle_key(key('?'));
     let t = render_to_text(&a, 120, 60);
-    for key in ["h / l", "/", "Enter"] {
+    for key in ["h / l", "/", "Enter", "b"] {
         assert!(t.contains(key), "{key:?} on the help page:\n{t}");
     }
     assert!(t.contains("fold") && t.contains("filter"), "{t}");
+    assert!(
+        t.contains("switch between the epic list") && t.contains("a kanban with a column per status"),
+        "{t}"
+    );
+    assert!(t.contains("kanban: move to the next column"), "{t}");
     let keys: Vec<&str> = board::BINDINGS.iter().map(|b| b.key).collect();
-    for k in ["h / l", "/", "s", "m", "a", "f", "Enter"] {
+    for k in ["h / l", "/", "s", "m", "a", "f", "Enter", "b"] {
         assert!(keys.contains(&k), "{k:?} in {keys:?}");
     }
+}
+
+// ---- the kanban layout -------------------------------------------------------------------------------
+
+/// An app on the Board in the kanban layout with the mockup's data and `select` selected.
+fn kanban_on(select: &str) -> App {
+    let mut a = on(select);
+    a.handle_key(key('b'));
+    assert_eq!(a.board.layout, board::BoardLayout::Kanban);
+    a
+}
+
+/// Whether a card of `i` is on screen (a status symbol, a blank, the id; the selected one has `▸` before).
+fn has_card(text: &str, i: &str) -> bool {
+    text.lines().any(|l| {
+        ["●", "■", "◆", "✓", "○"]
+            .iter()
+            .any(|g| l.contains(&format!("{g} {i}")))
+    })
+}
+
+#[test]
+fn the_default_layout_is_the_epic_list_and_b_switches_to_the_kanban_and_back() {
+    let mut a = board_app(round4());
+    assert_eq!(a.board.layout, board::BoardLayout::Epics);
+    for width in [100, 120] {
+        let t = render_to_text(&a, width, 30);
+        assert!(t.contains("▾ asf-23") && t.contains("No epic"), "{width}:\n{t}");
+    }
+    assert_eq!(a.handle_key(key('b')), Action::LoadDetail(id("asf-24")));
+    assert_eq!(a.board.layout, board::BoardLayout::Kanban);
+    for width in [100, 120] {
+        let t = render_to_text(&a, width, 30);
+        assert!(!t.contains("▾ asf-23") && !t.contains("No epic"), "{width}:\n{t}");
+        assert!(t.contains("in-review") && t.contains("blocked"), "{width}:\n{t}");
+    }
+    a.handle_key(key('b'));
+    assert_eq!(a.board.layout, board::BoardLayout::Epics);
+    assert!(render_to_text(&a, 100, 30).contains("▾ asf-23"));
+}
+
+#[test]
+fn the_kanban_has_a_column_per_status_with_its_count_and_never_a_card_for_an_epic() {
+    let a = kanban_on("asf-27");
+    let t = render_to_text(&a, 100, 30);
+    let header = line_with(&t, "blocked 0");
+    for want in [
+        "backlog 5",
+        "ready 1",
+        "in-progress 3",
+        "blocked 0",
+        "in-review 0",
+        "validating 1",
+        "done 4",
+    ] {
+        assert!(header.contains(want), "{want:?} in {header:?}");
+    }
+    let at = |w: &str| header.find(w).unwrap();
+    assert!(
+        at("backlog") < at("ready")
+            && at("ready") < at("in-progress")
+            && at("in-progress") < at("blocked")
+            && at("blocked") < at("in-review")
+            && at("in-review") < at("validating")
+            && at("validating") < at("done"),
+        "{header:?}"
+    );
+    // tasks and reviews are cards, epics are not (they are neither cards nor counted)
+    for card in [
+        "asf-24", "asf-25", "asf-26", "asf-27", "asf-28", "asf-29", "asf-30", "asf-90",
+    ] {
+        assert!(has_card(&t, card), "{card}:\n{t}");
+    }
+    for epic in ["asf-23", "asf-15", "asf-10"] {
+        assert!(!t.contains(epic), "{epic} is an epic:\n{t}");
+    }
+    // cancelled issues are not cards either
+    let mut s = round4();
+    s.issues.push(issue("asf-94", "Dropped idea", Status::Cancelled));
+    assert!(!render_to_text(&board_app(s), 100, 30).contains("asf-94"));
+}
+
+#[test]
+fn a_card_shows_the_symbol_the_id_and_the_title_cut_with_an_ellipsis() {
+    let mut s = round4();
+    s.issues.iter_mut().find(|i| i.id == id("asf-26")).unwrap().title =
+        "A very long title that runs on and on about everything a reader may want to know".into();
+    let mut a = board_app(s);
+    a.handle_key(key('b'));
+    let t = render_to_text(&a, 100, 30);
+    assert!(has_card(&t, "asf-26"), "{t}");
+    // the id line is followed by two lines of the title; the rest is cut
+    let at = t.lines().position(|l| l.contains("asf-26")).unwrap();
+    let [first, second]: [String; 2] = [1, 2].map(|n| t.lines().nth(at + n).unwrap().to_string());
+    assert!(first.contains("A very long"), "{first:?}");
+    assert!(second.contains('…'), "{second:?}");
+    // symbols and ids are styled like the rows of the epic list
+    assert_eq!(cell_style(&a, "asf-29", "●").0, Color::Green);
+    assert_eq!(cell_style(&a, "asf-27", "■").0, Color::Red);
+    assert_eq!(cell_style(&a, "asf-28", "◆").0, Color::Yellow);
+    assert!(cell_style(&a, "asf-29", "asf-29").1.contains(Modifier::BOLD));
+}
+
+#[test]
+fn the_selected_issue_stays_selected_when_the_layout_changes() {
+    for select in ["asf-27", "asf-90", "asf-33", "asf-28"] {
+        let mut a = on(select);
+        a.handle_key(key('b'));
+        assert_eq!(a.selected_issue(), Some(id(select)), "{select} in the kanban");
+        let t = render_to_text(&a, 100, 30);
+        assert!(t.contains('▸') && has_card(&t, select), "{t}");
+        a.handle_key(key('b'));
+        assert_eq!(a.selected_issue(), Some(id(select)), "{select} back in the list");
+        let t = render_to_text(&a, 100, 30);
+        assert!(row(&t, select).contains('▸'), "{}", row(&t, select));
+    }
+    // a card picked in the kanban opens its epic in the list: asf-16 sits in a finished, folded epic
+    let mut a = kanban_on("asf-27");
+    a.handle_key(key('l'));
+    a.handle_key(key('l'));
+    a.handle_key(key('j'));
+    a.handle_key(key('j'));
+    assert_eq!(a.selected_issue(), Some(id("asf-16")), "done runs 24, 17, 16, 11");
+    a.handle_key(key('b'));
+    assert_eq!(a.board.layout, board::BoardLayout::Epics);
+    assert_eq!(a.selected_issue(), Some(id("asf-16")));
+    let t = render_to_text(&a, 100, 30);
+    assert!(t.contains("▾ asf-15") && row(&t, "asf-16").contains('▸'), "{t}");
+}
+
+#[test]
+fn an_epic_header_stands_for_its_first_card_and_the_no_epic_header_keeps_the_cursor() {
+    let mut a = board_app(round4());
+    assert_eq!(a.selected_issue(), Some(id("asf-23")), "the first header");
+    a.handle_key(key('b'));
+    assert_eq!(
+        a.selected_issue(),
+        Some(id("asf-24")),
+        "its first child in row order"
+    );
+    // the No epic header is nothing: the kanban keeps its cursor
+    let mut n = board_app(round4());
+    n.handle_key(key('G'));
+    n.handle_key(key('k'));
+    assert_eq!(n.selected_issue(), None);
+    n.handle_key(key('b'));
+    assert!(n.selected_issue().is_some(), "the kanban always rests on a card");
+}
+
+#[test]
+fn toggling_asks_for_the_detail_only_when_the_selection_changes() {
+    let snap = round4();
+    let mut st = board::State::default();
+    assert_eq!(
+        board::handle_key(key('b'), &snap, &mut st),
+        Action::LoadDetail(id("asf-24")),
+        "the epic header gave way to its first card"
+    );
+    assert_eq!(board::handle_key(key('b'), &snap, &mut st), Action::None);
+    let mut a = on("asf-27");
+    assert_eq!(a.handle_key(key('b')), Action::None);
+}
+
+#[test]
+fn j_and_k_move_inside_a_column_and_h_and_l_between_columns_skipping_empty_ones() {
+    let mut a = kanban_on("asf-25");
+    let go = |a: &mut App, k: KeyEvent| {
+        a.handle_key(k);
+        a.selected_issue().unwrap().to_string()
+    };
+    // in-progress holds asf-25, 27, 29
+    assert_eq!(go(&mut a, key('j')), "asf-27");
+    assert_eq!(go(&mut a, key('j')), "asf-29");
+    assert_eq!(go(&mut a, key('j')), "asf-29", "clamped at the last card");
+    assert_eq!(go(&mut a, code(KeyCode::Up)), "asf-27");
+    assert_eq!(go(&mut a, key('k')), "asf-25");
+    assert_eq!(go(&mut a, key('k')), "asf-25", "clamped at the first card");
+    assert_eq!(go(&mut a, key('G')), "asf-29");
+    assert_eq!(go(&mut a, key('g')), "asf-25");
+    // blocked and in-review are empty: l goes to validating, then done
+    assert_eq!(go(&mut a, key('l')), "asf-28");
+    assert_eq!(
+        go(&mut a, code(KeyCode::Right)),
+        "asf-24",
+        "done: the newest card first"
+    );
+    assert_eq!(go(&mut a, key('l')), "asf-24", "no column to the right");
+    assert_eq!(go(&mut a, key('h')), "asf-28");
+    assert_eq!(go(&mut a, key('h')), "asf-25");
+    assert_eq!(go(&mut a, code(KeyCode::Left)), "asf-90", "ready");
+    assert_eq!(go(&mut a, key('h')), "asf-26", "backlog");
+    assert_eq!(go(&mut a, key('h')), "asf-26", "no column to the left");
+    // the row is kept when the next column has it
+    assert_eq!(go(&mut a, key('j')), "asf-30");
+    assert_eq!(go(&mut a, key('l')), "asf-90", "ready has one card only");
+    // Home and End are g and G
+    a.handle_key(key('h'));
+    assert_eq!(go(&mut a, code(KeyCode::End)), "asf-33");
+    assert_eq!(go(&mut a, code(KeyCode::Home)), "asf-26");
+}
+
+#[test]
+fn moving_in_the_kanban_asks_for_the_detail_of_the_card_it_lands_on() {
+    let snap = round4();
+    let mut st = board::State::default();
+    board::select(&mut st, &snap, &id("asf-25"));
+    board::handle_key(key('b'), &snap, &mut st);
+    assert_eq!(
+        board::handle_key(key('j'), &snap, &mut st),
+        Action::LoadDetail(id("asf-27"))
+    );
+    assert_eq!(
+        board::handle_key(key('l'), &snap, &mut st),
+        Action::LoadDetail(id("asf-28"))
+    );
+    assert_eq!(
+        board::handle_key(key('l'), &snap, &mut st),
+        Action::LoadDetail(id("asf-24"))
+    );
+    assert_eq!(
+        board::handle_key(key('l'), &snap, &mut st),
+        Action::None,
+        "already there"
+    );
+}
+
+#[test]
+fn the_selected_card_has_a_marker_and_a_highlight_and_reverse_video_without_colours() {
+    let a = kanban_on("asf-27");
+    let t = render_to_text(&a, 100, 30);
+    let y = t
+        .lines()
+        .position(|l| l.contains("▸■ asf-27"))
+        .expect("the marker") as u16;
+    let x = t
+        .lines()
+        .nth(y as usize)
+        .unwrap()
+        .chars()
+        .position(|c| c == '▸')
+        .unwrap() as u16;
+    assert_eq!(t.matches('▸').count(), 1, "one selected card:\n{t}");
+    let buf = render_to_buffer(&a, 100, 30);
+    for line in 0..3 {
+        assert_ne!(buf[(x + 3, y + line)].bg, Color::Reset, "line {line} of the card");
+    }
+    assert_eq!(
+        buf[(x + 3, y + 3)].bg,
+        Color::Reset,
+        "the gap below the card is not"
+    );
+    let mut plain = kanban_on("asf-27");
+    plain.theme = Theme::new(false);
+    let buf = render_to_buffer(&plain, 100, 30);
+    assert!(buf[(x + 3, y + 1)].modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
+fn the_kanban_fits_the_smallest_terminal_and_cuts_titles() {
+    for (w, h) in [(80u16, 20u16), (100, 24), (120, 20), (160, 40)] {
+        let mut s = round4();
+        s.issues.iter_mut().find(|i| i.id == id("asf-26")).unwrap().title =
+            "A very long title that runs on and on about everything a reader may want to know".repeat(2);
+        let mut a = board_app(s);
+        a.handle_key(key('b'));
+        let t = render_to_text(&a, w, h);
+        assert_eq!(t.lines().count(), h as usize, "{w}x{h}");
+        for l in t.lines() {
+            assert!(text_width(l) <= w as usize, "{w}x{h}: {l:?}");
+        }
+        assert!(t.contains('…'), "{w}x{h}:\n{t}");
+        let mut full = board_app(round4());
+        full.handle_key(key('b'));
+        full.handle_key(code(KeyCode::Enter));
+        render_to_text(&full, w, h);
+    }
+}
+
+#[test]
+fn the_kanban_keeps_the_detail_panel_at_120_columns_and_not_below() {
+    let mut a = kanban_on("asf-27");
+    let t = render_to_text(&a, 120, 30);
+    for needle in [
+        "asf-27 · task · P2",
+        "Depends on",
+        "Scope",
+        "Acceptance",
+        "☐ works",
+        "Latest",
+    ] {
+        assert!(t.contains(needle), "{needle:?}:\n{t}");
+    }
+    assert!(t.contains('┌') && t.contains('┘'));
+    assert!(
+        has_card(&t, "asf-27") && has_card(&t, "asf-29"),
+        "the columns are still there:\n{t}"
+    );
+    // below 120 there is no panel; Enter opens the whole detail, Esc comes back to the kanban
+    for width in [100, 119] {
+        let t = render_to_text(&a, width, 30);
+        assert!(!t.contains("Acceptance"), "no panel at {width}:\n{t}");
+    }
+    assert_eq!(
+        a.handle_key(code(KeyCode::Enter)),
+        Action::LoadDetail(id("asf-27"))
+    );
+    let t = render_to_text(&a, 100, 30);
+    assert!(t.contains("Acceptance") && t.contains("Esc"), "{t}");
+    assert!(!has_card(&t, "asf-29"), "the columns are gone:\n{t}");
+    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
+    let t = render_to_text(&a, 100, 30);
+    assert!(has_card(&t, "asf-29") && !t.contains("Acceptance"), "{t}");
+    assert_eq!(a.board.layout, board::BoardLayout::Kanban);
+}
+
+#[test]
+fn the_action_keys_act_on_the_selected_card_like_in_the_list() {
+    let mut a = kanban_on("asf-90");
+    assert_eq!(a.handle_key(key('s')), Action::Start(id("asf-90")));
+    assert_eq!(a.handle_key(key('m')), Action::Enqueue(id("asf-90")));
+    assert_eq!(a.handle_key(key('f')), Action::Focus(id("asf-90")));
+    let mut a = kanban_on("asf-29");
+    assert_eq!(a.handle_key(key('s')), Action::None);
+    assert!(
+        a.status.as_deref().unwrap_or("").contains("ready"),
+        "{:?}",
+        a.status
+    );
+    assert_eq!(a.handle_key(key('m')), Action::Enqueue(id("asf-29")));
+    assert_eq!(a.handle_key(key('f')), Action::Focus(id("asf-29")));
+    assert_eq!(a.handle_key(key('a')), Action::None);
+    assert!(
+        a.status.as_deref().unwrap_or("").contains("no blocked run"),
+        "{:?}",
+        a.status
+    );
+    assert!(matches!(a.handle_key(key('x')), Action::None));
+    assert!(matches!(a.mode(), Mode::Confirm { .. }));
+    let mut a = kanban_on("asf-27");
+    assert_eq!(a.handle_key(key('a')), Action::Peek(id("asf-27")));
+    assert!(matches!(a.mode(), Mode::Answer { .. }));
+}
+
+#[test]
+fn the_filter_works_in_the_kanban_and_keeps_the_selection_when_it_is_cleared() {
+    let mut a = kanban_on("asf-27");
+    a.handle_key(key('/'));
+    press(&mut a, &['v', 'a', 'l', 'i', 'd']);
+    let t = render_to_text(&a, 100, 30);
+    assert!(
+        t.contains("/ valid") && has_card(&t, "asf-28") && !has_card(&t, "asf-27"),
+        "{t}"
+    );
+    assert_eq!(
+        a.selected_issue(),
+        Some(id("asf-28")),
+        "the first match is selected"
+    );
+    assert!(
+        t.contains("validating 1") && t.contains("backlog 0"),
+        "the columns count the matches:\n{t}"
+    );
+    // `b` is text while typing, not the layout key
+    a.handle_key(key('b'));
+    assert_eq!(a.board.layout, board::BoardLayout::Kanban);
+    assert_eq!(a.board.filter(), "validb");
+    a.handle_key(code(KeyCode::Backspace));
+    a.handle_key(code(KeyCode::Enter));
+    assert!(!a.board.typing());
+    // the filter survives a switch of the layout
+    a.handle_key(key('b'));
+    let t = render_to_text(&a, 100, 30);
+    assert!(t.contains("asf-28") && !t.contains("asf-27"), "{t}");
+    a.handle_key(key('b'));
+    // Esc clears it and asf-28 stays selected
+    a.handle_key(code(KeyCode::Esc));
+    assert!(a.board.filter().is_empty());
+    assert_eq!(a.selected_issue(), Some(id("asf-28")));
+    let t = render_to_text(&a, 100, 30);
+    assert!(has_card(&t, "asf-27") && t.contains("▸◆ asf-28"), "{t}");
+    // nothing matches
+    a.handle_key(key('/'));
+    press(&mut a, &['z', 'z', 'z']);
+    a.handle_key(code(KeyCode::Enter));
+    let t = render_to_text(&a, 100, 30);
+    assert!(t.contains("Nothing matches") && t.contains("blocked 0"), "{t}");
+    assert_eq!(a.selected_issue(), None);
+    assert_eq!(a.handle_key(key('s')), Action::None, "no card, no action");
+}
+
+#[test]
+fn an_empty_kanban_shows_the_columns_and_says_what_to_do() {
+    for width in [100, 120] {
+        let mut a = board_app(Snapshot::default());
+        a.handle_key(key('b'));
+        let t = render_to_text(&a, width, 30);
+        assert!(
+            t.contains("No issues yet. Create one with `asf issue create`."),
+            "{t}"
+        );
+        for column in ["backlog 0", "ready 0", "blocked 0", "validating 0", "done 0"] {
+            assert!(t.contains(column), "{width}: {column}:\n{t}");
+        }
+        assert_eq!(a.selected_issue(), None);
+        for k in ['j', 'k', 'h', 'l', 'g', 'G', 'b', 'b'] {
+            a.handle_key(key(k)); // nothing to move over, and no panic
+        }
+    }
+}
+
+#[test]
+fn the_done_column_shows_the_newest_cards_and_says_how_many_more() {
+    let finished = || {
+        let mut issues: Vec<Issue> = (1..=8)
+            .map(|n| issue(&format!("asf-{n}"), &format!("Finished {n}"), Status::Done))
+            .collect();
+        issues.push(issue("asf-9", "Open work", Status::Backlog));
+        desk(issues)
+    };
+    let mut a = board_app(finished());
+    a.handle_key(key('b'));
+    let t = render_to_text(&a, 100, 30);
+    assert!(t.contains("done 8") && t.contains("+3 more"), "{t}");
+    for newest in ["asf-8", "asf-7", "asf-6", "asf-5", "asf-4"] {
+        assert!(has_card(&t, newest), "{newest}:\n{t}");
+    }
+    for older in ["asf-3", "asf-2", "asf-1"] {
+        assert!(!has_card(&t, older), "{older}:\n{t}");
+    }
+    let order: Vec<usize> = ["asf-8", "asf-7", "asf-6"]
+        .iter()
+        .map(|i| t.lines().position(|l| l.contains(&format!("✓ {i}"))).unwrap())
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "newest first: {order:?}");
+    // the keys stop at the fifth card
+    a.handle_key(key('l'));
+    assert_eq!(a.selected_issue(), Some(id("asf-8")));
+    a.handle_key(key('G'));
+    assert_eq!(a.selected_issue(), Some(id("asf-4")));
+    // a filter lists every match, and a card older than the cap is reached by selecting it
+    a.handle_key(key('/'));
+    press(&mut a, &['d', 'o', 'n', 'e']);
+    let t = render_to_text(&a, 100, 60); // tall enough for all eight cards
+    assert!(!t.contains("more") && has_card(&t, "asf-1"), "{t}");
+    let mut b = board_app(finished());
+    b.handle_key(key('b'));
+    board::select(&mut b.board, &b.snap, &id("asf-1"));
+    assert_eq!(b.selected_issue(), Some(id("asf-1")));
+    let t = render_to_text(&b, 100, 30);
+    assert!(has_card(&t, "asf-1") && !t.contains("+3 more"), "{t}");
+    // switching the layout closes it again
+    b.handle_key(key('b'));
+    b.handle_key(key('b'));
+    assert_eq!(b.selected_issue(), Some(id("asf-1")));
+}
+
+#[test]
+fn a_tall_column_scrolls_to_keep_the_selected_card_on_screen() {
+    let issues: Vec<Issue> = (1..=30)
+        .map(|n| issue(&format!("asf-{n}"), "Card", Status::Backlog))
+        .collect();
+    let mut a = board_app(desk(issues));
+    a.handle_key(key('b'));
+    let top = render_to_text(&a, 100, 24);
+    assert!(top.contains("▸○ asf-1"), "{top}");
+    assert!(top.contains("more") && !top.contains('↑'), "{top}");
+    a.handle_key(key('G'));
+    let t = render_to_text(&a, 100, 24);
+    assert!(
+        t.contains("▸○ asf-30"),
+        "the last card is on screen and selected:\n{t}"
+    );
+    assert!(t.contains('↑') && !t.contains("more"), "{t}");
+    for l in t.lines() {
+        assert!(text_width(l) <= 100, "{l:?}");
+    }
+    a.handle_key(key('g'));
+    assert!(render_to_text(&a, 100, 24).contains("▸○ asf-1"));
+}
+
+#[test]
+fn the_layout_is_remembered_for_the_session_but_the_default_stays_the_epic_list() {
+    let mut a = board_app(round4());
+    a.handle_key(key('b'));
+    // another view and back
+    a.handle_key(key('3'));
+    a.handle_key(key('2'));
+    assert_eq!(a.view, View::Board);
+    assert_eq!(a.board.layout, board::BoardLayout::Kanban);
+    // a fresh snapshot keeps it too
+    a.replace(round4());
+    assert_eq!(a.board.layout, board::BoardLayout::Kanban);
+    // OpenOnBoard from another view selects the card
+    a.handle_key(key('3'));
+    board::select(&mut a.board, &a.snap, &id("asf-33"));
+    a.handle_key(key('2'));
+    assert_eq!(a.selected_issue(), Some(id("asf-33")));
+    // the state a `--once` run starts from is the epic list
+    let fresh = App::new(round4());
+    assert_eq!(fresh.board.layout, board::BoardLayout::Epics);
+    let mut once = App::new(round4());
+    once.view = View::Board;
+    let t = render_to_text(&once, 100, 30);
+    assert!(t.contains("▾ asf-23") && !t.contains("in-review"), "{t}");
 }
 
 #[test]

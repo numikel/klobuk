@@ -303,7 +303,7 @@ fn a_status_set_again_by_a_key_gets_a_fresh_four_seconds() {
 #[test]
 fn a_key_is_inert_in_every_view_the_table_does_not_list_it_for() {
     for view in View::ALL {
-        for c in ['s', 'm', 'f', 'r', 'x', 'a', 'd', 'M', 'v'] {
+        for c in ['s', 'm', 'f', 'r', 'x', 'a', 'd', 'M', 'v', 'b'] {
             let listed = all().any(|b| b.key == c.to_string() && b.applies(view, ModeKind::Normal));
             if listed {
                 continue;
