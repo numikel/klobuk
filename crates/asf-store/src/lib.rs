@@ -772,7 +772,6 @@ impl IssueStore for SqliteStore {
     }
 }
 
-/// The author name whose comments a lane never sees in its own inbox.
 /// A QUESTION that an ANSWER has resolved (`resolved_at` set by `add_comment`) needs nobody any more,
 /// so the inbox does not list it. Other comment types ignore `resolved_at`.
 fn without_resolved_questions(items: Vec<Comment>) -> Vec<Comment> {
@@ -782,6 +781,7 @@ fn without_resolved_questions(items: Vec<Comment>) -> Vec<Comment> {
         .collect()
 }
 
+/// The author name whose comments a lane never sees in its own inbox.
 fn inbox_own_author(lane: &str) -> String {
     if lane == LANE_ORCHESTRATOR {
         LANE_ORCHESTRATOR.to_string()
