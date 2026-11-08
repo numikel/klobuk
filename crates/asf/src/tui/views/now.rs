@@ -319,8 +319,9 @@ pub fn is_overdue(snap: &Snapshot, need: &Need) -> bool {
         kind: wait_kind(&need.source),
         since: need.since.clone(),
         reason: String::new(),
+        key: String::new(),
     }];
-    !due(&waiting, &BTreeMap::new(), now, &cfg).is_empty()
+    !due(&waiting, &BTreeMap::new(), &BTreeMap::new(), now, &cfg).is_empty()
 }
 
 fn title(text: String, theme: &Theme) -> Line<'static> {
