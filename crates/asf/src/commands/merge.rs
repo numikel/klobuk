@@ -194,7 +194,7 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
             }
             process(ctx, next)?
         } else {
-            match poll_review(ctx, next, GateMode::Inline)? {
+            match poll_review(ctx, next, GateMode::Inline, false)? {
                 Some(changed) => changed,
                 None => continue,
             }
@@ -227,15 +227,21 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
 /// reviewer (an approved one is merged on the spot) and, for the GitHub target, looks at every open
 /// pull request. It runs no gates: a merge that lands here only leaves a pending check of the default
 /// branch (see `start_next`).
-pub fn poll(ctx: &Ctx) -> Result<TickResult, AppError> {
+///
+/// With `hold_main` (a check of the default branch is running in the repository root, or has just
+/// come back red) nothing may be merged, because a merge changes the tree that check is testing: a
+/// verdict is still read (the reviewer's slot is freed, `changes` is sent back) but an approved item
+/// stays in `reviewing` for a later tick, and pull requests are not looked at. `tick_all` stops after a
+/// red main in the same way.
+pub fn poll(ctx: &Ctx, hold_main: bool) -> Result<TickResult, AppError> {
     let mut items = Vec::new();
     let queue = ctx.store.merge_queue()?;
     for waiting in queue.iter().filter(|m| m.state == MergeState::Reviewing) {
-        if let Some(changed) = poll_review(ctx, waiting, GateMode::Background)? {
+        if let Some(changed) = poll_review(ctx, waiting, GateMode::Background, hold_main)? {
             items.push(changed);
         }
     }
-    if ctx.config.merge.target == "github" {
+    if ctx.config.merge.target == "github" && !hold_main {
         for open in queue.iter().filter(|m| m.state == MergeState::PrOpen) {
             if let Some(changed) = poll_pr(ctx, open, GateMode::Background)? {
                 items.push(changed);
@@ -1234,7 +1240,12 @@ fn failed_review_starts_in_a_row(ctx: &Ctx, id: &IssueId) -> Result<usize, AppEr
 
 /// One look at an item waiting for its reviewer. `None` when there is no verdict of the current
 /// round yet (nothing is written) or the approved item is parked behind a dirty main.
-fn poll_review(ctx: &Ctx, item: &MergeItem, mode: GateMode) -> Result<Option<MergeItem>, AppError> {
+fn poll_review(
+    ctx: &Ctx,
+    item: &MergeItem,
+    mode: GateMode,
+    park_approved: bool,
+) -> Result<Option<MergeItem>, AppError> {
     let boundary = round_boundary(ctx, &item.issue_id)?;
     let Some((_, verdict)) = verdicts(ctx, &item.issue_id)?
         .into_iter()
@@ -1254,6 +1265,10 @@ fn poll_review(ctx: &Ctx, item: &MergeItem, mode: GateMode) -> Result<Option<Mer
     );
     match verdict {
         Verdict::Approve => {
+            // not merged now, but not lost: the verdict stays in the comments and is read again
+            if park_approved {
+                return Ok(None);
+            }
             let (run, worktree_rel, wt) = locate(ctx, item)?;
             if !wt.is_dir() {
                 return fail(

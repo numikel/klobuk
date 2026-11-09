@@ -276,6 +276,12 @@ impl GateSlot {
         None
     }
 
+    /// Whether the gate run in flight is a check of the default branch. It builds and tests the working
+    /// tree of the repository root, which therefore must not change until it is over.
+    pub fn checks_main(&self) -> bool {
+        matches!(self.running.as_ref().map(|r| &r.job), Some(Job::Main(_)))
+    }
+
     /// The gate run in flight, if any, once its gates are done; frees the slot.
     pub fn take_finished(&mut self) -> Option<Finished> {
         let results = match self.running.as_ref()?.results.try_recv() {

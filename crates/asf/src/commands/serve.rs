@@ -191,7 +191,8 @@ fn tick_background(
     let mut watch = worker.watch_in(GateMode::Background)?;
     transitions.append(&mut watch.transitions);
     watch.transitions = transitions;
-    items.extend(merge::poll(ctx)?.items);
+    // a merge would change the tree that a running check of main is testing (or that just came back red)
+    items.extend(merge::poll(ctx, main_red || slot.checks_main())?.items);
     let done = promote_and_dispatch(ctx, &worker, dispatch)?;
 
     if !main_red {

@@ -884,7 +884,14 @@ impl Gated {
 
 /// A worker that did its job and ran `asf issue finish`; nothing has verified it yet.
 fn finished_worker(repo: &Repo, scope: &str, file: &str) -> String {
-    let id = repo.create_issue(file, &["--ready", "--scope", scope]);
+    finished_worker_with(repo, scope, file, &[])
+}
+
+/// `finished_worker` with more `asf issue create` arguments (a label, say).
+fn finished_worker_with(repo: &Repo, scope: &str, file: &str, extra: &[&str]) -> String {
+    let mut args = vec!["--ready", "--scope", scope];
+    args.extend_from_slice(extra);
+    let id = repo.create_issue(file, &args);
     repo.ok(&["run", "start", &id]);
     let wt = repo.path().join(".worktrees").join(&id);
     commit_in(&wt, file, "x\n");
@@ -908,6 +915,52 @@ fn queued_item(repo: &Repo, scope: &str, file: &str) -> String {
     let res = repo.ok(&["run", "watch", "--once"]);
     assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
     id
+}
+
+/// `queued_item` for an issue that carries the label `risky`, which `[review] on_labels` turns into a review.
+fn risky_queued_item(repo: &Repo, scope: &str, file: &str) -> String {
+    let id = finished_worker_with(repo, scope, file, &["--label", "risky"]);
+    let res = repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    id
+}
+
+fn review_on_label_risky(g: &Gated) {
+    let cfg = g.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("on_labels = []"), "template carries on_labels");
+    std::fs::write(&cfg, s.replacen("on_labels = []", "on_labels = [\"risky\"]", 1)).unwrap();
+    git(g.repo.path(), &["add", ".factory/config.toml"]);
+    git(g.repo.path(), &["commit", "-q", "-m", "review"]);
+}
+
+/// The reviewer's verdict on `issue`: a DECISION authored by the lane of its newest review issue.
+fn review_verdict(g: &Gated, issue: &str, body: &str) {
+    let reviews = g
+        .store()
+        .list_issues(&asf_core::IssueFilter {
+            kind: Some(asf_core::IssueType::Review),
+            parent: Some(issue.parse().unwrap()),
+            ..asf_core::IssueFilter::default()
+        })
+        .unwrap();
+    let rid = reviews.last().expect("a reviewer was started").id.to_string();
+    g.repo.ok(&[
+        "--lane", &rid, "issue", "comment", issue, "--type", "DECISION", "--to", "human", "--body", body,
+    ]);
+}
+
+fn reviewers_running(g: &Gated) -> u64 {
+    g.repo.ok(&["run", "plan"])["reviewers_running"].as_u64().unwrap()
+}
+
+fn main_head(g: &Gated) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "main"])
+        .current_dir(g.repo.path())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn queue_states(g: &Gated) -> Vec<MergeState> {
@@ -978,6 +1031,159 @@ fn a_merge_gate_in_flight_does_not_stop_the_loop() {
         merged,
         "the tick that reaped the result reports the merge: {lines:?}"
     );
+}
+
+#[test]
+fn a_review_verdict_is_read_while_a_gate_run_is_in_flight() {
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    review_on_label_risky(&g);
+    let r = risky_queued_item(&g.repo, "docs/**", "docs/r.md");
+    let b = queued_item(&g.repo, "src/**", "src/b.rs");
+    // `r` goes into review while the gate is open; then the gate closes again for `b`
+    g.release();
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    std::fs::remove_file(&g.release).unwrap();
+    assert_eq!(reviewers_running(&g), 1);
+
+    let mut live = LiveServe::start(&g.repo, &LOOP);
+    assert_eq!(
+        live.first["result"]["gate_run"]["issue"],
+        b.as_str(),
+        "{}",
+        live.first
+    );
+    review_verdict(&g, &r, "approve");
+
+    // the tick that reads the verdict is printed while `b`'s gate is still held
+    let line = live.next_line();
+    let items = line["result"]["merge"]["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|m| m["issue_id"] == r.as_str() && m["state"] == "merged"),
+        "{line}"
+    );
+    assert_eq!(
+        line["result"]["gate_run"]["issue"],
+        b.as_str(),
+        "still in flight: {line}"
+    );
+    assert_eq!(reviewers_running(&g), 0, "the reviewer's slot is free again");
+    assert!(g
+        .event_kinds()
+        .contains(&("merge.merged".to_string(), Some(r.clone()))));
+
+    g.release();
+    live.finish();
+}
+
+#[test]
+fn an_approved_item_is_not_merged_while_main_is_being_checked() {
+    let g = gated(HOLD_GATE, "[\"main\"]", true);
+    review_on_label_risky(&g);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    let r = risky_queued_item(&g.repo, "docs/**", "docs/r.md");
+    // `a` has no review and merges first (the open gate lets its check through); `r` is then rebased
+    // onto that main and enters review, so its approval would fast-forward cleanly
+    g.release();
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    // the inline tick ran that check to its end; owe it again so that the loop has one to hold
+    g.store()
+        .append_event(&NewEvent {
+            kind: "merge.main_check_pending".into(),
+            issue_id: Some(a.parse().unwrap()),
+            run_id: None,
+            actor: Some("orchestrator".into()),
+            payload: serde_json::json!({}),
+        })
+        .unwrap();
+    std::fs::remove_file(&g.release).ok();
+    let before = main_head(&g);
+
+    let live = LiveServe::start(&g.repo, &LOOP);
+    assert_eq!(live.first["result"]["gate_run"]["kind"], "main", "{}", live.first);
+    review_verdict(&g, &r, "approve");
+    std::thread::sleep(Duration::from_secs(3)); // several ticks with the check of main held
+    assert_eq!(
+        main_head(&g),
+        before,
+        "main's tree must not change under its check"
+    );
+    assert_eq!(
+        queue_states(&g),
+        vec![MergeState::Merged, MergeState::Reviewing],
+        "approved, but parked"
+    );
+    assert_eq!(
+        reviewers_running(&g),
+        0,
+        "the verdict was read and the reviewer's slot freed"
+    );
+
+    g.release();
+    let (lines, stderr) = live.finish();
+    assert_eq!(
+        queue_states(&g),
+        vec![MergeState::Merged, MergeState::Merged],
+        "{lines:?}\n{stderr}"
+    );
+    assert_ne!(main_head(&g), before, "merged once the check was over");
+}
+
+#[test]
+fn nothing_is_merged_in_the_tick_that_finds_main_red() {
+    let g = gated(RED_GATE, "[\"main\"]", false);
+    review_on_label_risky(&g);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    let r = risky_queued_item(&g.repo, "docs/**", "docs/r.md");
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    // the operator turns the check of main on, and `a`'s check is owed (as after a stopped serve)
+    let cfg = g.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        s.replace("verify_main_after = false", "verify_main_after = true"),
+    )
+    .unwrap();
+    g.store()
+        .append_event(&NewEvent {
+            kind: "merge.main_check_pending".into(),
+            issue_id: Some(a.parse().unwrap()),
+            run_id: None,
+            actor: Some("orchestrator".into()),
+            payload: serde_json::json!({}),
+        })
+        .unwrap();
+
+    // tick 1 starts the check; the approval arrives before tick 2, which finds main red
+    let mut live = LiveServe::start(&g.repo, &LOOP);
+    assert_eq!(live.first["result"]["gate_run"]["kind"], "main", "{}", live.first);
+    review_verdict(&g, &r, "approve");
+    let red = live.next_line();
+    let items = red["result"]["merge"]["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|m| m["issue_id"] == a.as_str() && !m["last_error"].is_null()),
+        "the tick that finds main red reports it: {red}"
+    );
+    assert!(
+        !items.iter().any(|m| m["issue_id"] == r.as_str()),
+        "and merges nothing on top of it: {red}"
+    );
+    // The approved item is only parked. Whether this serve goes on to merge it in a later tick or
+    // reports `stuck` first depends on timing; the next serve merges it in any case.
+    live.finish();
+    let again = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
+    assert!(matches!(again.status.code(), Some(0 | 3)), "{again:?}");
+    assert_eq!(queue_states(&g)[1], MergeState::Merged, "{again:?}");
 }
 
 #[test]
