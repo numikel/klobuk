@@ -1,5 +1,7 @@
 use asf_core::config::GateWhen;
-use asf_core::config_edit::{editable_keys, fields, set_key, unset_key, ConfigGroup, FieldKind};
+use asf_core::config_edit::{
+    applies, apply_note, editable_keys, fields, set_key, unset_key, Applies, ConfigGroup, FieldKind,
+};
 use asf_core::{Config, ConfigError};
 
 const COMMENTED: &str = "\
@@ -414,5 +416,57 @@ fn unset_output_always_parses() {
         // and set_key can bring it back
         let back = set_key(&out, key, "haiku").unwrap();
         Config::from_toml(&back).unwrap();
+    }
+}
+
+#[test]
+fn a_key_the_serve_loop_reloads_says_it_applies_on_the_next_tick() {
+    // each key is read from `ctx.config`, which `asf serve` replaces at the start of every tick
+    for key in [
+        "worker.model",
+        "worker.budget_usd",
+        "review.model",
+        "review.required",
+        "review.max_rounds",
+        "scheduler.max_parallel",
+        "merge.target",
+        "merge.verify_main_after",
+        "notify.on_new",
+        "notify.after_minutes",
+        "notify.every_minutes",
+    ] {
+        assert_eq!(applies(key), Applies::NextTick, "{key}");
+        assert_eq!(
+            apply_note(key),
+            "a running `asf serve` picks this up on its next tick",
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn a_key_only_asf_plan_reads_promises_nothing_of_serve() {
+    for key in ["planner.model", "planner.budget_usd"] {
+        assert_eq!(applies(key), Applies::NextPlan, "{key}");
+        let note = apply_note(key);
+        assert_eq!(
+            note, "the next `asf plan` uses this; `asf serve` never does",
+            "{key}"
+        );
+        assert!(!note.contains("restart"), "{note}");
+    }
+}
+
+#[test]
+fn a_key_nobody_classified_gets_the_restart_hint() {
+    assert_eq!(applies("repo.prefix"), Applies::Restart);
+    assert_eq!(apply_note("repo.prefix"), "restart `asf serve` to apply");
+    assert_eq!(apply_note("nope"), "restart `asf serve` to apply");
+}
+
+#[test]
+fn every_editable_key_has_a_note() {
+    for (key, _) in editable_keys() {
+        assert!(!apply_note(key).is_empty(), "{key}");
     }
 }

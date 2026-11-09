@@ -115,10 +115,12 @@ fn config_edit_status(
             .map(|r| r.value)
             .unwrap_or_default()
     };
+    // The same sentence `asf config set` prints, so the CLI and this view cannot disagree.
     format!(
-        "{key}: {} -> {} (applies on the next tick)",
+        "{key}: {} -> {} ({})",
         shown(&text),
-        shown(&edited)
+        shown(&edited),
+        asf_core::config_edit::apply_note(key)
     )
 }
 

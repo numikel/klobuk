@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use asf_core::config_edit::{editable_keys, set_key};
+use asf_core::config_edit::{apply_note, editable_keys, set_key};
 use asf_core::Config;
 use serde::Serialize;
 use serde_json::Value;
@@ -15,8 +15,6 @@ use crate::cli::{Cli, ConfigCmd};
 use crate::ctx::{start_dir, CONFIG_FILE, FACTORY_DIR};
 use crate::git;
 use crate::output::{AppError, ErrorCode, Rendered};
-
-const RESTART_HINT: &str = "restart `asf serve` to apply";
 
 pub fn run(cli: &Cli, cmd: &ConfigCmd) -> Result<Rendered, AppError> {
     match cmd {
@@ -99,13 +97,15 @@ fn set(cli: &Cli, key: &str, value: &str) -> Result<Rendered, AppError> {
     let edited = set_key(&text, key, value)?;
     let new = value_of(&Config::from_toml(&edited)?, key)?;
     std::fs::write(&path, edited.as_bytes())?;
-    let human = format!("{key}: {} -> {}\n{RESTART_HINT}", display(&old), display(&new));
+    // The same sentence the TUI Config view shows, so the two cannot disagree.
+    let note = apply_note(key);
+    let human = format!("{key}: {} -> {}\n{note}", display(&old), display(&new));
     Rendered::new(
         &SetView {
             key: key.to_string(),
             old,
             new,
-            note: RESTART_HINT,
+            note,
         },
         human,
     )

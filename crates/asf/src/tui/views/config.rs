@@ -95,8 +95,15 @@ pub const BINDINGS: &[Binding] = &[
 /// The hint on the right of the first group title.
 const MODELS_HINT: &str = "who thinks, who types, who checks";
 
-/// Under the list: where a change goes and when it takes effect.
-const NOTE: &str = "Saved to .factory/config.toml · comments in the file are kept · applies on the next tick";
+/// Under the list: where a change goes and, for the selected key, when it takes effect. The second
+/// half is `config_edit::apply_note`, the sentence `asf config set` prints too. The path is left out
+/// so the longest sentence still fits 100 columns.
+fn note(key: &str) -> String {
+    format!(
+        "Saved to config.toml · comments kept · {}",
+        asf_core::config_edit::apply_note(key)
+    )
+}
 
 /// Columns: the marker, the label, then the value.
 const LABEL_X: usize = 3;
@@ -395,10 +402,11 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
         height.saturating_sub(1)
     };
     if note_row < height {
+        let key = fields()[selected(snap, state)].key;
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(trunc(NOTE, width.saturating_sub(2)), theme.dim()),
+                Span::styled(trunc(&note(key), width.saturating_sub(2)), theme.dim()),
             ])),
             Rect {
                 y: area.y + note_row as u16,

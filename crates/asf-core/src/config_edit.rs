@@ -52,6 +52,58 @@ pub fn editable_keys() -> &'static [(&'static str, &'static str)] {
     EDITABLE
 }
 
+/// When a changed key reaches the code that uses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applies {
+    /// A running `asf serve` re-reads `config.toml` at the start of every tick (`ConfigWatch::refresh`
+    /// in `crates/asf/src/ctx.rs`, called from `serve::run`) and the stage that uses the key takes it
+    /// from that context.
+    NextTick,
+    /// Only the one-shot `asf plan` reads it, from a fresh load each run; `asf serve` never uses it.
+    NextPlan,
+    /// Read once at startup (or not shown to be reloaded): a running `asf serve` must be restarted.
+    Restart,
+}
+
+/// How each key of [`editable_keys`] reaches its user, in the same order. `planner.*` is read only by
+/// `commands/plan.rs`; every other key is read from `ctx.config` by a stage of the serve tick
+/// (`worker.rs`, `commands/merge.rs`, `commands/run.rs`, `commands/remind.rs`). A new editable key
+/// must be added here (a test checks it).
+const APPLIES: &[(&str, Applies)] = &[
+    ("planner.model", Applies::NextPlan),
+    ("worker.model", Applies::NextTick),
+    ("review.model", Applies::NextTick),
+    ("planner.budget_usd", Applies::NextPlan),
+    ("worker.budget_usd", Applies::NextTick),
+    ("scheduler.max_parallel", Applies::NextTick),
+    ("review.required", Applies::NextTick),
+    ("review.max_rounds", Applies::NextTick),
+    ("merge.target", Applies::NextTick),
+    ("merge.verify_main_after", Applies::NextTick),
+    ("notify.on_new", Applies::NextTick),
+    ("notify.after_minutes", Applies::NextTick),
+    ("notify.every_minutes", Applies::NextTick),
+];
+
+/// When a change of `key` takes effect. A key that is not classified counts as [`Applies::Restart`],
+/// the one claim that is safe without proof.
+pub fn applies(key: &str) -> Applies {
+    APPLIES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or(Applies::Restart, |(_, a)| *a)
+}
+
+/// The one true sentence about when a change of `key` takes effect. The CLI (`asf config set`) and
+/// the TUI Config view both print this, so they cannot disagree.
+pub fn apply_note(key: &str) -> &'static str {
+    match applies(key) {
+        Applies::NextTick => "a running `asf serve` picks this up on its next tick",
+        Applies::NextPlan => "the next `asf plan` uses this; `asf serve` never does",
+        Applies::Restart => "restart `asf serve` to apply",
+    }
+}
+
 /// The section of the Config view a field is listed under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigGroup {
@@ -363,6 +415,13 @@ mod tests {
         for k in UNSETTABLE {
             assert!(EDITABLE.iter().any(|(e, _)| e == k), "{k}");
         }
+    }
+
+    #[test]
+    fn every_editable_key_is_classified_once_in_the_same_order() {
+        let editable: Vec<&str> = EDITABLE.iter().map(|(k, _)| *k).collect();
+        let classified: Vec<&str> = APPLIES.iter().map(|(k, _)| *k).collect();
+        assert_eq!(editable, classified);
     }
 
     #[test]

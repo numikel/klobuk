@@ -101,9 +101,10 @@ fn tui_once_config_view_shows_the_groups_with_labels_and_the_note() {
     }
     assert!(text.contains("[7] Config"), "{text}");
     assert!(text.contains("local · github"), "{text}");
+    // the first row (Planning) is selected, and only `asf plan` reads it
     assert!(
         text.contains(
-            "Saved to .factory/config.toml · comments in the file are kept · applies on the next tick"
+            "Saved to config.toml · comments kept · the next `asf plan` uses this; `asf serve` never does"
         ),
         "{text}"
     );

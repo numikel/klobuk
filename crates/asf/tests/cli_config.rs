@@ -3,7 +3,8 @@ mod common;
 use common::Repo;
 use serde_json::Value;
 
-const RESTART: &str = "restart `asf serve` to apply";
+const NEXT_TICK: &str = "a running `asf serve` picks this up on its next tick";
+const PLAN_ONLY: &str = "the next `asf plan` uses this; `asf serve` never does";
 
 fn config_path(r: &Repo) -> std::path::PathBuf {
     r.path().join(".factory/config.toml")
@@ -76,7 +77,7 @@ fn set_changes_a_value_and_keeps_comments() {
 }
 
 #[test]
-fn set_prints_old_and_new_values_and_the_restart_hint() {
+fn set_prints_old_and_new_values_and_says_a_running_serve_picks_them_up() {
     let r = Repo::initialised();
     let out = r
         .asf()
@@ -87,14 +88,53 @@ fn set_prints_old_and_new_values_and_the_restart_hint() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("merge.target"), "{text}");
     assert!(text.contains("local") && text.contains("github"), "{text}");
-    assert!(text.contains(RESTART), "{text}");
+    assert!(text.contains(NEXT_TICK), "{text}");
+    assert!(
+        !text.contains("restart"),
+        "a reloaded key needs no restart: {text}"
+    );
 
     let res = r.ok(&["config", "set", "merge.target", "local"]);
     assert_eq!(
         (res["old"].as_str(), res["new"].as_str()),
         (Some("github"), Some("local"))
     );
-    assert!(res["note"].as_str().unwrap().contains(RESTART), "{res}");
+    assert_eq!(res["note"], NEXT_TICK, "{res}");
+}
+
+#[test]
+fn every_key_a_serve_tick_reloads_says_so_and_never_hints_at_a_restart() {
+    let r = Repo::initialised();
+    for (key, value) in [
+        ("worker.model", "sonnet"),
+        ("worker.budget_usd", "4"),
+        ("review.model", "haiku"),
+        ("review.required", "true"),
+        ("review.max_rounds", "3"),
+        ("scheduler.max_parallel", "2"),
+        ("merge.verify_main_after", "true"),
+        ("notify.on_new", "false"),
+        ("notify.after_minutes", "10"),
+        ("notify.every_minutes", "0"),
+    ] {
+        let res = r.ok(&["config", "set", key, value]);
+        assert_eq!(res["note"], NEXT_TICK, "{key}: {res}");
+    }
+}
+
+#[test]
+fn a_planner_key_says_only_asf_plan_reads_it() {
+    let r = Repo::initialised();
+    let res = r.ok(&["config", "set", "planner.budget_usd", "2"]);
+    assert_eq!(res["note"], PLAN_ONLY, "{res}");
+    let out = r
+        .asf()
+        .args(["config", "set", "planner.model", "sonnet"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(PLAN_ONLY), "{text}");
+    assert!(!text.contains("restart"), "{text}");
 }
 
 #[test]

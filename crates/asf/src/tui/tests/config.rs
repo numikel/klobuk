@@ -1,7 +1,11 @@
 use super::*;
 use asf_core::config_edit::{fields, FieldKind};
 
-const NOTE: &str = "Saved to .factory/config.toml · comments in the file are kept · applies on the next tick";
+/// The footer for a key a running `asf serve` reloads, and for one only `asf plan` reads.
+const TICK_NOTE: &str =
+    "Saved to config.toml · comments kept · a running `asf serve` picks this up on its next tick";
+const PLAN_NOTE: &str =
+    "Saved to config.toml · comments kept · the next `asf plan` uses this; `asf serve` never does";
 
 /// An app on the Config view whose snapshot holds the config text `toml`.
 fn view(toml: &str) -> App {
@@ -169,18 +173,52 @@ fn a_snapshot_without_config_rows_shows_the_defaults() {
 
 #[test]
 fn the_note_says_where_the_value_is_saved_and_when_it_applies() {
+    // the first row (Planning) is selected: only `asf plan` reads it
     let t = render_to_text(&view(BUDGETS), 120, 30);
-    assert!(t.contains(NOTE), "{t}");
+    assert!(t.contains(PLAN_NOTE), "{t}");
     let t = render_to_text(&view(BUDGETS), 120, 40);
-    let note_at = t.lines().position(|l| l.contains(NOTE)).unwrap();
+    let note_at = t.lines().position(|l| l.contains(PLAN_NOTE)).unwrap();
     let last_row = t.lines().position(|l| l.contains("Repeat reminder")).unwrap();
     assert_eq!(
         note_at,
         last_row + 2,
         "one blank line between the list and the note:\n{t}"
     );
-    let (_, m) = cell_style(&view(BUDGETS), NOTE, "Saved to");
+    let (_, m) = cell_style(&view(BUDGETS), PLAN_NOTE, "Saved to");
     assert!(m.contains(Modifier::DIM));
+}
+
+#[test]
+fn the_note_follows_the_selected_row() {
+    let t = render_to_text(&at(BUDGETS, "worker.budget_usd"), 120, 40);
+    assert!(
+        t.contains(TICK_NOTE) && !t.contains("`asf serve` never does"),
+        "{t}"
+    );
+    let t = render_to_text(&at(BUDGETS, "planner.budget_usd"), 120, 40);
+    assert!(t.contains(PLAN_NOTE) && !t.contains("picks this up"), "{t}");
+    // never a restart hint: no key of the view needs one
+    for f in fields() {
+        let t = render_to_text(&at(BUDGETS, f.key), 120, 40);
+        assert!(!t.contains("restart"), "{}:\n{t}", f.key);
+        assert!(
+            t.contains(asf_core::config_edit::apply_note(f.key)),
+            "{}:\n{t}",
+            f.key
+        );
+    }
+}
+
+#[test]
+fn the_note_fits_100_columns_for_every_key() {
+    for f in fields() {
+        let t = render_to_text(&at(BUDGETS, f.key), 100, 40);
+        assert!(
+            t.contains(asf_core::config_edit::apply_note(f.key)),
+            "{} is cut at 100 columns:\n{t}",
+            f.key
+        );
+    }
 }
 
 #[test]
@@ -199,7 +237,7 @@ fn it_fits_100_columns_and_truncates_with_an_ellipsis() {
     for label in ["Review before merge", "Gates on main", "Per issue"] {
         assert!(t.contains(label), "{label}:\n{t}");
     }
-    assert!(t.contains(NOTE), "{t}");
+    assert!(t.contains(PLAN_NOTE), "{t}");
 }
 
 #[test]
@@ -233,12 +271,12 @@ fn the_selected_row_has_a_highlighted_background_or_reverse_video() {
 fn a_long_list_scrolls_to_keep_the_selected_row_and_the_note_visible() {
     let mut a = view(Config::default_toml());
     let t = render_to_text(&a, 100, 20);
-    assert!(t.contains("Planning") && t.contains(NOTE), "{t}");
+    assert!(t.contains("Planning") && t.contains(PLAN_NOTE), "{t}");
     assert!(!t.contains("Repeat reminder"), "does not fit 14 rows:\n{t}");
     a.handle_key(key('G'));
     let t = render_to_text(&a, 100, 20);
     assert!(row(&t, "Repeat reminder").contains('▸'), "{t}");
-    assert!(t.contains(NOTE) && !t.contains("Planning  "), "{t}");
+    assert!(t.contains(TICK_NOTE) && !t.contains("Planning  "), "{t}");
     a.handle_key(key('k'));
     let t = render_to_text(&a, 100, 20);
     assert!(
@@ -500,11 +538,28 @@ fn the_event_loop_hands_a_refused_edit_to_the_view_and_nothing_else() {
 }
 
 #[test]
-fn a_saved_edit_says_it_applies_on_the_next_tick() {
+fn a_saved_edit_says_a_running_serve_picks_it_up_on_its_next_tick() {
     let (dir, _) = config_dir(Config::default_toml());
     let msg = config_set_status(dir.path(), "scheduler.max_parallel", "5");
-    assert!(msg.ends_with("(applies on the next tick)"), "{msg}");
+    assert_eq!(
+        msg,
+        "scheduler.max_parallel: 3 -> 5 (a running `asf serve` picks this up on its next tick)"
+    );
     assert!(!msg.contains("restart"), "{msg}");
+}
+
+#[test]
+fn a_saved_planner_edit_says_serve_never_uses_it() {
+    let (dir, _) = config_dir(Config::default_toml());
+    let msg = config_set_status(dir.path(), "planner.budget_usd", "2");
+    assert!(
+        msg.ends_with("(the next `asf plan` uses this; `asf serve` never does)"),
+        "{msg}"
+    );
+    assert!(!msg.contains("restart") && !msg.contains("next tick"), "{msg}");
+    // an unset says the same as a set of the same key
+    let msg = config_unset_status(dir.path(), "worker.model");
+    assert!(msg.ends_with("picks this up on its next tick)"), "{msg}");
 }
 
 #[test]
