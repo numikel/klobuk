@@ -650,3 +650,37 @@ mod stages {
         assert_eq!(specs[0].shell.as_deref(), Some("sh"));
     }
 }
+
+/// A Polish linker quotes the path with „ ” instead of ASCII quotes; the recovery must still find the
+/// file, move it aside and say so (and not "no file path in the linker message").
+#[test]
+fn moves_the_locked_executable_aside_when_the_linker_quotes_it_with_polish_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("deps")).unwrap();
+    let locked = dir.path().join("deps").join("asf-ce36f34fbf868c1a.exe");
+    std::fs::write(&locked, "old").unwrap();
+    // The message goes out as UTF-8 bytes whatever the console code page is.
+    let code = format!(
+        "import os, sys; p = {:?}; e = os.path.exists(p)\n\
+msg = 'LINK : fatal error LNK1104: nie mo\\u017cna otworzy\\u0107 pliku \\u201e' + p + '\\u201d\\n'\n\
+sys.stdout.buffer.write((msg if e else 'tests ok\\n').encode('utf-8'))\n\
+sys.exit(101 if e else 0)",
+        locked.to_string_lossy().replace('\\', "/")
+    );
+    let results = run_gates(&[spec("test", &py(&code), 30)], dir.path());
+    assert!(results[0].ok, "{}", results[0].tail);
+    assert!(!locked.exists(), "locked file moved aside");
+    assert!(
+        dir.path()
+            .join("deps")
+            .join("asf-ce36f34fbf868c1a.exe.locked.old")
+            .exists(),
+        "moved to *.locked.old"
+    );
+    assert!(results[0].tail.contains("moved aside"), "{}", results[0].tail);
+    assert!(
+        !results[0].tail.contains("nothing to move aside"),
+        "{}",
+        results[0].tail
+    );
+}

@@ -181,17 +181,45 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
     }
 }
 
-/// Files `link.exe` could not open, taken from the quoted path on each `LNK1104` line.
+/// Quote characters a localized linker may put around the path: ASCII `"` and `'`, Polish „ ”, the
+/// English “ ”, French « » and Japanese 「 」.
+const QUOTE_CHARS: &[char] = &['"', '\'', '„', '”', '“', '«', '»', '「', '」'];
+
+/// The `.exe` path on one `LNK1104` line, whatever language the linker message is in.
+///
+/// The path ends after the last `.exe` of the line (any case). It starts at the first Windows drive
+/// path (`X:\` or `X:/`) on the line, which skips the sentence before it (the French
+/// `d'ouvrir le fichier «...»` has an apostrophe that is not a quote); a path without a drive letter
+/// must be quoted and starts after the last quote character before its end. An unquoted relative
+/// name carries no reliable start, so it is not taken.
+fn exe_path_on_line(line: &str) -> Option<&str> {
+    let end = line.to_ascii_lowercase().rfind(".exe")? + ".exe".len();
+    let head = &line[..end];
+    let bytes = head.as_bytes();
+    let drive = (0..bytes.len().saturating_sub(2)).find(|&i| {
+        bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && matches!(bytes[i + 2], b'\\' | b'/')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+    });
+    let start = match drive {
+        Some(i) => i,
+        None => {
+            let quote = head.rfind(QUOTE_CHARS)?;
+            quote + head[quote..].chars().next()?.len_utf8()
+        }
+    };
+    let path = head[start..].trim();
+    (!path.is_empty()).then_some(path)
+}
+
+/// Files `link.exe` could not open, taken from the path on each `LNK1104` line.
 fn locked_files(output: &str) -> Vec<std::path::PathBuf> {
     output
         .lines()
         .filter(|l| l.contains(LINKER_LOCK_MARKER))
-        .filter_map(|l| {
-            let start = l.find('"')? + 1;
-            let end = l[start..].find('"')? + start;
-            Some(std::path::PathBuf::from(&l[start..end]))
-        })
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))
+        .filter_map(exe_path_on_line)
+        .map(std::path::PathBuf::from)
         .collect()
 }
 
@@ -382,4 +410,92 @@ pub fn stage_specs(gates: &[GateCfg], stage: GateWhen) -> Vec<GateSpec> {
             shell: g.shell.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locked_files;
+    use std::path::PathBuf;
+
+    const EXE: &str = r"D:\Programowanie\auto-software-factory\.worktrees\asf-43\target\debug\deps\asf-ce36f34fbf868c1a.exe";
+
+    fn only(line: &str) -> Vec<PathBuf> {
+        locked_files(line)
+    }
+
+    /// The exact line observed on a Polish Windows (asf-43 merge item, 2026-11-09).
+    #[test]
+    fn reads_the_path_from_a_polish_linker_line() {
+        let line = r"LINK : fatal error LNK1104: nie można otworzyć pliku „D:\Programowanie\auto-software-factory\.worktrees\asf-43\target\debug\deps\asf-ce36f34fbf868c1a.exe”";
+        assert_eq!(only(line), vec![PathBuf::from(EXE)]);
+    }
+
+    #[test]
+    fn reads_the_path_from_an_english_linker_line() {
+        let line = format!("LINK : fatal error LNK1104: cannot open file \"{EXE}\"");
+        assert_eq!(only(&line), vec![PathBuf::from(EXE)]);
+    }
+
+    #[test]
+    fn reads_the_path_whatever_quotes_the_locale_uses() {
+        for (open, close) in [
+            ("'", "'"),
+            ("“", "”"),
+            ("«", "»"),
+            ("« ", " »"),
+            ("「", "」"),
+            ("„", "“"),
+        ] {
+            let line = format!("LINK : fatal error LNK1104: file {open}{EXE}{close}");
+            assert_eq!(only(&line), vec![PathBuf::from(EXE)], "quotes {open}{close}");
+        }
+    }
+
+    /// French has an apostrophe in the sentence before the path, which must not start the path.
+    #[test]
+    fn an_apostrophe_in_the_message_text_does_not_start_the_path() {
+        let line = format!("LINK : fatal error LNK1104: impossible d'ouvrir le fichier «{EXE}»");
+        assert_eq!(only(&line), vec![PathBuf::from(EXE)]);
+    }
+
+    #[test]
+    fn keeps_spaces_and_apostrophes_inside_the_path() {
+        let path = r"C:\Users\Jan O'Brien\My Projects\target\debug\deps\a-1.EXE";
+        let line = format!("LINK : fatal error LNK1104: nie można otworzyć pliku „{path}”");
+        assert_eq!(only(&line), vec![PathBuf::from(path)]);
+    }
+
+    #[test]
+    fn forward_slashes_are_accepted() {
+        let path = "D:/work/target/debug/deps/a-1.exe";
+        let line = format!("LINK : fatal error LNK1104: cannot open file \"{path}\"");
+        assert_eq!(only(&line), vec![PathBuf::from(path)]);
+    }
+
+    #[test]
+    fn collects_one_path_per_linker_line_and_skips_other_lines() {
+        let out = format!(
+            "   Compiling x\nLINK : fatal error LNK1104: nie można otworzyć pliku „{EXE}”\nerror: other\n\
+LINK : fatal error LNK1104: cannot open file \"{}\"\n{} is not an LNK line\n",
+            r"D:\b\two.exe", r"D:\b\three.exe"
+        );
+        assert_eq!(
+            only(&out),
+            vec![PathBuf::from(EXE), PathBuf::from(r"D:\b\two.exe")]
+        );
+    }
+
+    #[test]
+    fn a_quoted_relative_path_still_counts() {
+        let line = r#"LINK : fatal error LNK1104: cannot open file "target\debug\deps\a.exe""#;
+        assert_eq!(only(line), vec![PathBuf::from(r"target\debug\deps\a.exe")]);
+    }
+
+    #[test]
+    fn ignores_lines_without_a_path_to_an_exe() {
+        assert!(only("LINK : fatal error LNK1104: cannot open file foo.exe").is_empty());
+        assert!(only(r#"LINK : fatal error LNK1104: cannot open file "D:\x\y.rlib""#).is_empty());
+        assert!(only("LINK : fatal error LNK1104").is_empty());
+        assert!(only("").is_empty());
+    }
 }
