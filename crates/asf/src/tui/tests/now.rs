@@ -189,9 +189,10 @@ fn a_failed_merge_item_of_an_issue_with_an_active_run_is_not_listed_it_is_runnin
         assert!(t.contains("NEEDS YOU (0)") && t.contains("RUNNING (1)"), "{t}");
         let row = row_of(&t, "asf-98");
         assert!(row.contains(label), "{label:?} missing in {row:?}");
+        // the label fills the whole state column, so the gap before the title must still be there
         assert!(
-            row.contains("Title of asf-98"),
-            "the title stays readable: {row:?}"
+            row.contains(&format!("{label:<19}  Title of asf-98")),
+            "the title stays readable and apart from the state: {row:?}"
         );
         assert!(!row.contains("r retry"), "{row:?}");
     }

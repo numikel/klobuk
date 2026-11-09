@@ -440,7 +440,7 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
                 Span::raw(format!(" {}", select_marker(i))),
                 Span::styled(format!("{} ", mark.glyph()), theme.mark(mark)),
                 Span::styled(format!("{}  ", fit(r.issue.as_str(), id_w)), theme.bold()),
-                Span::raw(fit(&r.state, RUN_STATE_W)),
+                Span::raw(format!("{}  ", fit(&r.state, RUN_STATE_W))),
                 Span::raw(format!("{}  ", fit(&r.title, title_w))),
                 Span::raw(format!("{}  ", fit(&money(r.cost, r.budget), 14))),
                 Span::raw(age(&snap.now, &r.since)),
