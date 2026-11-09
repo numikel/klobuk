@@ -44,6 +44,7 @@ impl State {
 }
 
 /// The filter text as typed.
+#[cfg(test)]
 pub fn filter(state: &State) -> &str {
     &state.filter
 }
@@ -240,7 +241,7 @@ fn is_review(snap: &Snapshot, id: Option<&IssueId>) -> bool {
         .is_some_and(|i| i.kind == IssueType::Review)
 }
 
-fn find_merge<'s>(snap: &'s Snapshot, merge_id: i64) -> Option<&'s MergeItem> {
+fn find_merge(snap: &Snapshot, merge_id: i64) -> Option<&MergeItem> {
     snap.queue
         .iter()
         .chain(&snap.merged_today)
@@ -283,7 +284,7 @@ enum Gates {
 }
 
 /// The merge state a `merge.state` event moved to, for the merge item `merge_id`.
-fn merge_to<'e>(e: &'e Event, merge_id: i64) -> Option<&'e str> {
+fn merge_to(e: &Event, merge_id: i64) -> Option<&str> {
     (e.kind == "merge.state" && count(e, "merge_id") == Some(merge_id))
         .then(|| text(e, "to"))
         .flatten()
@@ -634,11 +635,13 @@ fn shown<'a>(all: &'a [Entry<'a>], state: &State) -> Vec<&'a Entry<'a>> {
 // ---------------------------------------------------------------------------------------------
 
 /// Events the Log lists (the filter is not applied).
+#[cfg(test)]
 pub fn rows(snap: &Snapshot) -> usize {
     entries(snap).len()
 }
 
 /// The selected row among the rows the filter lets through.
+#[cfg(test)]
 pub fn selected(snap: &Snapshot, state: &State) -> usize {
     let all = entries(snap);
     state.selected.min(shown(&all, state).len().saturating_sub(1))
