@@ -468,6 +468,46 @@ fn a_refused_value_is_shown_under_its_row_until_the_next_key() {
 }
 
 #[test]
+fn the_event_loop_hands_a_refused_edit_to_the_view_and_nothing_else() {
+    use crate::tui::note_config_result;
+    let (dir, _) = config_dir(Config::default_toml());
+    let set = Action::SetConfig("scheduler.max_parallel".into(), "0".into());
+    let msg = config_set_status(dir.path(), "scheduler.max_parallel", "0");
+    let mut a = at(Config::default_toml(), "scheduler.max_parallel");
+    note_config_result(&mut a, &set, &msg);
+    let t = render_to_text(&a, 120, 40);
+    assert!(
+        t.contains("error: invalid config: scheduler.max_parallel must be >= 1"),
+        "{t}"
+    );
+    assert!(!t.contains("error: error"), "the prefix is not doubled:\n{t}");
+    // an unset that the file refuses is shown the same way
+    let unset = Action::UnsetConfig("scheduler.max_parallel".into());
+    let msg = config_unset_status(dir.path(), "scheduler.max_parallel");
+    let mut u = at(Config::default_toml(), "scheduler.max_parallel");
+    note_config_result(&mut u, &unset, &msg);
+    assert!(render_to_text(&u, 120, 40).contains("cannot be unset"));
+    // a saved value, or another action, leaves nothing under the row
+    let mut b = at(Config::default_toml(), "scheduler.max_parallel");
+    note_config_result(
+        &mut b,
+        &set,
+        "scheduler.max_parallel: 3 -> 5 (applies on the next tick)",
+    );
+    note_config_result(&mut b, &Action::Tick, "error: not a config edit");
+    let t = render_to_text(&b, 120, 40);
+    assert!(!t.contains("error"), "{t}");
+}
+
+#[test]
+fn a_saved_edit_says_it_applies_on_the_next_tick() {
+    let (dir, _) = config_dir(Config::default_toml());
+    let msg = config_set_status(dir.path(), "scheduler.max_parallel", "5");
+    assert!(msg.ends_with("(applies on the next tick)"), "{msg}");
+    assert!(!msg.contains("restart"), "{msg}");
+}
+
+#[test]
 fn d_puts_a_key_back_to_its_default_after_a_yes() {
     let mut a = at(BUDGETS, "planner.budget_usd");
     assert_eq!(a.handle_key(key('d')), Action::None);

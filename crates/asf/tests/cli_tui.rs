@@ -80,7 +80,7 @@ fn tui_once_can_open_other_views() {
 }
 
 #[test]
-fn tui_once_config_view_prints_every_editable_key() {
+fn tui_once_config_view_shows_the_groups_with_labels_and_the_note() {
     let repo = fake_repo();
     let out = repo
         .asf()
@@ -89,11 +89,40 @@ fn tui_once_config_view_prints_every_editable_key() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
+    for title in ["MODELS", "BUDGETS", "FLOW"] {
+        assert!(text.contains(title), "missing {title} in:\n{text}");
+    }
+    // the first screen of the list: labels instead of dotted keys
+    for label in ["Planning", "Workers", "Reviewer", "Per issue", "Merge target"] {
+        assert!(text.contains(label), "missing {label} in:\n{text}");
+    }
     for (key, _) in asf_core::config_edit::editable_keys() {
-        assert!(text.contains(key), "missing {key} in:\n{text}");
+        assert!(!text.contains(key), "dotted key {key} in:\n{text}");
     }
     assert!(text.contains("[7] Config"), "{text}");
-    assert!(text.contains("fake") || text.contains("local"), "{text}");
+    assert!(text.contains("local · github"), "{text}");
+    assert!(
+        text.contains(
+            "Saved to .factory/config.toml · comments in the file are kept · applies on the next tick"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn tui_once_config_view_reads_the_file_as_it_is_now() {
+    let repo = fake_repo();
+    let path = repo.path().join(".factory/config.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("max_parallel = 3", "max_parallel = 7")).unwrap();
+    let out = repo
+        .asf()
+        .args(["tui", "--once", "--view", "config"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text.lines().find(|l| l.contains("Workers at once")).unwrap();
+    assert!(row.contains('7') && row.contains("default 3"), "{text}");
 }
 
 #[test]
@@ -208,7 +237,7 @@ fn tui_once_shows_the_contextual_footer_for_each_view() {
     let text = String::from_utf8_lossy(&out.stdout);
     let footer = text.lines().rfind(|l| !l.trim().is_empty()).unwrap();
     assert!(
-        footer.contains("d unset") && !footer.contains("s start"),
+        footer.contains("d back to default") && !footer.contains("s start"),
         "{text}"
     );
     assert!(footer.trim_end().ends_with("? help  q quit"), "{text}");

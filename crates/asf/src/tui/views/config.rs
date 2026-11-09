@@ -35,8 +35,7 @@ pub struct State {
 
 impl State {
     /// Remembers that `key` refused the value just typed; the row of `key` shows `message` under it.
-    // Called by the event loop with the result of `Action::SetConfig`.
-    #[allow(dead_code)]
+    // Called by the event loop with the result of `Action::SetConfig` (`tui::note_config_result`).
     pub fn fail(&mut self, key: &str, message: &str) {
         let message = message.strip_prefix("error: ").unwrap_or(message);
         self.error = Some((key.to_string(), message.to_string()));

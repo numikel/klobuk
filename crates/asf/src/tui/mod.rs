@@ -116,10 +116,20 @@ fn config_edit_status(
             .unwrap_or_default()
     };
     format!(
-        "{key}: {} -> {} (restart `asf serve` to apply)",
+        "{key}: {} -> {} (applies on the next tick)",
         shown(&text),
         shown(&edited)
     )
+}
+
+/// A refused Config edit (`error: ...`) is also kept by the Config view, which draws it under the row
+/// of the key until the next key press. Any other result, or any other action, leaves the view alone.
+pub(crate) fn note_config_result(app: &mut App, action: &Action, status: &str) {
+    if let Action::SetConfig(key, _) | Action::UnsetConfig(key) = action {
+        if status.starts_with("error") {
+            app.config.fail(key, status);
+        }
+    }
 }
 
 /// A slow action that runs as a child process of this executable.
@@ -489,7 +499,10 @@ fn event_loop(
                     }
                 } else {
                     match execute(action.clone(), ctx, worker) {
-                        Ok(Some(msg)) => app.status = Some(msg),
+                        Ok(Some(msg)) => {
+                            note_config_result(app, &action, &msg);
+                            app.status = Some(msg);
+                        }
                         Ok(None) => {}
                         Err(e) => app.status = Some(format!("error: {}", e.message)),
                     }
