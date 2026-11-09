@@ -1,7 +1,10 @@
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use asf_core::{IssueStore, MergeState, NewEvent};
+use asf_store::SqliteStore;
 use common::{git, Repo};
 
 fn commit_in(dir: &Path, rel: &str, content: &str) {
@@ -321,6 +324,14 @@ impl LiveServe {
         stdout.read_line(&mut line).unwrap();
         let first = serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("first line {line:?}: {e}"));
         LiveServe { child, stdout, first }
+    }
+
+    /// Blocks until the loop prints its next line (a tick with an event, or the summary).
+    fn next_line(&mut self) -> serde_json::Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("next line {line:?}: {e}"))
     }
 
     /// Waits for the process; returns the remaining stdout lines (JSON) and the whole stderr.
@@ -773,4 +784,465 @@ fn serve_prints_the_notification_in_the_human_report() {
         text.contains(&format!("notified: asf {id} is blocked: gate test timed out")),
         "{text}"
     );
+}
+
+// ---- gate runs leave the tick (asf-66) ----
+
+/// A gate that records its working directory, then waits until the `release` file exists (it gives
+/// up after 90 s). While it waits, the gate run is "in flight" for as long as the test wants.
+const HOLD_GATE: &str = concat!(
+    "import os, sys, time\n",
+    "open(sys.argv[1], 'a').write(os.getcwd() + '\\n')\n",
+    "t = time.time()\n",
+    "while not os.path.exists(sys.argv[2]):\n",
+    "    if time.time() - t > 90:\n",
+    "        sys.exit(9)\n",
+    "    time.sleep(0.1)\n",
+);
+
+/// A gate that always fails.
+const RED_GATE: &str = "import sys\nprint('red on purpose')\nsys.exit(7)\n";
+
+/// A repository on the fake runtime with one gate named `hold` that runs in `stages` (a TOML array).
+struct Gated {
+    repo: Repo,
+    log: PathBuf,
+    release: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn gated(script: &str, stages: &str, verify_main_after: bool) -> Gated {
+    let repo = Repo::initialised();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("gate.py");
+    std::fs::write(&file, script).unwrap();
+    let log = dir.path().join("gate.log");
+    let release = dir.path().join("release");
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let cfg = repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("runtime = \"herdr\"", "runtime = \"fake\"");
+    if verify_main_after {
+        assert!(
+            s.contains("verify_main_after = false"),
+            "template carries the flag"
+        );
+        s = s.replace("verify_main_after = false", "verify_main_after = true");
+    }
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"hold\"\ncmd = ['python', '{}', '{}', '{}']\nwhen = {stages}\n",
+        fwd(&file),
+        fwd(&log),
+        fwd(&release)
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "cfg"]);
+    Gated {
+        repo,
+        log,
+        release,
+        _dir: dir,
+    }
+}
+
+impl Gated {
+    /// Where each run of the gate happened, oldest first.
+    fn runs(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn release(&self) {
+        std::fs::write(&self.release, "").unwrap();
+    }
+
+    fn store(&self) -> SqliteStore {
+        SqliteStore::open(&self.repo.path().join(".factory/factory.db")).unwrap()
+    }
+
+    fn issue_status(&self, id: &str) -> String {
+        self.repo.ok(&["issue", "show", id])["issue"]["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn event_kinds(&self) -> Vec<(String, Option<String>)> {
+        self.store()
+            .events_since(0, 10_000)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind, e.issue_id.map(|i| i.to_string())))
+            .collect()
+    }
+}
+
+/// A worker that did its job and ran `asf issue finish`; nothing has verified it yet.
+fn finished_worker(repo: &Repo, scope: &str, file: &str) -> String {
+    let id = repo.create_issue(file, &["--ready", "--scope", scope]);
+    repo.ok(&["run", "start", &id]);
+    let wt = repo.path().join(".worktrees").join(&id);
+    commit_in(&wt, file, "x\n");
+    let report = wt.join(".factory").join("runs").join(&id).join("report.md");
+    std::fs::write(&report, "# done\n").unwrap();
+    repo.ok(&[
+        "--lane",
+        &id,
+        "issue",
+        "finish",
+        &id,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    id
+}
+
+/// `finished_worker` plus the (inline) verification: the item waits in the merge queue.
+fn queued_item(repo: &Repo, scope: &str, file: &str) -> String {
+    let id = finished_worker(repo, scope, file);
+    let res = repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    id
+}
+
+fn queue_states(g: &Gated) -> Vec<MergeState> {
+    g.store().merge_queue().unwrap().iter().map(|m| m.state).collect()
+}
+
+const LOOP: [&str; 6] = ["serve", "--until-done", "--max-ticks", "10", "--interval", "1"];
+
+#[test]
+fn a_merge_gate_in_flight_does_not_stop_the_loop() {
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    let b = g.repo.create_issue("later", &["--ready", "--scope", "docs/**"]);
+
+    let mut args = LOOP.to_vec();
+    args.push("--dispatch");
+    let mut live = LiveServe::start(&g.repo, &args);
+    // this line exists only because the tick ended while the gate is still waiting for `release`
+    let first = &live.first["result"];
+    assert_eq!(first["gate_run"]["kind"], "merge", "{first}");
+    assert_eq!(first["gate_run"]["issue"], a.as_str(), "{first}");
+    assert_eq!(first["gate_run"]["gate"], "hold", "{first}");
+    assert!(first["gate_run"]["seconds"].is_u64(), "{first}");
+    assert_eq!(
+        first["started"],
+        serde_json::json!([b.clone()]),
+        "a ready issue is dispatched in the tick that starts the gate run: {first}"
+    );
+    assert_eq!(queue_states(&g), vec![MergeState::Gating]);
+    assert!(!g.release.exists());
+
+    // a question raised during the gate run is announced by a later tick, the gate still held
+    g.repo.ok(&[
+        "issue",
+        "comment",
+        &b,
+        "--type",
+        "QUESTION",
+        "--to",
+        "human",
+        "--body",
+        "Which table?",
+    ]);
+    let alert = live.next_line();
+    assert_eq!(alert["result"]["alerts"][0]["kind"], "question", "{alert}");
+    assert_eq!(
+        alert["result"]["gate_run"]["issue"],
+        a.as_str(),
+        "still in flight: {alert}"
+    );
+    assert_eq!(queue_states(&g), vec![MergeState::Gating]);
+
+    g.release();
+    let (lines, stderr) = live.finish();
+    assert_eq!(queue_states(&g), vec![MergeState::Merged], "{lines:?}\n{stderr}");
+    assert_eq!(g.issue_status(&a), "done");
+    assert_eq!(g.runs().len(), 1, "the gate ran once: {:?}", g.runs());
+    let merged = lines
+        .iter()
+        .flat_map(|l| {
+            l["result"]["merge"]["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .any(|m| m["state"] == "merged");
+    assert!(
+        merged,
+        "the tick that reaped the result reports the merge: {lines:?}"
+    );
+}
+
+#[test]
+fn only_one_gate_run_is_in_flight_and_the_queue_stays_fifo() {
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    let b = queued_item(&g.repo, "docs/**", "docs/b.md");
+
+    let live = LiveServe::start(&g.repo, &LOOP);
+    assert_eq!(live.first["result"]["gate_run"]["issue"], a.as_str());
+    std::thread::sleep(Duration::from_secs(3)); // several ticks with the first gate held
+    assert_eq!(
+        g.runs().len(),
+        1,
+        "no second gate run while one is in flight: {:?}",
+        g.runs()
+    );
+    assert_eq!(queue_states(&g), vec![MergeState::Gating, MergeState::Queued]);
+
+    g.release();
+    let (lines, stderr) = live.finish();
+    assert_eq!(
+        queue_states(&g),
+        vec![MergeState::Merged, MergeState::Merged],
+        "{lines:?}\n{stderr}"
+    );
+    let order: Vec<_> = g
+        .event_kinds()
+        .into_iter()
+        .filter(|(k, _)| k == "merge.merged")
+        .filter_map(|(_, i)| i)
+        .collect();
+    assert_eq!(order, vec![a.clone(), b.clone()], "FIFO");
+    let runs = g.runs();
+    assert!(
+        runs.len() == 2 && runs[0].ends_with(&a) && runs[1].ends_with(&b),
+        "{runs:?}"
+    );
+}
+
+#[test]
+fn the_result_of_an_item_skipped_while_its_gates_ran_is_dropped() {
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    let live = LiveServe::start(&g.repo, &LOOP);
+    assert_eq!(live.first["result"]["gate_run"]["issue"], a.as_str());
+    // the operator gives up on the item while its gates run
+    g.repo.ok(&["merge", "skip", &a]);
+    g.release();
+    let (lines, stderr) = live.finish();
+    assert_eq!(queue_states(&g), vec![MergeState::Skipped], "{lines:?}\n{stderr}");
+    assert_eq!(g.issue_status(&a), "validating", "nothing was merged or closed");
+    assert!(!g.event_kinds().iter().any(|(k, _)| k == "merge.merged"));
+}
+
+#[test]
+fn serve_start_puts_items_left_in_rebasing_or_gating_back_in_the_queue() {
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    let b = queued_item(&g.repo, "docs/**", "docs/b.md");
+    g.release(); // the gate passes at once; what matters is the state serve finds
+                 // `asf serve` was stopped while `a` was gating and `b` was rebasing
+    let store = g.store();
+    for (item, state) in store
+        .merge_queue()
+        .unwrap()
+        .iter()
+        .zip([MergeState::Gating, MergeState::Rebasing])
+    {
+        store
+            .update_merge(
+                item.id,
+                &asf_core::MergePatch {
+                    state: Some(state),
+                    ..asf_core::MergePatch::default()
+                },
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let out = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(queue_states(&g), vec![MergeState::Merged, MergeState::Merged]);
+    assert_eq!(g.issue_status(&a), "done");
+    assert_eq!(g.issue_status(&b), "done");
+    let recovered: Vec<_> = g
+        .event_kinds()
+        .into_iter()
+        .filter(|(k, _)| k == "merge.recovered")
+        .filter_map(|(_, i)| i)
+        .collect();
+    assert_eq!(recovered, vec![a, b], "one event per recovered item");
+}
+
+#[test]
+fn serve_start_verifies_again_a_run_a_stopped_serve_left_verifying() {
+    let g = gated(HOLD_GATE, "[\"verify\"]", false);
+    let a = finished_worker(&g.repo, "src/**", "src/a.rs");
+    g.release();
+    // the previous serve had set the run `verifying` when it was stopped; the issue is still in-review
+    let store = g.store();
+    let run = store.runs(Some(&a.parse().unwrap()), true).unwrap().remove(0);
+    store
+        .update_run(
+            &run.id,
+            &asf_core::RunPatch {
+                state: Some(asf_core::RunState::Verifying),
+                ..asf_core::RunPatch::default()
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    let out = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let runs = g.repo.ok(&["run", "list"]);
+    assert_eq!(runs[0]["state"], "succeeded", "{runs}");
+    assert_eq!(queue_states(&g), vec![MergeState::Merged]);
+    assert_eq!(g.runs().len(), 1, "the gate ran once, after the restart");
+}
+
+#[test]
+fn serve_once_waits_for_the_gate_it_started() {
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    let release = g.release.clone();
+    let helper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        std::fs::write(release, "").unwrap();
+    });
+    let started = std::time::Instant::now();
+    let res = g.repo.ok(&["serve", "--once"]);
+    helper.join().unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "returned before the gate finished"
+    );
+    assert_eq!(res["merge"]["items"][0]["state"], "merged", "{res}");
+    assert_eq!(
+        res["gate_run"],
+        serde_json::Value::Null,
+        "nothing is left in flight: {res}"
+    );
+    assert_eq!(g.issue_status(&a), "done");
+}
+
+#[test]
+fn verification_of_finished_runs_leaves_the_tick_and_shares_the_single_slot() {
+    let g = gated(HOLD_GATE, "[\"verify\"]", false);
+    let a = finished_worker(&g.repo, "src/**", "src/a.rs");
+    let b = finished_worker(&g.repo, "docs/**", "docs/b.md");
+    let c = g.repo.create_issue("later", &["--ready", "--scope", "lib/**"]);
+
+    let mut args = LOOP.to_vec();
+    args.push("--dispatch");
+    let live = LiveServe::start(&g.repo, &args);
+    let first = &live.first["result"];
+    assert_eq!(first["gate_run"]["kind"], "verify", "{first}");
+    assert_eq!(first["gate_run"]["issue"], a.as_str(), "{first}");
+    assert_eq!(first["started"], serde_json::json!([c]), "{first}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        g.runs().len(),
+        1,
+        "the second run waits for the slot: {:?}",
+        g.runs()
+    );
+
+    g.release();
+    let (lines, stderr) = live.finish();
+    let runs = g.repo.ok(&["run", "list"]);
+    let state_of = |id: &str| {
+        runs.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["issue_id"] == id)
+            .map(|r| r["state"].clone())
+    };
+    assert_eq!(
+        state_of(&a),
+        Some("succeeded".into()),
+        "{runs}\n{lines:?}\n{stderr}"
+    );
+    assert_eq!(state_of(&b), Some("succeeded".into()), "{runs}");
+    // no merge-stage gate is configured, so both verified branches go straight through the queue
+    assert_eq!(queue_states(&g), vec![MergeState::Merged, MergeState::Merged]);
+}
+
+#[test]
+fn the_check_of_main_after_a_merge_runs_in_the_background() {
+    let g = gated(HOLD_GATE, "[\"main\"]", true);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+
+    let live = LiveServe::start(&g.repo, &LOOP);
+    let first = &live.first["result"];
+    assert_eq!(first["merge"]["items"][0]["state"], "merged", "{first}");
+    assert_eq!(first["gate_run"]["kind"], "main", "{first}");
+    assert_eq!(first["gate_run"]["issue"], a.as_str(), "{first}");
+    assert_eq!(first["gate_run"]["gate"], "hold", "{first}");
+    assert_eq!(
+        g.issue_status(&a),
+        "done",
+        "the merge is not held back by the check of main"
+    );
+    assert!(g
+        .event_kinds()
+        .contains(&("merge.main_check_pending".to_string(), Some(a.clone()))));
+
+    g.release();
+    let (lines, stderr) = live.finish();
+    let kinds = g.event_kinds();
+    assert!(
+        kinds.contains(&("merge.main_checked".to_string(), Some(a.clone()))),
+        "{kinds:?}\n{lines:?}\n{stderr}"
+    );
+    assert!(!kinds.iter().any(|(k, _)| k == "merge.main_red"), "{kinds:?}");
+    assert_eq!(g.runs().len(), 1);
+}
+
+#[test]
+fn a_check_of_main_left_pending_by_a_stopped_serve_is_run_again_and_a_red_one_is_reported() {
+    let g = gated(RED_GATE, "[\"main\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    // merged by hand while `verify_main_after` is off, then the operator turns it on ...
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    let cfg = g.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        s.replace("verify_main_after = false", "verify_main_after = true"),
+    )
+    .unwrap();
+    // ... and a previous serve died between the merge and the end of its check
+    g.store()
+        .append_event(&NewEvent {
+            kind: "merge.main_check_pending".into(),
+            issue_id: Some(a.parse().unwrap()),
+            run_id: None,
+            actor: Some("orchestrator".into()),
+            payload: serde_json::json!({}),
+        })
+        .unwrap();
+
+    let out = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let kinds = g.event_kinds();
+    assert!(
+        kinds.contains(&("merge.main_red".to_string(), Some(a.clone()))),
+        "{kinds:?}"
+    );
+    let item = &g.store().merge_queue().unwrap()[0];
+    assert_eq!(item.state, MergeState::Merged, "no automatic revert");
+    assert_eq!(
+        item.last_error.as_deref(),
+        Some("main red after merge: gate `hold` failed (exit 7)")
+    );
+    // the check is over: a further serve does not run it again
+    let again = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
+    assert_eq!(again.status.code(), Some(0), "{again:?}");
+    let reds = g
+        .event_kinds()
+        .into_iter()
+        .filter(|(k, _)| k == "merge.main_red")
+        .count();
+    assert_eq!(reds, 1);
 }

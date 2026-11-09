@@ -4,7 +4,10 @@
 //! worker ran `asf issue finish` (issue `in-review`), and only the orchestrator decides `succeeded`.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use asf_core::config::GateWhen;
 use asf_core::*;
@@ -90,6 +93,220 @@ pub struct WatchResult {
 pub struct ShowResult {
     pub run: Run,
     pub agent: Option<AgentInfo>,
+}
+
+/// Where the gates of a verification or of a merge step run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// In the calling thread: the call returns when the gates are finished (one-shot commands).
+    Inline,
+    /// On the `GateSlot` of `asf serve`: the call starts the gate run and returns at once; a later tick
+    /// concludes it. Store writes stay on the tick thread either way.
+    Background,
+}
+
+/// A worker's verification waiting for its gates (`GateWhen::Verify`, in the run's worktree).
+pub struct VerifyJob {
+    /// The run as it was before the verification set it `verifying` (the transition starts there).
+    pub run: Run,
+    pub issue: Issue,
+    pub wt: PathBuf,
+    /// What the cheap checks before the gates found; the gates add their own.
+    pub problems: Vec<String>,
+    pub changed: usize,
+}
+
+/// A rebased merge-queue item waiting for its gates (`GateWhen::Merge`, in its worktree).
+pub struct MergeJob {
+    pub item: MergeItem,
+    pub run: Option<Run>,
+    pub wt: PathBuf,
+}
+
+/// The check of the default branch after `item` was merged (`GateWhen::Main`, in the repository root).
+/// `covered` are further merged items whose check was still pending: one run answers for all of them.
+pub struct MainJob {
+    pub item: MergeItem,
+    pub head: String,
+    pub covered: Vec<IssueId>,
+}
+
+/// What a gate run is for, with what the tick needs to conclude it once the gates are done.
+pub enum Job {
+    Verify(VerifyJob),
+    Merge(MergeJob),
+    Main(MainJob),
+}
+
+impl Job {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Job::Verify(_) => "verify",
+            Job::Merge(_) => "merge",
+            Job::Main(_) => "main",
+        }
+    }
+
+    pub fn issue(&self) -> &IssueId {
+        match self {
+            Job::Verify(j) => &j.run.issue_id,
+            Job::Merge(j) => &j.item.issue_id,
+            Job::Main(j) => &j.item.issue_id,
+        }
+    }
+}
+
+/// A gate run that is over: the job and what its gates reported (every gate that ran, the failed one last).
+pub struct Finished {
+    pub job: Job,
+    pub results: Vec<GateResult>,
+}
+
+/// The gate run in flight, as the tick report shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GateRun {
+    /// `verify`, `merge` or `main`.
+    pub kind: &'static str,
+    pub issue: IssueId,
+    /// The gate being run right now.
+    pub gate: String,
+    pub seconds: u64,
+}
+
+struct Running {
+    job: Job,
+    since: Instant,
+    gate: Arc<Mutex<String>>,
+    results: mpsc::Receiver<Vec<GateResult>>,
+}
+
+/// The one place where a gate run can be in flight while `asf serve` goes on ticking. Gate runs are
+/// heavy (a full `cargo test` fights over the linker and the antivirus), so there is room for one.
+///
+/// The thread behind a run executes the gate commands and nothing else: it holds no store, no `Ctx`
+/// and no transaction. Everything that must be written (state, comments, events) is written by the tick
+/// thread when `take_finished` hands the result over, so nothing but the thread itself lives only in
+/// memory. A restart loses the thread and the store still says `gating`/`verifying`/pending, which
+/// is what the recovery on the next start acts on.
+#[derive(Default)]
+pub struct GateSlot {
+    running: Option<Running>,
+    started: u64,
+}
+
+fn gate_failure(name: &str, why: String) -> GateResult {
+    GateResult {
+        name: name.to_string(),
+        ok: false,
+        exit_code: None,
+        duration_ms: 0,
+        tail: why,
+        attempts: 0,
+    }
+}
+
+/// Runs the gates in order, stopping at the first failure like `run_gates`, and tells `current` the
+/// name of each gate before it starts.
+fn run_gates_reporting(specs: &[GateSpec], cwd: &Path, mut current: impl FnMut(&str)) -> Vec<GateResult> {
+    let mut results = Vec::new();
+    for spec in specs {
+        current(&spec.name);
+        let one = run_gates(std::slice::from_ref(spec), cwd);
+        let stop = one.last().is_some_and(|r| !r.ok);
+        results.extend(one);
+        if stop {
+            break;
+        }
+    }
+    results
+}
+
+impl GateSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// How many gate runs were started on this slot; a tick compares it before and after to learn
+    /// whether it started one.
+    pub fn started(&self) -> u64 {
+        self.started
+    }
+
+    /// Starts `specs` in `cwd` on a new thread. With nothing to run, or when no thread can be had, the
+    /// run is over at once and comes back as `Some`; the caller concludes it like any other. The slot
+    /// must be free (`is_busy`): two gate runs at a time is what this type exists to prevent.
+    pub fn start(&mut self, job: Job, specs: Vec<GateSpec>, cwd: PathBuf) -> Option<Finished> {
+        assert!(!self.is_busy(), "a gate run is already in flight");
+        if specs.is_empty() {
+            return Some(Finished {
+                job,
+                results: Vec::new(),
+            });
+        }
+        let (tx, results) = mpsc::channel();
+        // named before the thread exists, so the report never shows a run with no gate
+        let gate = Arc::new(Mutex::new(specs[0].name.clone()));
+        let shared = Arc::clone(&gate);
+        let spawned = thread::Builder::new().name("asf-gates".into()).spawn(move || {
+            let results = run_gates_reporting(&specs, &cwd, |name| {
+                *shared.lock().unwrap_or_else(PoisonError::into_inner) = name.to_string();
+            });
+            let _ = tx.send(results);
+        });
+        if let Err(e) = spawned {
+            return Some(Finished {
+                job,
+                results: vec![gate_failure(
+                    "gate runner",
+                    format!("cannot start the gate thread: {e}"),
+                )],
+            });
+        }
+        self.started += 1;
+        self.running = Some(Running {
+            job,
+            since: Instant::now(),
+            gate,
+            results,
+        });
+        None
+    }
+
+    /// The gate run in flight, if any, once its gates are done; frees the slot.
+    pub fn take_finished(&mut self) -> Option<Finished> {
+        let results = match self.running.as_ref()?.results.try_recv() {
+            Ok(results) => results,
+            Err(TryRecvError::Empty) => return None,
+            // the thread died without a word (a panic): that is a failed gate run, not a green one
+            Err(TryRecvError::Disconnected) => {
+                let name = self.current().map(|r| r.gate).unwrap_or_default();
+                vec![gate_failure(
+                    &name,
+                    "the gate thread died before it reported".into(),
+                )]
+            }
+        };
+        let running = self.running.take()?;
+        Some(Finished {
+            job: running.job,
+            results,
+        })
+    }
+
+    /// The gate run in flight: whose it is, which gate runs now and for how long the run has been going.
+    pub fn current(&self) -> Option<GateRun> {
+        let r = self.running.as_ref()?;
+        Some(GateRun {
+            kind: r.job.kind(),
+            issue: r.job.issue().clone(),
+            gate: r.gate.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            seconds: r.since.elapsed().as_secs(),
+        })
+    }
 }
 
 fn fwd(p: &Path) -> String {
@@ -1113,8 +1330,16 @@ impl<'a> Worker<'a> {
         Ok(run)
     }
 
-    /// One pass over the active runs.
+    /// One pass over the active runs; the runs that wait for verification are verified (gates and all)
+    /// before it returns.
     pub fn watch(&self) -> Result<WatchResult, AppError> {
+        self.watch_in(GateMode::Inline)
+    }
+
+    /// `watch` in either mode. In `Background` mode the pass only looks at the agents (blocked, working,
+    /// heartbeat): runs that wait for verification are left alone, because verifying them takes a gate
+    /// run and the tick must not wait for one. `start_verification` hands them to the gate slot.
+    pub fn watch_in(&self, mode: GateMode) -> Result<WatchResult, AppError> {
         let store = &self.ctx.store;
         let active = store.runs(None, true)?;
         let mut transitions = Vec::new();
@@ -1129,8 +1354,10 @@ impl<'a> Worker<'a> {
             let handle = Self::handle(run)?;
             let info = self.rt.info(&handle).ok();
             if issue.status == Status::InReview {
-                let t = self.verify(run, &issue)?;
-                transitions.push(t);
+                if mode == GateMode::Inline {
+                    let t = self.verify(run, &issue)?;
+                    transitions.push(t);
+                }
                 continue;
             }
             let Some(info) = info else { continue };
@@ -1186,7 +1413,11 @@ impl<'a> Worker<'a> {
                 _ => {}
             }
         }
-        let again = self.finished_again()?;
+        let again = if mode == GateMode::Inline {
+            self.finished_again()?
+        } else {
+            Vec::new()
+        };
         for (run, issue) in &again {
             transitions.push(self.verify(run, issue)?);
         }
@@ -1194,6 +1425,65 @@ impl<'a> Worker<'a> {
             checked: active.len() + again.len(),
             transitions,
         })
+    }
+
+    /// The run that waits longest for its verification: an active run whose worker has finished
+    /// (issue `in-review`, which includes a run a stopped `asf serve` left `verifying`), else a failed
+    /// run whose worker has finished again.
+    fn next_to_verify(&self) -> Result<Option<(Run, Issue)>, AppError> {
+        let store = &self.ctx.store;
+        for run in store.runs(None, true)? {
+            if run.state == RunState::Starting {
+                continue;
+            }
+            let Some(issue) = store.get_issue(&run.issue_id)? else {
+                continue;
+            };
+            if issue.status == Status::InReview {
+                return Ok(Some((run, issue)));
+            }
+        }
+        Ok(self.finished_again()?.into_iter().next())
+    }
+
+    /// Hands the next run that waits for verification to the gate slot (if it is free): the cheap checks
+    /// run now, the gates in the background. A verification with no gates to run is over at once, and
+    /// the next run gets its turn. Returns the verifications that ended in this call.
+    pub fn start_verification(&self, slot: &mut GateSlot) -> Result<Vec<Transition>, AppError> {
+        let mut ended = Vec::new();
+        while !slot.is_busy() {
+            let Some((run, issue)) = self.next_to_verify()? else {
+                break;
+            };
+            let job = self.verify_prepare(&run, &issue)?;
+            let wt = job.wt.clone();
+            let Some(finished) = slot.start(Job::Verify(job), self.verify_specs(), wt) else {
+                break;
+            };
+            let Job::Verify(job) = finished.job else {
+                unreachable!("the slot hands back the job it was given");
+            };
+            ended.push(self.verify_conclude(job, finished.results)?);
+        }
+        Ok(ended)
+    }
+
+    /// The end of a verification that ran on the gate slot. `None` when the run is no longer
+    /// `verifying` (the operator aborted it while the gates ran): its result belongs to nobody.
+    pub fn conclude_verification(
+        &self,
+        job: VerifyJob,
+        results: Vec<GateResult>,
+    ) -> Result<Option<Transition>, AppError> {
+        let still_verifying = self
+            .ctx
+            .store
+            .get_run(&job.run.id)?
+            .is_some_and(|r| r.state == RunState::Verifying);
+        if !still_verifying {
+            return Ok(None);
+        }
+        self.verify_conclude(job, results).map(Some)
     }
 
     /// Failed runs whose worker has finished again: the issue's latest run is `failed`, the issue is
@@ -1277,8 +1567,20 @@ impl<'a> Worker<'a> {
         Ok(String::from_utf8_lossy(&text).into_owned())
     }
 
-    /// Independent verification after the worker's finish ritual.
+    /// Independent verification after the worker's finish ritual, gates included, in this thread.
     fn verify(&self, run: &Run, issue: &Issue) -> Result<Transition, AppError> {
+        let job = self.verify_prepare(run, issue)?;
+        let results = run_gates(&self.verify_specs(), &job.wt);
+        self.verify_conclude(job, results)
+    }
+
+    fn verify_specs(&self) -> Vec<GateSpec> {
+        stage_specs(&self.ctx.config.gates, GateWhen::Verify)
+    }
+
+    /// The cheap part of a verification: the run goes `verifying`, then the report, the worktree and the
+    /// scope are checked. What the checks found travels with the job; the gates come next.
+    fn verify_prepare(&self, run: &Run, issue: &Issue) -> Result<VerifyJob, AppError> {
         let wt_abs = self.ctx.root.join(&run.worktree);
         let mut problems: Vec<String> = Vec::new();
         self.set_state(run, RunState::Verifying, None)?;
@@ -1317,8 +1619,26 @@ impl<'a> Worker<'a> {
                 outside.join(", ")
             ));
         }
-        let specs = stage_specs(&self.ctx.config.gates, GateWhen::Verify);
-        let results = run_gates(&specs, &wt_abs);
+        Ok(VerifyJob {
+            run: run.clone(),
+            issue: issue.clone(),
+            wt: wt_abs,
+            problems,
+            changed: changed.len(),
+        })
+    }
+
+    /// The end of a verification: the gates' verdict joins the problems of the cheap checks, and the
+    /// run is `succeeded` (and queued for merge) or `failed` (with a BLOCKER).
+    fn verify_conclude(&self, job: VerifyJob, results: Vec<GateResult>) -> Result<Transition, AppError> {
+        let VerifyJob {
+            run,
+            issue,
+            mut problems,
+            changed,
+            ..
+        } = job;
+        let (run, issue) = (&run, &issue);
         for r in results.iter().filter(|r| !r.ok) {
             problems.push(format!(
                 "gate `{}` failed (exit {:?}):\n{}",
@@ -1377,7 +1697,7 @@ impl<'a> Worker<'a> {
                 issue_id: run.issue_id.clone(),
                 from: run.state,
                 to: RunState::Succeeded,
-                detail: format!("{} files, {} gates", changed.len(), results.len()),
+                detail: format!("{changed} files, {} gates", results.len()),
             })
         } else {
             let reason = problems.join("\n");
@@ -1756,5 +2076,123 @@ mod tests {
         assert_ne!(again.run.id, first.run.id);
         assert_eq!(again.run.state, RunState::Working);
         assert_eq!(reviews(&fx).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod gate_slot_tests {
+    use super::*;
+
+    fn spec(name: &str, code: &str) -> GateSpec {
+        GateSpec {
+            name: name.to_string(),
+            cmd: vec!["python".into(), "-c".into(), code.into()],
+            timeout_s: 60,
+            shell: None,
+        }
+    }
+
+    fn job(id: u32) -> Job {
+        Job::Merge(MergeJob {
+            item: MergeItem {
+                id: i64::from(id),
+                issue_id: format!("asf-{id}").parse().unwrap(),
+                run_id: None,
+                branch: format!("feat/asf-{id}"),
+                state: MergeState::Gating,
+                attempts: 1,
+                head_sha: None,
+                rebased_onto: None,
+                pr_url: None,
+                gate_results: Vec::new(),
+                last_error: None,
+                enqueued_at: String::new(),
+                updated_at: String::new(),
+            },
+            run: None,
+            wt: PathBuf::new(),
+        })
+    }
+
+    /// Polls the slot until its run is over (15 s at most).
+    fn wait(slot: &mut GateSlot) -> Finished {
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(f) = slot.take_finished() {
+                return f;
+            }
+            assert!(Instant::now() < until, "the gate run never finished");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_run_names_the_gate_in_flight_and_hands_over_its_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let hold = format!(
+            "import os, time\nwhile not os.path.exists({:?}):\n    time.sleep(0.05)",
+            release.to_string_lossy().replace('\\', "/")
+        );
+        let mut slot = GateSlot::new();
+        assert!(!slot.is_busy() && slot.current().is_none());
+        assert!(slot
+            .start(job(4), vec![spec("hold", &hold)], dir.path().to_path_buf())
+            .is_none());
+        assert!(slot.is_busy());
+        assert_eq!(slot.started(), 1);
+        let now = slot.current().unwrap();
+        assert_eq!(
+            (now.kind, now.issue.to_string(), now.gate.as_str()),
+            ("merge", "asf-4".into(), "hold")
+        );
+        assert!(slot.take_finished().is_none(), "the gate is still waiting");
+
+        std::fs::write(&release, "").unwrap();
+        let done = wait(&mut slot);
+        assert_eq!(done.job.issue().to_string(), "asf-4");
+        assert_eq!(done.results.len(), 1);
+        assert!(done.results[0].ok, "{:?}", done.results);
+        assert!(
+            !slot.is_busy() && slot.current().is_none(),
+            "the slot is free again"
+        );
+    }
+
+    #[test]
+    fn gates_run_in_order_and_stop_at_the_first_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = GateSlot::new();
+        let specs = vec![
+            spec("one", "pass"),
+            spec("two", "import sys; sys.exit(3)"),
+            spec("three", "pass"),
+        ];
+        assert!(slot.start(job(1), specs, dir.path().to_path_buf()).is_none());
+        let done = wait(&mut slot);
+        let names: Vec<_> = done.results.iter().map(|r| (r.name.as_str(), r.ok)).collect();
+        assert_eq!(names, [("one", true), ("two", false)]);
+        assert_eq!(done.results[1].exit_code, Some(3));
+    }
+
+    #[test]
+    fn a_run_without_gates_is_over_at_once_and_takes_no_slot() {
+        let mut slot = GateSlot::new();
+        let done = slot
+            .start(job(2), Vec::new(), PathBuf::new())
+            .expect("nothing to wait for");
+        assert!(done.results.is_empty());
+        assert!(!slot.is_busy());
+        assert_eq!(slot.started(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "already in flight")]
+    fn a_second_run_is_refused_while_one_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = GateSlot::new();
+        let slow = spec("slow", "import time; time.sleep(3)");
+        let _ = slot.start(job(1), vec![slow.clone()], dir.path().to_path_buf());
+        let _ = slot.start(job(2), vec![slow], dir.path().to_path_buf());
     }
 }

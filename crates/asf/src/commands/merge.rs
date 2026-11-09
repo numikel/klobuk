@@ -15,7 +15,22 @@ use serde::Serialize;
 use crate::cli::{Cli, MergeCmd};
 use crate::ctx::{Ctx, FACTORY_DIR};
 use crate::output::{AppError, ErrorCode, Rendered};
-use crate::worker::{Worker, RUNS_DIR};
+use crate::worker::{Finished, GateMode, GateSlot, Job, MainJob, MergeJob, Worker, RUNS_DIR};
+
+/// Event `asf serve` appends for a merged item whose check of the default branch (`[merge]
+/// verify_main_after`) has to run in the background. It is pending until `MAIN_CHECKED` or `MAIN_RED`
+/// follows for the same issue, so a check that a stopped serve never finished is run again.
+const MAIN_CHECK_PENDING: &str = "merge.main_check_pending";
+
+/// Event that ends a pending check of the default branch: it was green, or another check answered for it.
+const MAIN_CHECKED: &str = "merge.main_checked";
+
+/// Event that ends a pending check of the default branch: it was red (the item stays merged).
+const MAIN_RED: &str = "merge.main_red";
+
+/// Event `asf serve` appends when it starts and finds an item that a stopped serve left in `rebasing`
+/// or `gating`: the item goes back to `queued`, same row, same place in the queue.
+const MERGE_RECOVERED: &str = "merge.recovered";
 
 /// Event the queue appends when a review round starts; its `after_comment` is the id of the newest
 /// comment at that moment, so verdicts of earlier rounds are never read again.
@@ -160,6 +175,10 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
 /// Processes queued items in FIFO order (`once` = at most one), looking at every item waiting for
 /// its reviewer on the way, then, for the GitHub target, polls every open pull request; a look that
 /// changes nothing is not reported.
+///
+/// Everything happens in this call, the gates included: it returns when the item it started is
+/// finished. `asf serve` does not call this; its loop uses `poll`, `start_next` and the `conclude_*`
+/// functions, which hand the gates to a `GateSlot`.
 pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
     let mut items = Vec::new();
     let queue = ctx.store.merge_queue()?;
@@ -175,7 +194,7 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
             }
             process(ctx, next)?
         } else {
-            match poll_review(ctx, next)? {
+            match poll_review(ctx, next, GateMode::Inline)? {
                 Some(changed) => changed,
                 None => continue,
             }
@@ -189,7 +208,7 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
     // a red default branch halts the whole tick: nothing else may be merged or integrated on top of it
     if !main_red && ctx.config.merge.target == "github" && (!once || items.is_empty()) {
         for open in queue.iter().filter(|m| m.state == MergeState::PrOpen) {
-            if let Some(changed) = poll_pr(ctx, open)? {
+            if let Some(changed) = poll_pr(ctx, open, GateMode::Inline)? {
                 main_red = is_main_red(&changed);
                 items.push(changed);
                 if once || main_red {
@@ -202,6 +221,278 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
         processed: items.len(),
         items,
     })
+}
+
+/// The cheap half of a merge tick for `asf serve`: reads the verdict of every item waiting for its
+/// reviewer (an approved one is merged on the spot) and, for the GitHub target, looks at every open
+/// pull request. It runs no gates: a merge that lands here only leaves a pending check of the default
+/// branch (see `start_next`).
+pub fn poll(ctx: &Ctx) -> Result<TickResult, AppError> {
+    let mut items = Vec::new();
+    let queue = ctx.store.merge_queue()?;
+    for waiting in queue.iter().filter(|m| m.state == MergeState::Reviewing) {
+        if let Some(changed) = poll_review(ctx, waiting, GateMode::Background)? {
+            items.push(changed);
+        }
+    }
+    if ctx.config.merge.target == "github" {
+        for open in queue.iter().filter(|m| m.state == MergeState::PrOpen) {
+            if let Some(changed) = poll_pr(ctx, open, GateMode::Background)? {
+                items.push(changed);
+            }
+        }
+    }
+    Ok(TickResult {
+        processed: items.len(),
+        items,
+    })
+}
+
+/// The first queued item after those in `passed`, in queue order (the merge item id, so a re-queued
+/// item keeps the place it had).
+fn next_queued<'a>(queue: &'a [MergeItem], passed: &[i64]) -> Option<&'a MergeItem> {
+    queue
+        .iter()
+        .find(|m| m.state == MergeState::Queued && !passed.contains(&m.id))
+}
+
+/// Starts the next gate run on `slot` when the slot is free, and returns the items that changed on the
+/// way (an item that failed or blocked before its gates, or whose run had no gates to wait for).
+///
+/// What goes first: the pending check of the default branch after a merge, then the head of the queue.
+/// Nothing is started while a run is in flight, which is what keeps the queue strictly FIFO: an item
+/// is gated alone, and a later one never overtakes it. The cheap part of an item (the rebase, the
+/// scope check) runs here, on the tick thread; only its gates leave it.
+pub fn start_next(ctx: &Ctx, slot: &mut GateSlot) -> Result<TickResult, AppError> {
+    let mut items = Vec::new();
+    let mut passed: Vec<i64> = Vec::new();
+    while !slot.is_busy() {
+        if let Some(job) = next_main_check(ctx)? {
+            let specs = gate_specs(ctx, GateWhen::Main);
+            if let Some(finished) = slot.start(Job::Main(job), specs, ctx.root.clone()) {
+                let ended = conclude_finished(ctx, finished)?;
+                let red = ended.iter().any(is_main_red);
+                items.extend(ended);
+                if red {
+                    break;
+                }
+            }
+            continue;
+        }
+        let queue = ctx.store.merge_queue()?;
+        let Some(next) = next_queued(&queue, &passed) else {
+            break;
+        };
+        passed.push(next.id);
+        // every reviewer slot is taken: the item stays queued, untouched, and is looked at again later
+        if waits_for_reviewer(ctx, next)? {
+            continue;
+        }
+        match prepare(ctx, next)? {
+            Prepared::Ended(done) => items.push(*done),
+            Prepared::Gates(job) => {
+                let (specs, wt) = (gate_specs(ctx, GateWhen::Merge), job.wt.clone());
+                if let Some(finished) = slot.start(Job::Merge(*job), specs, wt) {
+                    items.extend(conclude_finished(ctx, finished)?);
+                }
+            }
+        }
+    }
+    Ok(TickResult {
+        processed: items.len(),
+        items,
+    })
+}
+
+/// Concludes a gate run that `start_next` itself got back, because there was nothing to wait for.
+fn conclude_finished(ctx: &Ctx, finished: Finished) -> Result<Vec<MergeItem>, AppError> {
+    match finished.job {
+        Job::Merge(job) => conclude_merge(ctx, job, finished.results).map(|i| i.into_iter().collect()),
+        Job::Main(job) => conclude_main(ctx, job, finished.results).map(|i| vec![i]),
+        Job::Verify(_) => unreachable!("start_next starts no verification"),
+    }
+}
+
+/// The end of a merge-queue gate run that ran on the slot: the item goes on to review or to the merge,
+/// or fails with the gate's tail. `None` when the item is no longer `gating` (the operator skipped or
+/// retried it while the gates ran): the result belongs to nobody. An error while concluding fails the
+/// item, so it cannot stay `gating` with no gate run behind it.
+pub fn conclude_merge(
+    ctx: &Ctx,
+    job: MergeJob,
+    results: Vec<GateResult>,
+) -> Result<Option<MergeItem>, AppError> {
+    let still_gating = ctx
+        .store
+        .merge_queue()?
+        .iter()
+        .any(|m| m.id == job.item.id && m.state == MergeState::Gating);
+    if !still_gating {
+        return Ok(None);
+    }
+    let item = job.item.clone();
+    match conclude(ctx, job, results, GateMode::Background) {
+        Ok(done) => Ok(Some(done)),
+        Err(e) => {
+            let msg = format!("concluding the gate run failed: {}", e.message);
+            let _ = fail(ctx, &item, MergeState::Failed, msg, None);
+            Err(e)
+        }
+    }
+}
+
+/// The end of a check of the default branch that ran on the slot (see `verify_main`). It answers for
+/// the item and for every other merged item whose check was pending; a red verdict is reported on the item.
+pub fn conclude_main(ctx: &Ctx, job: MainJob, results: Vec<GateResult>) -> Result<MergeItem, AppError> {
+    let MainJob { item, head, covered } = job;
+    let green = results.iter().all(|r| r.ok);
+    let verdict = main_verdict(ctx, item.clone(), &head, &results)?;
+    let mut ended: Vec<(&IssueId, serde_json::Value)> = Vec::new();
+    if green {
+        ended.push((&item.issue_id, serde_json::json!({ "head": head })));
+    }
+    for id in &covered {
+        ended.push((
+            id,
+            serde_json::json!({ "covered_by": item.issue_id, "head": head }),
+        ));
+    }
+    for (id, payload) in ended {
+        ctx.store.append_event(&NewEvent {
+            kind: MAIN_CHECKED.into(),
+            issue_id: Some(id.clone()),
+            run_id: None,
+            actor: Some(LANE_ORCHESTRATOR.into()),
+            payload,
+        })?;
+    }
+    Ok(verdict)
+}
+
+/// Puts the items a stopped `asf serve` left in `rebasing` or `gating` back in the queue, and returns
+/// their issues. Their gate run died with the process, and nothing else would ever touch them again.
+/// The row stays, so the item keeps its place; a rebase that was cut short is aborted in the worktree.
+/// Meant for the start of the serve loop: the one-shot commands do not call it, so a `merge tick`
+/// running next to a serve is not mistaken for a dead one.
+pub fn recover_orphans(ctx: &Ctx) -> Result<Vec<IssueId>, AppError> {
+    let mut back = Vec::new();
+    for item in ctx
+        .store
+        .merge_queue()?
+        .iter()
+        .filter(|m| matches!(m.state, MergeState::Rebasing | MergeState::Gating))
+    {
+        if item.state == MergeState::Rebasing {
+            let (_, _, wt) = locate(ctx, item)?;
+            abort_rebase(&wt);
+        }
+        set(
+            ctx,
+            item.id,
+            MergePatch {
+                state: Some(MergeState::Queued),
+                last_error: Some(None),
+                ..MergePatch::default()
+            },
+        )?;
+        ctx.store.append_event(&NewEvent {
+            kind: MERGE_RECOVERED.into(),
+            issue_id: Some(item.issue_id.clone()),
+            run_id: item.run_id.clone(),
+            actor: Some(LANE_ORCHESTRATOR.into()),
+            payload: serde_json::json!({ "from": item.state.to_string() }),
+        })?;
+        back.push(item.issue_id.clone());
+    }
+    Ok(back)
+}
+
+/// Best effort: a rebase that a dying process left half done in `wt` would make the next one fail.
+fn abort_rebase(wt: &std::path::Path) {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("git")
+        .args(["rebase", "--abort"])
+        .current_dir(wt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Issues whose check of the default branch was started by a merge and has no verdict yet, oldest first.
+fn pending_main_checks(ctx: &Ctx) -> Result<Vec<IssueId>, AppError> {
+    let mut events = Vec::new();
+    let mut seq = 0;
+    loop {
+        let page = ctx.store.events_since(seq, 500)?;
+        let Some(last) = page.last() else { break };
+        seq = last.seq;
+        events.extend(page);
+    }
+    Ok(fold_pending_checks(&events))
+}
+
+/// Whether a merge left a check of the default branch that has not been run yet. Read-only; the serve
+/// loop asks it to know that it is not done while such a check is owed.
+pub fn main_check_owed(ctx: &Ctx) -> Result<bool, AppError> {
+    Ok(ctx.config.merge.verify_main_after && !pending_main_checks(ctx)?.is_empty())
+}
+
+fn fold_pending_checks(events: &[Event]) -> Vec<IssueId> {
+    let mut pending: Vec<IssueId> = Vec::new();
+    for e in events {
+        let Some(id) = &e.issue_id else { continue };
+        match e.kind.as_str() {
+            MAIN_CHECK_PENDING => {
+                pending.retain(|p| p != id);
+                pending.push(id.clone());
+            }
+            MAIN_CHECKED | MAIN_RED => pending.retain(|p| p != id),
+            _ => {}
+        }
+    }
+    pending
+}
+
+/// The check of the default branch to run next, if a merge left one pending. One run answers for all of
+/// them, so the newest merged item is the subject and the older ones are covered by it; a pending
+/// check whose item is no longer merged (it was queued again) is ended without a run.
+fn next_main_check(ctx: &Ctx) -> Result<Option<MainJob>, AppError> {
+    if !ctx.config.merge.verify_main_after {
+        return Ok(None);
+    }
+    let pending = pending_main_checks(ctx)?;
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let queue = ctx.store.merge_queue()?;
+    let mut subject: Option<MergeItem> = None;
+    let mut covered = Vec::new();
+    for id in pending.iter().rev() {
+        let merged = queue
+            .iter()
+            .find(|m| &m.issue_id == id && m.state == MergeState::Merged);
+        match (merged, &subject) {
+            (Some(item), None) => subject = Some(item.clone()),
+            _ => covered.push(id.clone()),
+        }
+    }
+    let Some(item) = subject else {
+        for id in covered {
+            ctx.store.append_event(&NewEvent {
+                kind: MAIN_CHECKED.into(),
+                issue_id: Some(id),
+                run_id: None,
+                actor: Some(LANE_ORCHESTRATOR.into()),
+                payload: serde_json::json!({ "skipped": "the item is no longer merged" }),
+            })?;
+        }
+        return Ok(None);
+    };
+    let head = GitCli
+        .head(&ctx.root)
+        .unwrap_or_else(|_| item.head_sha.clone().unwrap_or_default());
+    Ok(Some(MainJob { item, head, covered }))
 }
 
 fn find(ctx: &Ctx, id: &IssueId) -> Result<MergeItem, AppError> {
@@ -261,7 +552,7 @@ fn last_lines(text: &str, n: usize) -> String {
 }
 
 /// A merged item whose post-merge gate run on the repo root failed: still `merged`, but carrying the error.
-fn is_main_red(item: &MergeItem) -> bool {
+pub(crate) fn is_main_red(item: &MergeItem) -> bool {
     item.state == MergeState::Merged && item.last_error.is_some()
 }
 
@@ -294,9 +585,35 @@ fn locate(ctx: &Ctx, item: &MergeItem) -> Result<(Option<Run>, String, std::path
     Ok((run, worktree_rel, wt))
 }
 
-/// Rebase → gates → (review) → ff-merge for one queued item. Never returns `Err` for a merge
-/// problem: the problem lands in the item's state and `last_error`.
+/// Rebase → gates → (review) → ff-merge for one queued item, the gates run in this thread. Never
+/// returns `Err` for a merge problem: the problem lands in the item's state and `last_error`.
 fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
+    match prepare(ctx, item)? {
+        Prepared::Ended(done) => Ok(*done),
+        Prepared::Gates(job) => {
+            let results = run_gates(&gate_specs(ctx, GateWhen::Merge), &job.wt);
+            conclude(ctx, *job, results, GateMode::Inline)
+        }
+    }
+}
+
+/// What the cheap part of `process` leaves to do.
+enum Prepared {
+    /// The item ended before its gates: blocked by a conflict or by files out of scope, or failed.
+    Ended(Box<MergeItem>),
+    /// Rebased and in scope, the item is `gating`: the gates come next, then `conclude`.
+    Gates(Box<MergeJob>),
+}
+
+impl Prepared {
+    fn ended(item: MergeItem) -> Self {
+        Prepared::Ended(Box::new(item))
+    }
+}
+
+/// The part of `process` before the gates: the worktree check, the rebase (onto the remote's state for
+/// the GitHub target) and the scope re-check, then the item goes `gating`.
+fn prepare(ctx: &Ctx, item: &MergeItem) -> Result<Prepared, AppError> {
     let vcs = GitCli;
     let default_branch = ctx.config.repo.default_branch.clone();
     let (run, worktree_rel, wt) = locate(ctx, item)?;
@@ -307,7 +624,8 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
             MergeState::Failed,
             format!("worktree {worktree_rel} does not exist"),
             None,
-        );
+        )
+        .map(Prepared::ended);
     }
     set(
         ctx,
@@ -330,7 +648,8 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
                 MergeState::Failed,
                 format!("cannot sync {default_branch} from {}/{base}: {e}", gh_cfg.remote),
                 None,
-            );
+            )
+            .map(Prepared::ended);
         }
     }
 
@@ -372,9 +691,12 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
                     item.branch, item.issue_id, item.issue_id
                 ),
             )?;
-            return Ok(updated);
+            return Ok(Prepared::ended(updated));
         }
-        Err(e) => return fail(ctx, item, MergeState::Failed, format!("rebase failed: {e}"), None),
+        Err(e) => {
+            return fail(ctx, item, MergeState::Failed, format!("rebase failed: {e}"), None)
+                .map(Prepared::ended)
+        }
     }
 
     // 2. scope re-check: the branch may have gained commits after verification
@@ -401,11 +723,11 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
                     item.issue_id
                 ),
             )?;
-            return Ok(updated);
+            return Ok(Prepared::ended(updated));
         }
     }
 
-    // 3. gates
+    // 3. the gates come next, in this thread or on the gate slot
     set(
         ctx,
         item.id,
@@ -414,7 +736,23 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
             ..MergePatch::default()
         },
     )?;
-    let results = run_gates(&gate_specs(ctx, GateWhen::Merge), &wt);
+    Ok(Prepared::Gates(Box::new(MergeJob {
+        item: item.clone(),
+        run,
+        wt,
+    })))
+}
+
+/// The part of `process` after the gates: the gates' verdict, then the review (if one is wanted) and
+/// the integration. `mode` says where a check of the default branch after a merge will run.
+fn conclude(
+    ctx: &Ctx,
+    job: MergeJob,
+    results: Vec<GateResult>,
+    mode: GateMode,
+) -> Result<MergeItem, AppError> {
+    let MergeJob { item, run, wt } = job;
+    let item = &item;
     if let Some(bad) = results.iter().find(|r| !r.ok) {
         let msg = format!(
             "gate `{}` failed (exit {:?}) after rebase:\n{}",
@@ -458,7 +796,7 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
     }
 
     // 5. integrate
-    integrate(ctx, item, &run, &wt, false)
+    integrate(ctx, item, &run, &wt, false, mode)
 }
 
 /// Push + pull request, or a local fast-forward. With `park_if_dirty` (an approved review) a main
@@ -469,11 +807,12 @@ fn integrate(
     run: &Option<Run>,
     wt: &std::path::Path,
     park_if_dirty: bool,
+    mode: GateMode,
 ) -> Result<MergeItem, AppError> {
     let vcs = GitCli;
     let default_branch = ctx.config.repo.default_branch.clone();
     if ctx.config.merge.target == "github" {
-        return open_pr(ctx, item, run, wt);
+        return open_pr(ctx, item, run, wt, mode);
     }
     set(
         ctx,
@@ -528,7 +867,7 @@ fn integrate(
             );
         }
     };
-    finalize_merged(ctx, item, run, new_head)
+    finalize_merged(ctx, item, run, new_head, mode)
 }
 
 /// Whether the default branch of the main checkout is no longer at the commit the item was rebased
@@ -895,7 +1234,7 @@ fn failed_review_starts_in_a_row(ctx: &Ctx, id: &IssueId) -> Result<usize, AppEr
 
 /// One look at an item waiting for its reviewer. `None` when there is no verdict of the current
 /// round yet (nothing is written) or the approved item is parked behind a dirty main.
-fn poll_review(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
+fn poll_review(ctx: &Ctx, item: &MergeItem, mode: GateMode) -> Result<Option<MergeItem>, AppError> {
     let boundary = round_boundary(ctx, &item.issue_id)?;
     let Some((_, verdict)) = verdicts(ctx, &item.issue_id)?
         .into_iter()
@@ -927,7 +1266,7 @@ fn poll_review(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppErro
                 .map(Some);
             }
             record_approval(ctx, item)?;
-            let done = integrate(ctx, item, &run, &wt, true)?;
+            let done = integrate(ctx, item, &run, &wt, true, mode)?;
             Ok((done.state != MergeState::Reviewing).then_some(done))
         }
         Verdict::Changes(findings) => request_changes(ctx, item, &findings).map(Some),
@@ -1115,6 +1454,7 @@ fn finalize_merged(
     item: &MergeItem,
     run: &Option<Run>,
     new_head: String,
+    mode: GateMode,
 ) -> Result<MergeItem, AppError> {
     let default_branch = ctx.config.repo.default_branch.clone();
     let updated = set(
@@ -1165,16 +1505,46 @@ fn finalize_merged(
         payload: serde_json::json!({ "head": new_head, "branch": item.branch, "pr_url": updated.pr_url }),
     })?;
     if ctx.config.merge.verify_main_after {
-        return verify_main(ctx, updated, &new_head);
+        return match mode {
+            GateMode::Inline => verify_main(ctx, updated, &new_head),
+            GateMode::Background => defer_main_check(ctx, updated),
+        };
     }
     Ok(updated)
 }
 
+/// Leaves the check of the default branch after a merge to the gate slot: the merge is already done and
+/// recorded, and a `merge.main_check_pending` event says that its check is still owed, so a stopped
+/// serve cannot lose it. The next `start_next` runs it (nothing else is gated before it).
+fn defer_main_check(ctx: &Ctx, merged: MergeItem) -> Result<MergeItem, AppError> {
+    if gate_specs(ctx, GateWhen::Main).is_empty() {
+        return Ok(merged);
+    }
+    ctx.store.append_event(&NewEvent {
+        kind: MAIN_CHECK_PENDING.into(),
+        issue_id: Some(merged.issue_id.clone()),
+        run_id: merged.run_id.clone(),
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload: serde_json::json!({ "branch": merged.branch, "head": merged.head_sha }),
+    })?;
+    Ok(merged)
+}
+
 /// Runs the gates in the repository root once the merge landed (local fast-forward or `pull_ff` after
-/// a merged PR), regardless of `require_clean_main`. A red gate leaves the item `merged` (no automatic
-/// revert) but records `last_error`, a BLOCKER comment and a `merge.main_red` event; the caller stops the tick.
+/// a merged PR), regardless of `require_clean_main`, and judges them (see `main_verdict`).
 fn verify_main(ctx: &Ctx, merged: MergeItem, head: &str) -> Result<MergeItem, AppError> {
     let results = run_gates(&gate_specs(ctx, GateWhen::Main), &ctx.root);
+    main_verdict(ctx, merged, head, &results)
+}
+
+/// A red gate leaves the item `merged` (no automatic revert) but records `last_error`, a BLOCKER comment
+/// and a `merge.main_red` event; the caller stops the tick.
+fn main_verdict(
+    ctx: &Ctx,
+    merged: MergeItem,
+    head: &str,
+    results: &[GateResult],
+) -> Result<MergeItem, AppError> {
     let Some(bad) = results.iter().find(|r| !r.ok) else {
         return Ok(merged);
     };
@@ -1203,7 +1573,7 @@ fn verify_main(ctx: &Ctx, merged: MergeItem, head: &str) -> Result<MergeItem, Ap
         ),
     )?;
     ctx.store.append_event(&NewEvent {
-        kind: "merge.main_red".into(),
+        kind: MAIN_RED.into(),
         issue_id: Some(merged.issue_id.clone()),
         run_id: merged.run_id.clone(),
         actor: Some(LANE_ORCHESTRATOR.into()),
@@ -1234,6 +1604,7 @@ fn open_pr(
     item: &MergeItem,
     run: &Option<Run>,
     wt: &std::path::Path,
+    mode: GateMode,
 ) -> Result<MergeItem, AppError> {
     let (gh, remote, base) = github(ctx)?;
     if let Err(e) = GitCli.push(wt, &remote, &item.branch, true) {
@@ -1262,7 +1633,7 @@ fn open_pr(
                     ..MergePatch::default()
                 },
             )?;
-            return integrate_remote(ctx, &queued, &remote, &base);
+            return integrate_remote(ctx, &queued, &remote, &base, mode);
         }
         _ => {
             let issue = ctx.store.get_issue(&item.issue_id)?;
@@ -1321,7 +1692,7 @@ fn open_pr(
 }
 
 /// One look at an open PR. `None` when nothing changed (checks still running).
-fn poll_pr(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
+fn poll_pr(ctx: &Ctx, item: &MergeItem, mode: GateMode) -> Result<Option<MergeItem>, AppError> {
     let (gh, remote, base) = github(ctx)?;
     let cfg = &ctx.config.merge.github;
     let pr = match gh.pr_find(&ctx.root, &item.branch) {
@@ -1340,7 +1711,7 @@ fn poll_pr(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
     };
     let url = pr.url.clone();
     match pr.state {
-        PrState::Merged => integrate_remote(ctx, item, &remote, &base).map(Some),
+        PrState::Merged => integrate_remote(ctx, item, &remote, &base, mode).map(Some),
         PrState::Closed => {
             let msg = format!("pull request {url} was closed on GitHub without merging");
             let updated = fail(ctx, item, MergeState::Failed, msg.clone(), None)?;
@@ -1403,7 +1774,7 @@ fn poll_pr(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
                         )
                         .map(Some);
                     }
-                    integrate_remote(ctx, item, &remote, &base).map(Some)
+                    integrate_remote(ctx, item, &remote, &base, mode).map(Some)
                 }
             }
         }
@@ -1411,7 +1782,13 @@ fn poll_pr(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
 }
 
 /// After GitHub merged the PR: fast-forward the local default branch from the remote and close out.
-fn integrate_remote(ctx: &Ctx, item: &MergeItem, remote: &str, base: &str) -> Result<MergeItem, AppError> {
+fn integrate_remote(
+    ctx: &Ctx,
+    item: &MergeItem,
+    remote: &str,
+    base: &str,
+    mode: GateMode,
+) -> Result<MergeItem, AppError> {
     set(
         ctx,
         item.id,
@@ -1425,7 +1802,7 @@ fn integrate_remote(ctx: &Ctx, item: &MergeItem, remote: &str, base: &str) -> Re
         None => None,
     };
     match GitCli.pull_ff(&ctx.root, remote, base) {
-        Ok(head) => finalize_merged(ctx, item, &run, head),
+        Ok(head) => finalize_merged(ctx, item, &run, head, mode),
         Err(e) => fail(
             ctx,
             item,
@@ -1433,5 +1810,101 @@ fn integrate_remote(ctx: &Ctx, item: &MergeItem, remote: &str, base: &str) -> Re
             format!("pull request merged, but `git pull --ff-only {remote} {base}` failed: {e}"),
             None,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: i64, state: MergeState) -> MergeItem {
+        MergeItem {
+            id,
+            issue_id: format!("asf-{id}").parse().unwrap(),
+            run_id: None,
+            branch: format!("feat/asf-{id}"),
+            state,
+            attempts: 0,
+            head_sha: None,
+            rebased_onto: None,
+            pr_url: None,
+            gate_results: Vec::new(),
+            last_error: None,
+            enqueued_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn event(seq: u64, kind: &str, issue: u32) -> Event {
+        Event {
+            seq,
+            ts: String::new(),
+            kind: kind.into(),
+            issue_id: Some(format!("asf-{issue}").parse().unwrap()),
+            run_id: None,
+            actor: None,
+            payload: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn the_head_of_the_queue_is_the_lowest_queued_row() {
+        let queue = [
+            item(1, MergeState::Merged),
+            item(2, MergeState::Gating),
+            item(3, MergeState::Queued),
+            item(4, MergeState::Queued),
+        ];
+        assert_eq!(next_queued(&queue, &[]).map(|m| m.id), Some(3));
+        assert_eq!(next_queued(&queue, &[3]).map(|m| m.id), Some(4));
+        assert_eq!(next_queued(&queue, &[3, 4]).map(|m| m.id), None);
+    }
+
+    #[test]
+    fn an_item_queued_again_after_main_moved_keeps_its_place_ahead_of_later_rows() {
+        // row 2 was approved, lost the fast-forward race and is `queued` again; row 3 waited all along
+        let queue = [item(2, MergeState::Queued), item(3, MergeState::Queued)];
+        assert_eq!(next_queued(&queue, &[]).map(|m| m.id), Some(2));
+    }
+
+    #[test]
+    fn a_check_stays_pending_until_a_verdict_for_the_same_issue() {
+        let events = [
+            event(1, MAIN_CHECK_PENDING, 1),
+            event(2, MAIN_CHECK_PENDING, 2),
+            event(3, MAIN_CHECKED, 1),
+            event(4, "merge.merged", 2),
+        ];
+        let pending = fold_pending_checks(&events);
+        assert_eq!(pending, vec!["asf-2".parse::<IssueId>().unwrap()]);
+    }
+
+    #[test]
+    fn a_red_verdict_ends_the_pending_check_too_and_a_new_merge_makes_it_pending_again() {
+        let events = [
+            event(1, MAIN_CHECK_PENDING, 7),
+            event(2, MAIN_RED, 7),
+            event(3, MAIN_CHECK_PENDING, 7),
+        ];
+        assert_eq!(fold_pending_checks(&events).len(), 1);
+        assert!(fold_pending_checks(&events[..2]).is_empty());
+    }
+
+    #[test]
+    fn pending_checks_are_listed_oldest_first() {
+        let events = [
+            event(1, MAIN_CHECK_PENDING, 3),
+            event(2, MAIN_CHECK_PENDING, 1),
+            event(3, MAIN_CHECK_PENDING, 3),
+        ];
+        let ids: Vec<String> = fold_pending_checks(&events)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            ids,
+            ["asf-1", "asf-3"],
+            "asf-3 was merged again, so it is the newest"
+        );
     }
 }

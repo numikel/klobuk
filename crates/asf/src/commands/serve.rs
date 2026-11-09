@@ -2,6 +2,16 @@
 //! watch active runs → process the merge queue → promote ready issues → close completed epics
 //! → (with `--dispatch`) start workers for the planned slots → sleep.
 //!
+//! A gate run takes 10 to 40 minutes, so in the loop it does not happen inside the tick. The tick
+//! hands the gates to a `GateSlot` (one run in flight at a time, a thread that runs the gate commands
+//! and nothing else) and the tick that finds the result concludes it. A tick therefore reads: conclude
+//! a finished gate run → watch the agents → read review verdicts → promote, close epics, dispatch →
+//! start the next gate run (a pending check of main, else the head of the merge queue, else the
+//! verification of a finished run) → notify. Dispatch never waits for the queue, and a tick ends in
+//! seconds. The tick report shows the run in flight as `gate_run`. When the loop starts, an item that a
+//! stopped serve left in `rebasing`/`gating` goes back to the queue. `--once` has no loop to return to:
+//! it runs the gates inside the call and returns when they are done.
+//!
 //! `--until-done` also checks after each tick whether to stop (`all_done`, `stuck`, `max_ticks`)
 //! and prints a final `{ticks, reason, open, runs, questions_waiting}` summary.
 //!
@@ -24,9 +34,9 @@ use crate::cli::{Cli, ServeArgs};
 use crate::ctx::{ConfigWatch, Ctx};
 use crate::output::{print_ok, AppError, Rendered};
 use crate::tui::app::unanswered_questions;
-use crate::worker::{self, WatchResult, Worker};
+use crate::worker::{self, GateMode, GateRun, GateSlot, Job, WatchResult, Worker};
 
-use super::merge::{tick_all, TickResult};
+use super::merge::{self, tick_all, TickResult};
 use super::remind::{self, RemindState};
 
 #[derive(Serialize)]
@@ -37,6 +47,13 @@ pub struct TickReport {
     pub merge: TickResult,
     pub started: Vec<IssueId>,
     pub start_errors: Vec<serde_json::Value>,
+    /// The gate run in flight when the tick ended (whose it is, which gate, for how many seconds);
+    /// `null` when none. Always `null` for `--once`, which waits for its gates.
+    pub gate_run: Option<GateRun>,
+    /// This tick started a gate run or concluded one, which is news for the operator even when nothing
+    /// else changed.
+    #[serde(skip)]
+    pub gate_event: bool,
     /// Unanswered QUESTIONs to the human plus runs in `blocked`; always present, `0` when none.
     pub questions_waiting: usize,
     /// Notifications sent in this tick for things that just started to wait for the human
@@ -74,11 +91,30 @@ fn waiting_line(n: usize) -> String {
     }
 }
 
-/// Order matters: merges close issues, and only then can their dependents be promoted.
-fn tick(ctx: &Ctx, dispatch: bool, reminders: &mut RemindState) -> Result<TickReport, AppError> {
-    let worker = Worker::new(ctx)?;
-    let watch = worker.watch()?;
-    let merge = tick_all(ctx, false)?;
+/// One tick. With no `gate` slot (`--once`) the gates run inside the call, in the order the loop used
+/// before gate runs left the tick; with one (the loop) they are handed to the slot.
+fn tick(
+    ctx: &Ctx,
+    dispatch: bool,
+    reminders: &mut RemindState,
+    gate: Option<&mut GateSlot>,
+) -> Result<TickReport, AppError> {
+    match gate {
+        None => tick_inline(ctx, dispatch, reminders),
+        Some(slot) => tick_background(ctx, dispatch, reminders, slot),
+    }
+}
+
+/// What `promote_and_dispatch` did.
+struct Dispatched {
+    promoted: Vec<IssueId>,
+    closed_epics: Vec<IssueId>,
+    started: Vec<IssueId>,
+    start_errors: Vec<serde_json::Value>,
+}
+
+/// Promotes what became ready, closes finished epics and, with `--dispatch`, starts the planned slots.
+fn promote_and_dispatch(ctx: &Ctx, worker: &Worker<'_>, dispatch: bool) -> Result<Dispatched, AppError> {
     let promoted = ctx.store.promote_ready()?;
     let closed_epics = ctx.store.close_completed_epics()?;
     let mut started = Vec::new();
@@ -94,16 +130,90 @@ fn tick(ctx: &Ctx, dispatch: bool, reminders: &mut RemindState) -> Result<TickRe
             }
         }
     }
+    Ok(Dispatched {
+        promoted,
+        closed_epics,
+        started,
+        start_errors,
+    })
+}
+
+/// Order matters: merges close issues, and only then can their dependents be promoted.
+fn tick_inline(ctx: &Ctx, dispatch: bool, reminders: &mut RemindState) -> Result<TickReport, AppError> {
+    let worker = Worker::new(ctx)?;
+    let watch = worker.watch()?;
+    let merge = tick_all(ctx, false)?;
+    let done = promote_and_dispatch(ctx, &worker, dispatch)?;
     // Last, so the notifications see the state this tick has just produced.
     let remind::Notices { alerts, reminders } =
         remind::send_due(ctx, &*worker.rt, reminders, time::OffsetDateTime::now_utc())?;
     Ok(TickReport {
-        promoted,
-        closed_epics,
+        promoted: done.promoted,
+        closed_epics: done.closed_epics,
         watch,
         merge,
-        started,
-        start_errors,
+        started: done.started,
+        start_errors: done.start_errors,
+        gate_run: None,
+        gate_event: false,
+        questions_waiting: questions_waiting(ctx)?,
+        alerts,
+        reminders,
+    })
+}
+
+/// The loop's tick: it never waits for a gate run. A result that is ready is concluded first (merges
+/// close issues, and only then can their dependents be promoted); the cheap watching comes next, so a
+/// blocked or asking worker and a reviewer's verdict are seen while gates run; promotion and dispatch
+/// come before a new gate run starts, so a long queue never delays a worker start. A red `main` after a
+/// merge halts the tick: no further gate run starts on top of it.
+fn tick_background(
+    ctx: &Ctx,
+    dispatch: bool,
+    reminders: &mut RemindState,
+    slot: &mut GateSlot,
+) -> Result<TickReport, AppError> {
+    let worker = Worker::new(ctx)?;
+    let started_before = slot.started();
+    let mut gate_event = false;
+    let mut transitions = Vec::new();
+    let mut items = Vec::new();
+    if let Some(finished) = slot.take_finished() {
+        gate_event = true;
+        match finished.job {
+            Job::Verify(job) => transitions.extend(worker.conclude_verification(job, finished.results)?),
+            Job::Merge(job) => items.extend(merge::conclude_merge(ctx, job, finished.results)?),
+            Job::Main(job) => items.push(merge::conclude_main(ctx, job, finished.results)?),
+        }
+    }
+    let main_red = items.iter().any(merge::is_main_red);
+
+    let mut watch = worker.watch_in(GateMode::Background)?;
+    transitions.append(&mut watch.transitions);
+    watch.transitions = transitions;
+    items.extend(merge::poll(ctx)?.items);
+    let done = promote_and_dispatch(ctx, &worker, dispatch)?;
+
+    if !main_red {
+        items.extend(merge::start_next(ctx, slot)?.items);
+        watch.transitions.extend(worker.start_verification(slot)?);
+    }
+    gate_event |= slot.started() != started_before;
+
+    let remind::Notices { alerts, reminders } =
+        remind::send_due(ctx, &*worker.rt, reminders, time::OffsetDateTime::now_utc())?;
+    Ok(TickReport {
+        promoted: done.promoted,
+        closed_epics: done.closed_epics,
+        watch,
+        merge: TickResult {
+            processed: items.len(),
+            items,
+        },
+        started: done.started,
+        start_errors: done.start_errors,
+        gate_run: slot.current(),
+        gate_event,
         questions_waiting: questions_waiting(ctx)?,
         alerts,
         reminders,
@@ -134,6 +244,12 @@ fn text(t: &TickReport) -> String {
     }
     for id in &t.started {
         s.push_str(&format!("\nstarted {id}"));
+    }
+    if let Some(g) = &t.gate_run {
+        s.push_str(&format!(
+            "\ngate run: {} of {} · gate {} · {}s",
+            g.kind, g.issue, g.gate, g.seconds
+        ));
     }
     for e in &t.start_errors {
         s.push_str(&format!("\nstart failed {}: {}", e["issue"], e["message"]));
@@ -187,6 +303,9 @@ struct Assessment {
     runs: Vec<RunBrief>,
     /// A run is starting/working/finishing/verifying or a merge item is in flight.
     busy: bool,
+    /// A gate run is in flight, or the check of main after a merge is still owed. Such a run is not
+    /// over until it has been concluded, even when no issue is open any more.
+    gate_busy: bool,
     /// This serve will start a worker next tick: `--dispatch` is on and the allocation plan has a
     /// slot. Without `--dispatch` nothing here ever starts work, so a plan slot is no progress.
     can_start: bool,
@@ -212,7 +331,7 @@ fn merge_is_busy(s: MergeState) -> bool {
     )
 }
 
-fn assess(ctx: &Ctx, dispatch: bool) -> Result<Assessment, AppError> {
+fn assess(ctx: &Ctx, dispatch: bool, gate: &GateSlot) -> Result<Assessment, AppError> {
     let open: Vec<IssueId> = ctx
         .store
         .list_issues(&IssueFilter::default())?
@@ -221,7 +340,9 @@ fn assess(ctx: &Ctx, dispatch: bool) -> Result<Assessment, AppError> {
         .map(|i| i.id)
         .collect();
     let runs = ctx.store.runs(None, true)?;
-    let busy = runs.iter().any(|r| run_is_busy(r.state))
+    let gate_busy = gate.is_busy() || merge::main_check_owed(ctx)?;
+    let busy = gate_busy
+        || runs.iter().any(|r| run_is_busy(r.state))
         || ctx.store.merge_queue()?.iter().any(|m| merge_is_busy(m.state));
     // The plan shells out to git, so only ask for it when its answer decides "stuck".
     let can_start = if !dispatch || open.is_empty() || busy {
@@ -239,6 +360,7 @@ fn assess(ctx: &Ctx, dispatch: bool) -> Result<Assessment, AppError> {
             })
             .collect(),
         busy,
+        gate_busy,
         can_start,
         questions_waiting: questions_waiting(ctx)?,
     })
@@ -246,9 +368,10 @@ fn assess(ctx: &Ctx, dispatch: bool) -> Result<Assessment, AppError> {
 
 /// Checked after every tick. `all_done` wins over `stuck`, which wins over `max_ticks`, so the
 /// most informative reason is reported when several hold at once. A failed tick never yields
-/// `stuck`: its half-applied state is not evidence that nothing can move.
+/// `stuck`: its half-applied state is not evidence that nothing can move. A gate run still in flight
+/// (or a check of main still owed) keeps the loop going even with nothing open: stopping would kill it.
 fn decide(a: &Assessment, ticks: u64, max_ticks: Option<u64>, tick_ok: bool) -> Option<StopReason> {
-    if a.open.is_empty() {
+    if a.open.is_empty() && !a.gate_busy {
         return Some(StopReason::AllDone);
     }
     if tick_ok && !a.busy && !a.can_start {
@@ -312,7 +435,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
     let mut ctx = Ctx::load(cli)?;
     let mut reminders = RemindState::new();
     if a.once {
-        let t = tick(&ctx, a.dispatch, &mut reminders)?;
+        let t = tick(&ctx, a.dispatch, &mut reminders, None)?;
         return Rendered::new(&t, text(&t));
     }
     eprintln!(
@@ -320,6 +443,17 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         a.interval,
         if a.dispatch { " with dispatch" } else { "" }
     );
+    // What a stopped serve left mid-way would never be touched again: no gate run is behind it now.
+    let recovered = merge::recover_orphans(&ctx)?;
+    if !recovered.is_empty() {
+        let ids: Vec<String> = recovered.iter().map(ToString::to_string).collect();
+        eprintln!(
+            "asf serve: {} merge item(s) left in rebasing/gating by an earlier run went back to the queue: {}",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
+    let mut gate = GateSlot::new();
     let mut watch = ConfigWatch::new(&ctx);
     let mut ticks: u64 = 0;
     loop {
@@ -327,7 +461,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         if let Some(warning) = watch.refresh(&mut ctx) {
             eprintln!("asf serve: {warning}");
         }
-        let tick_ok = match tick(&ctx, a.dispatch, &mut reminders) {
+        let tick_ok = match tick(&ctx, a.dispatch, &mut reminders, Some(&mut gate)) {
             Ok(t) => {
                 if !t.promoted.is_empty()
                     || !t.closed_epics.is_empty()
@@ -337,6 +471,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
                     || !t.start_errors.is_empty()
                     || !t.alerts.is_empty()
                     || !t.reminders.is_empty()
+                    || t.gate_event
                 {
                     print_ok(cli.json, cli.quiet, &Rendered::new(&t, text(&t))?);
                 }
@@ -348,7 +483,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
             }
         };
         if a.until_done {
-            let assessment = assess(&ctx, a.dispatch)?;
+            let assessment = assess(&ctx, a.dispatch, &gate)?;
             if let Some(reason) = decide(&assessment, ticks, a.max_ticks, tick_ok) {
                 return finish(cli, ticks, reason, assessment);
             }
@@ -370,6 +505,7 @@ mod tests {
             open: (1..=open as u32).map(id).collect(),
             runs: Vec::new(),
             busy,
+            gate_busy: false,
             can_start,
             questions_waiting: 0,
         }
@@ -396,6 +532,21 @@ mod tests {
         let a = assessment(0, false, false);
         assert_eq!(decide(&a, 1, None, true), Some(StopReason::AllDone));
         assert_eq!(decide(&a, 3, Some(3), true), Some(StopReason::AllDone));
+    }
+
+    #[test]
+    fn a_gate_run_in_flight_is_not_all_done_even_with_nothing_open() {
+        let a = Assessment {
+            gate_busy: true,
+            busy: true,
+            ..assessment(0, false, false)
+        };
+        assert_eq!(
+            decide(&a, 1, None, true),
+            None,
+            "stopping would kill the gate run"
+        );
+        assert_eq!(decide(&a, 4, Some(4), true), Some(StopReason::MaxTicks));
     }
 
     #[test]
