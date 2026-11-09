@@ -645,12 +645,22 @@ pub fn read_config_text(root: &Path) -> std::io::Result<String> {
 }
 
 /// Loads everything the TUI shows. `rt` adds live agent states (skipped when `None`).
+///
+/// The settings it carries (`max_parallel`, the review and merge switches, the models of the runs)
+/// come from `.factory/config.toml` as it is now, not from the `Ctx` loaded when the TUI started, so an
+/// edit made from the Config view, `asf config set` or an editor shows at the next refresh. A file that
+/// is missing or does not parse leaves the settings of the `Ctx`.
 pub fn load_snapshot(
     ctx: &Ctx,
     rt: Option<&dyn AgentRuntime>,
     prev_agents: &BTreeMap<IssueId, AgentInfo>,
 ) -> Result<Snapshot, AppError> {
     let store = &ctx.store;
+    let config_text = read_config_text(&ctx.root).ok();
+    let live_config = config_text
+        .as_deref()
+        .and_then(|text| Config::from_toml(text).ok());
+    let cfg = live_config.as_ref().unwrap_or(&ctx.config);
     let runs = store.runs(None, true)?;
     let mut agents = prev_agents.clone();
     let mut runtime_ok = None;
@@ -728,9 +738,9 @@ pub fn load_snapshot(
             started_at: r.started_at.clone(),
             finished_at: r.finished_at.clone(),
             model: if is_review(&r.issue_id) {
-                Some(ctx.config.review.model.clone())
+                Some(cfg.review.model.clone())
             } else {
-                ctx.config.worker.model.clone()
+                cfg.worker.model.clone()
             },
             pane: r.pane_id.clone(),
             session_name: None,
@@ -761,9 +771,9 @@ pub fn load_snapshot(
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
-        branch: ctx.config.repo.default_branch.clone(),
+        branch: cfg.repo.default_branch.clone(),
         runtime_ok,
-        max_parallel: ctx.config.scheduler.max_parallel,
+        max_parallel: cfg.scheduler.max_parallel,
         issues,
         claims: store.active_claims()?,
         runs,
@@ -777,16 +787,16 @@ pub fn load_snapshot(
             .cloned()
             .collect(),
         events,
-        config: config_rows(&read_config_text(&ctx.root).unwrap_or_default()),
+        config: config_rows(config_text.as_deref().unwrap_or_default()),
         now,
         utc_offset_secs,
         failed_runs,
         blockers,
         deps: store.deps()?,
-        review_model: ctx.config.review.model.clone(),
-        review_required: ctx.config.review.required,
-        review_on_labels: ctx.config.review.on_labels.clone(),
-        verify_main_after: ctx.config.merge.verify_main_after,
+        review_model: cfg.review.model.clone(),
+        review_required: cfg.review.required,
+        review_on_labels: cfg.review.on_labels.clone(),
+        verify_main_after: cfg.merge.verify_main_after,
         last_runs,
         merged_today: Vec::new(),
         review_of,

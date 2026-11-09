@@ -244,6 +244,51 @@ fn the_loader_carries_whether_the_gates_run_on_main_after_a_merge() {
 }
 
 #[test]
+fn a_value_changed_in_config_toml_shows_up_in_the_next_snapshot_without_a_restart() {
+    let (ctx, _) = story();
+    let path = ctx.root.join(".factory/config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // the Ctx was loaded with the defaults; the file says otherwise
+    std::fs::write(
+        &path,
+        "[scheduler]\nmax_parallel = 7\n[review]\nrequired = true\nmodel = \"sonnet\"\non_labels = [\"risky\"]\n[merge]\nverify_main_after = true\n[repo]\ndefault_branch = \"trunk\"\n",
+    )
+    .unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert_eq!(s.max_parallel, 7, "the header's workers n/m");
+    assert!(s.review_required && s.verify_main_after);
+    assert_eq!((s.review_model.as_str(), s.branch.as_str()), ("sonnet", "trunk"));
+    assert_eq!(s.review_on_labels, ["risky"]);
+    let row = |s: &Snapshot, k: &str| s.config.iter().find(|r| r.key == k).unwrap().raw.clone();
+    assert_eq!(row(&s, "scheduler.max_parallel"), "7");
+
+    // an edit made while the TUI runs (`asf config set`, an editor) is picked up by the next refresh
+    std::fs::write(&path, "[scheduler]\nmax_parallel = 2\n").unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert_eq!(s.max_parallel, 2);
+    assert!(!s.review_required && !s.verify_main_after);
+    assert_eq!(row(&s, "scheduler.max_parallel"), "2");
+
+    // a file that does not parse keeps the settings the TUI started with and says so in the rows
+    std::fs::write(&path, "[scheduler\nmax_parallel = 9\n").unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert_eq!(s.max_parallel, ctx.config.scheduler.max_parallel);
+    assert_eq!(s.config[0].value, "(unreadable)");
+}
+
+#[test]
+fn the_model_of_a_run_follows_the_config_file_too() {
+    let (ctx, [a, _, _, r]) = story();
+    ctx.store.create_run(&new_run(&r)).unwrap();
+    let path = ctx.root.join(".factory/config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "[worker]\nmodel = \"haiku\"\n[review]\nmodel = \"sonnet\"\n").unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert_eq!(s.last_run(&a).unwrap().model.as_deref(), Some("haiku"));
+    assert_eq!(s.last_run(&r).and_then(|l| l.model.clone()).as_deref(), Some("sonnet"));
+}
+
+#[test]
 fn the_detail_of_an_issue_is_loaded_on_demand_with_comments_and_dependency_status() {
     let (ctx, [a, b, ..]) = story();
     let d = load_detail(&ctx, &b).unwrap();
