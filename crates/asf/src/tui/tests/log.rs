@@ -167,30 +167,17 @@ fn a_worker_that_could_not_start_is_not_reported_as_asking_a_question() {
 }
 
 #[test]
-fn a_verified_run_says_how_many_files_and_gates_when_the_event_knows() {
-    let s = log_desk(vec![
-        ev(
-            2,
-            NOW,
-            "run.state",
-            Some("asf-24"),
-            serde_json::json!({"to":"succeeded","files":1,"gates":3}),
-        ),
-        ev(
-            1,
-            NOW,
-            "run.state",
-            Some("asf-25"),
-            serde_json::json!({"to":"succeeded","files":4,"gates":1}),
-        ),
-    ]);
-    assert_eq!(
-        lines(&s),
-        [
-            "✓ run verified · 1 file, 3 gates · queued for merge",
-            "✓ run verified · 4 files, 1 gate · queued for merge",
-        ]
-    );
+fn a_verified_run_has_no_counts_because_no_event_carries_them() {
+    // `run.state` is written as {from, to, reason} only (asf-store `runs.rs`); the operator dropped
+    // the counts from the contract (#429), so the sentence never invents them
+    let s = log_desk(vec![ev(
+        1,
+        NOW,
+        "run.state",
+        Some("asf-24"),
+        serde_json::json!({"from":"verifying","to":"succeeded","reason":"verified"}),
+    )]);
+    assert_eq!(lines(&s), ["✓ run verified · queued for merge"]);
 }
 
 #[test]
@@ -329,7 +316,7 @@ fn the_review_has_a_start_and_a_verdict() {
             NOW,
             "merge.sent_back",
             Some("asf-24"),
-            serde_json::json!({"round":1,"file":"x","findings":3}),
+            serde_json::json!({"round":1,"file":"x"}),
         ),
         ev(
             3,
@@ -356,11 +343,92 @@ fn the_review_has_a_start_and_a_verdict() {
     assert_eq!(
         lines(&s),
         [
-            "◆ review verdict: changes (3 findings)",
+            "◆ review verdict: changes",
             "◆ review verdict: changes",
             "◆ review verdict: approve",
             "◆ review started · opus · round 2",
         ]
+    );
+}
+
+/// A merge.state event as the queue writes it.
+fn merge_state(seq: u64, merge_id: i64, from: &str, to: &str) -> Event {
+    ev(
+        seq,
+        NOW,
+        "merge.state",
+        Some("asf-24"),
+        serde_json::json!({"merge_id":merge_id,"from":from,"to":to}),
+    )
+}
+
+#[test]
+fn a_changes_verdict_that_is_not_sent_back_still_shows_as_a_verdict() {
+    // `request_changes` fails the item without `merge.sent_back` when the worker is still running or
+    // `review.max_rounds` is reached: the failed state is then the only trace of the verdict
+    let mut s = log_desk(vec![
+        merge_state(3, 1, "reviewing", "failed"),
+        ev(
+            2,
+            NOW,
+            "merge.review_started",
+            Some("asf-24"),
+            serde_json::json!({"after_comment":3,"round":1}),
+        ),
+    ]);
+    s.queue = vec![merge_item(
+        1,
+        "asf-24",
+        MergeState::Failed,
+        Some("review asks for changes on feat/asf-24:\n- one\n- two"),
+        NOW,
+    )];
+    assert_eq!(
+        lines(&s),
+        ["◆ review verdict: changes", "◆ review started · opus · round 1"]
+    );
+}
+
+#[test]
+fn a_changes_verdict_that_was_sent_back_is_one_line_not_two() {
+    // the failed state is written first and `merge.sent_back` right after it
+    let s = log_desk(vec![
+        ev(
+            4,
+            NOW,
+            "merge.sent_back",
+            Some("asf-24"),
+            serde_json::json!({"round":1,"file":"x"}),
+        ),
+        merge_state(3, 1, "reviewing", "failed"),
+        ev(
+            2,
+            NOW,
+            "run.state",
+            Some("asf-24"),
+            serde_json::json!({"from":"succeeded","to":"working","reason":"sent back"}),
+        ),
+    ]);
+    let verdicts = lines(&s)
+        .into_iter()
+        .filter(|l| l.contains("review verdict"))
+        .count();
+    assert_eq!(verdicts, 1, "{:?}", lines(&s));
+}
+
+#[test]
+fn a_review_that_failed_for_another_reason_is_a_failed_merge() {
+    let mut s = log_desk(vec![merge_state(2, 1, "reviewing", "failed")]);
+    s.queue = vec![merge_item(
+        1,
+        "asf-24",
+        MergeState::Failed,
+        Some("worktree .worktrees/asf-24 does not exist"),
+        NOW,
+    )];
+    assert_eq!(
+        lines(&s),
+        ["✗ merge failed · worktree .worktrees/asf-24 does not exist"]
     );
 }
 
@@ -398,7 +466,7 @@ fn a_reviewers_own_run_and_decision_comment_repeat_the_review_lines() {
 }
 
 #[test]
-fn a_merge_names_the_branch_and_the_short_sha_and_main_when_it_was_checked() {
+fn a_merge_names_the_branch_and_the_short_sha_and_never_claims_main_is_green() {
     let mut s = log_desk(vec![ev(
         1,
         NOW,
@@ -408,8 +476,10 @@ fn a_merge_names_the_branch_and_the_short_sha_and_main_when_it_was_checked() {
     )]);
     s.branch = "main".into();
     assert_eq!(lines(&s), ["✓ merged into main · 9c1e4aa"]);
+    // the main gates run after `merge.merged` is written and only a red run writes an event, so
+    // there is no positive signal to say "green" from
     s.verify_main_after = true;
-    assert_eq!(lines(&s), ["✓ merged into main · 9c1e4aa · gates on main green"]);
+    assert_eq!(lines(&s), ["✓ merged into main · 9c1e4aa"]);
     s.events.insert(
         0,
         ev(
@@ -784,7 +854,7 @@ fn backspace_and_ctrl_u_edit_the_filter_and_esc_clears_it() {
     a.handle_key(key('x'));
     a.handle_key(code(KeyCode::Enter));
     assert_eq!(log::filter(&a.log), "x");
-    assert!(!a.log.typing());
+    assert!(!a.log.takes_every_key());
     a.handle_key(code(KeyCode::Esc));
     assert_eq!(log::filter(&a.log), "");
     let t = render_to_text(&a, 120, 30);
@@ -823,6 +893,22 @@ fn capital_j_shows_the_raw_json_of_the_selected_event_in_a_modal() {
     a.handle_key(key('J'));
     a.handle_key(code(KeyCode::Esc));
     assert!(!render_to_text(&a, 120, 30).contains("\"kind\""));
+}
+
+#[test]
+fn while_the_raw_window_is_open_every_key_goes_to_the_log() {
+    let mut a = log_app(mockup());
+    a.handle_key(key('J'));
+    // q does not quit the TUI behind the window
+    assert!(!matches!(a.handle_key(key('q')), Action::Quit));
+    // a digit does not switch the view
+    a.handle_key(key('2'));
+    assert_eq!(a.view, View::Log);
+    assert!(render_to_text(&a, 120, 30).contains("\"kind\""));
+    // J (or Esc) closes it, and then the global keys work again
+    a.handle_key(key('J'));
+    a.handle_key(key('2'));
+    assert_eq!(a.view, View::Board);
 }
 
 #[test]

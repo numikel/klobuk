@@ -38,9 +38,10 @@ pub struct State {
 }
 
 impl State {
-    /// Whether keys are text for the filter: `App::handle_key` then hands every key to this view.
-    pub fn typing(&self) -> bool {
-        self.typing
+    /// Whether this view takes every key: typing a filter, or the raw JSON window is open (a window
+    /// swallows keys like the app's other modals, so `q` or a digit does not act behind it).
+    pub fn takes_every_key(&self) -> bool {
+        self.typing || self.raw
     }
 }
 
@@ -298,6 +299,42 @@ fn gates_after(snap: &Snapshot, idx: usize, merge_id: i64) -> Gates {
     Gates::Running
 }
 
+/// What a `reviewing` to `failed` move was. A `changes` verdict that is sent back writes
+/// `merge.sent_back` right after it (that line is the verdict); one that is not (the worker is still
+/// running, or `review.max_rounds` is reached) leaves this move as the only trace of it. A reviewer
+/// that could not start has its own line, and any other error is a failed merge with its reason.
+fn reviewed_failed(snap: &Snapshot, idx: usize, e: &Event, reason: Option<String>) -> Option<Said> {
+    for next in snap.events[..idx]
+        .iter()
+        .rev()
+        .filter(|n| n.issue_id == e.issue_id)
+    {
+        match next.kind.as_str() {
+            "merge.sent_back" | "merge.review_start_failed" => return None,
+            "merge.state"
+            | "merge.review_started"
+            | "merge.enqueued"
+            | "merge.requeued"
+            | "merge.retried"
+            | "merge.merged" => break,
+            _ => {}
+        }
+    }
+    let changes = merge_id_of(e)
+        .and_then(|id| find_merge(snap, id))
+        .and_then(|m| m.last_error.as_deref())
+        .is_none_or(|err| err.starts_with("review asks for changes"));
+    if changes {
+        said(Sym::Review, "review verdict: changes", &[])
+    } else {
+        said(Sym::Failed, "merge failed", &[reason])
+    }
+}
+
+fn merge_id_of(e: &Event) -> Option<i64> {
+    count(e, "merge_id")
+}
+
 fn merge_state(snap: &Snapshot, idx: usize, e: &Event) -> Option<Said> {
     let merge_id = count(e, "merge_id")?;
     let item = find_merge(snap, merge_id);
@@ -318,7 +355,8 @@ fn merge_state(snap: &Snapshot, idx: usize, e: &Event) -> Option<Said> {
             Gates::Running => said(Sym::Working, "gates running after rebase", &[]),
         },
         // a failed gate has its line already, a reviewer's `changes` verdict has its own
-        "failed" if matches!(text(e, "from"), Some("gating" | "reviewing")) => None,
+        "failed" if text(e, "from") == Some("gating") => None,
+        "failed" if text(e, "from") == Some("reviewing") => reviewed_failed(snap, idx, e, reason),
         "failed" => said(Sym::Failed, "merge failed", &[reason]),
         "blocked" => said(Sym::Needs, "merge blocked", &[reason]),
         "skipped" => said(Sym::Waiting, "merge skipped", &[]),
@@ -360,14 +398,8 @@ fn run_state(snap: &Snapshot, idx: usize, e: &Event) -> Option<Said> {
             if reviewer {
                 return None;
             }
-            let files = count(e, "files").map(|n| plural(n, "file", "files"));
-            let gates = count(e, "gates").map(|n| plural(n, "gate", "gates"));
-            let totals = match (files, gates) {
-                (Some(f), Some(g)) => Some(format!("{f}, {g}")),
-                (Some(x), None) | (None, Some(x)) => Some(x),
-                (None, None) => None,
-            };
-            said(Sym::Done, "run verified", &[totals, some("queued for merge")])
+            // `run.state` carries {from, to, reason} only; the counts were dropped from the contract
+            said(Sym::Done, "run verified", &[some("queued for merge")])
         }
         "failed" => said(Sym::Failed, "verification failed", &[reason]),
         "stalled" => said(Sym::Needs, "worker went quiet and may be stuck", &[reason]),
@@ -505,13 +537,7 @@ fn describe(snap: &Snapshot, idx: usize) -> Option<Said> {
             "review skipped",
             &[some("this patch was approved before")],
         ),
-        "merge.sent_back" => {
-            let head = match count(e, "findings") {
-                Some(n) => format!("review verdict: changes ({})", plural(n, "finding", "findings")),
-                None => "review verdict: changes".to_string(),
-            };
-            said(Sym::Review, head, &[])
-        }
+        "merge.sent_back" => said(Sym::Review, "review verdict: changes", &[]),
         "merge.review_start_failed" => said(
             Sym::Failed,
             "reviewer could not start",
@@ -519,11 +545,7 @@ fn describe(snap: &Snapshot, idx: usize) -> Option<Said> {
         ),
         "merge.merged" => {
             let sha = text(e, "head").map(|h| h.chars().take(7).collect::<String>());
-            let red = snap.events[..idx]
-                .iter()
-                .any(|n| n.kind == "merge.main_red" && n.issue_id == e.issue_id);
-            let main = (snap.verify_main_after && !red).then(|| "gates on main green".to_string());
-            said(Sym::Done, format!("merged into {}", snap.branch), &[sha, main])
+            said(Sym::Done, format!("merged into {}", snap.branch), &[sha])
         }
         "merge.main_red" => said(
             Sym::Needs,

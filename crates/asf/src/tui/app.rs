@@ -367,10 +367,10 @@ impl App {
             return self.dispatch(action);
         }
         // The Board's and the Log's filters take every key as text, also the ones that are bound
-        // elsewhere (q, t, 1-7).
+        // elsewhere (q, t, 1-7); the Log's raw JSON window swallows keys like the other modals.
         let typing = match self.view {
             View::Board => self.board.typing(),
-            View::Log => self.log.typing(),
+            View::Log => self.log.takes_every_key(),
             _ => false,
         };
         if typing {
