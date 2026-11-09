@@ -8,22 +8,23 @@ use toml_edit::{Decor, DocumentMut, Item, Table, TableLike, Value};
 
 use crate::config::{Config, ConfigError};
 
-/// Keys the CLI and the TUI may change, with a one-line description each.
+/// Keys the CLI and the TUI may change, with a one-line description each. The order is the order of
+/// the Config view (models, budgets, flow, notifications); [`FIELDS`] lists the same keys in it.
 const EDITABLE: &[(&str, &str)] = &[
     ("planner.model", "model used by `asf plan` (headless claude -p)"),
-    ("planner.budget_usd", "USD budget per planning step"),
     (
         "worker.model",
         "model workers run on (unset: Claude Code default)",
     ),
-    ("worker.budget_usd", "USD budget per issue"),
-    ("review.required", "run a read-only reviewer before every merge"),
     ("review.model", "model the reviewer runs on"),
+    ("planner.budget_usd", "USD budget per planning step"),
+    ("worker.budget_usd", "USD budget per issue"),
+    ("scheduler.max_parallel", "workers running at the same time"),
+    ("review.required", "run a read-only reviewer before every merge"),
     (
         "review.max_rounds",
         "`changes` verdicts allowed before the human decides",
     ),
-    ("scheduler.max_parallel", "workers running at the same time"),
     (
         "merge.target",
         "local (rebase + fast-forward) or github (push + PR)",
@@ -49,6 +50,178 @@ const EDITABLE: &[(&str, &str)] = &[
 /// The keys [`set_key`] accepts, each with a one-line description.
 pub fn editable_keys() -> &'static [(&'static str, &'static str)] {
     EDITABLE
+}
+
+/// The section of the Config view a field is listed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigGroup {
+    Models,
+    Budgets,
+    Flow,
+    Notifications,
+}
+
+impl ConfigGroup {
+    /// The groups in the order the view lists them.
+    pub const ALL: [ConfigGroup; 4] = [
+        ConfigGroup::Models,
+        ConfigGroup::Budgets,
+        ConfigGroup::Flow,
+        ConfigGroup::Notifications,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            ConfigGroup::Models => "Models",
+            ConfigGroup::Budgets => "Budgets",
+            ConfigGroup::Flow => "Flow",
+            ConfigGroup::Notifications => "Notifications",
+        }
+    }
+}
+
+/// What kind of value a field holds, and so how the Config view edits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// One of a short list (`h`/`l` step through it). A stored value outside the list is legal: the view
+    /// keeps it, and a custom value is typed with Enter.
+    Choice(&'static [&'static str]),
+    /// On or off (`Space` toggles it).
+    Bool,
+    /// A whole number or an amount in USD (typed with Enter).
+    Number,
+    /// Free text (typed with Enter). No editable key is plain text yet.
+    Text,
+}
+
+/// One editable key as the Config view presents it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigField {
+    /// The dotted key, one of [`editable_keys`].
+    pub key: &'static str,
+    /// The name the view shows instead of the dotted key.
+    pub label: &'static str,
+    pub group: ConfigGroup,
+    pub kind: FieldKind,
+    /// One line in plain words.
+    pub help: &'static str,
+}
+
+impl ConfigField {
+    /// The default of the key as the text [`set_key`] takes, read from [`Config::default`]. `None` when
+    /// the key is optional and absent by default (`worker.model`): returning to the default then means
+    /// [`unset_key`].
+    pub fn default_value(&self) -> Option<String> {
+        let root = serde_json::to_value(Config::default()).ok()?;
+        match self.key.split('.').try_fold(&root, |node, seg| node.get(seg))? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        }
+    }
+}
+
+/// The three model keys take these names; any other model id is kept as it is.
+const MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+
+const FIELDS: &[ConfigField] = &[
+    ConfigField {
+        key: "planner.model",
+        label: "Planning",
+        group: ConfigGroup::Models,
+        kind: FieldKind::Choice(MODELS),
+        help: "turns an idea into issues (`asf plan new`)",
+    },
+    ConfigField {
+        key: "worker.model",
+        label: "Workers",
+        group: ConfigGroup::Models,
+        kind: FieldKind::Choice(MODELS),
+        help: "writes the code for each issue",
+    },
+    ConfigField {
+        key: "review.model",
+        label: "Reviewer",
+        group: ConfigGroup::Models,
+        kind: FieldKind::Choice(MODELS),
+        help: "reads the diff with a clean context before merge",
+    },
+    ConfigField {
+        key: "planner.budget_usd",
+        label: "Planning step",
+        group: ConfigGroup::Budgets,
+        kind: FieldKind::Number,
+        help: "ceiling for one planning call",
+    },
+    ConfigField {
+        key: "worker.budget_usd",
+        label: "Per issue",
+        group: ConfigGroup::Budgets,
+        kind: FieldKind::Number,
+        help: "the worker is stopped when it is exceeded",
+    },
+    ConfigField {
+        key: "scheduler.max_parallel",
+        label: "Workers at once",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Number,
+        help: "how many issues run in parallel",
+    },
+    ConfigField {
+        key: "review.required",
+        label: "Review before merge",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Bool,
+        help: "every merge waits for the reviewer's approve",
+    },
+    ConfigField {
+        key: "review.max_rounds",
+        label: "Review rounds",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Number,
+        help: "`changes` verdicts before the queue asks you",
+    },
+    ConfigField {
+        key: "merge.target",
+        label: "Merge target",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Choice(&["local", "github"]),
+        help: "fast-forward locally, or pull requests",
+    },
+    ConfigField {
+        key: "merge.verify_main_after",
+        label: "Gates on main",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Bool,
+        help: "run the gates again after each merge",
+    },
+    ConfigField {
+        key: "notify.on_new",
+        label: "Notify at once",
+        group: ConfigGroup::Notifications,
+        kind: FieldKind::Bool,
+        help: "tell you the moment something new waits for you",
+    },
+    ConfigField {
+        key: "notify.after_minutes",
+        label: "First reminder",
+        group: ConfigGroup::Notifications,
+        kind: FieldKind::Number,
+        help: "minutes of waiting before the first reminder (0: no reminders)",
+    },
+    ConfigField {
+        key: "notify.every_minutes",
+        label: "Repeat reminder",
+        group: ConfigGroup::Notifications,
+        kind: FieldKind::Number,
+        help: "minutes between reminders (0: remind once)",
+    },
+];
+
+/// Every editable key as the Config view presents it, in [`editable_keys`] order: label, group, kind,
+/// choices and a plain-words help line. The default of each comes from [`ConfigField::default_value`].
+pub fn fields() -> &'static [ConfigField] {
+    FIELDS
 }
 
 /// Sets the dotted `key` to `value` in the TOML document `toml` and returns the new text.

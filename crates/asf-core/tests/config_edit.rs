@@ -1,5 +1,5 @@
 use asf_core::config::GateWhen;
-use asf_core::config_edit::{editable_keys, set_key, unset_key};
+use asf_core::config_edit::{editable_keys, fields, set_key, unset_key, ConfigGroup, FieldKind};
 use asf_core::{Config, ConfigError};
 
 const COMMENTED: &str = "\
@@ -140,18 +140,19 @@ fn unparsable_document_is_a_parse_error() {
 
 #[test]
 fn editable_keys_are_exactly_the_thirteen_named_in_the_briefs() {
+    // In the order of the Config view: models, budgets, flow, notifications.
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
     assert_eq!(
         keys,
         [
             "planner.model",
-            "planner.budget_usd",
             "worker.model",
-            "worker.budget_usd",
-            "review.required",
             "review.model",
-            "review.max_rounds",
+            "planner.budget_usd",
+            "worker.budget_usd",
             "scheduler.max_parallel",
+            "review.required",
+            "review.max_rounds",
             "merge.target",
             "merge.verify_main_after",
             "notify.on_new",
@@ -160,6 +161,108 @@ fn editable_keys_are_exactly_the_thirteen_named_in_the_briefs() {
         ]
     );
     assert!(editable_keys().iter().all(|(_, d)| !d.trim().is_empty()));
+}
+
+#[test]
+fn fields_describe_every_editable_key_in_the_same_order() {
+    let described: Vec<&str> = fields().iter().map(|f| f.key).collect();
+    let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
+    assert_eq!(described, keys);
+    for f in fields() {
+        assert!(!f.label.trim().is_empty(), "{}: label", f.key);
+        assert!(!f.help.trim().is_empty(), "{}: help", f.key);
+    }
+    let labels: std::collections::HashSet<_> = fields().iter().map(|f| f.label).collect();
+    assert_eq!(labels.len(), fields().len(), "labels are unique");
+}
+
+#[test]
+fn fields_carry_the_labels_and_groups_of_the_view() {
+    let get = |key: &str| fields().iter().find(|f| f.key == key).unwrap();
+    for (key, label, group) in [
+        ("planner.model", "Planning", ConfigGroup::Models),
+        ("worker.model", "Workers", ConfigGroup::Models),
+        ("review.model", "Reviewer", ConfigGroup::Models),
+        ("planner.budget_usd", "Planning step", ConfigGroup::Budgets),
+        ("worker.budget_usd", "Per issue", ConfigGroup::Budgets),
+        ("scheduler.max_parallel", "Workers at once", ConfigGroup::Flow),
+        ("review.required", "Review before merge", ConfigGroup::Flow),
+        ("review.max_rounds", "Review rounds", ConfigGroup::Flow),
+        ("merge.target", "Merge target", ConfigGroup::Flow),
+        ("merge.verify_main_after", "Gates on main", ConfigGroup::Flow),
+    ] {
+        assert_eq!((get(key).label, get(key).group), (label, group), "{key}");
+    }
+    // the keys the mockup does not show still get a group of their own
+    for key in ["notify.on_new", "notify.after_minutes", "notify.every_minutes"] {
+        assert_eq!(get(key).group, ConfigGroup::Notifications, "{key}");
+    }
+    assert_eq!(
+        [
+            ConfigGroup::Models.title(),
+            ConfigGroup::Budgets.title(),
+            ConfigGroup::Flow.title(),
+            ConfigGroup::Notifications.title(),
+        ],
+        ["Models", "Budgets", "Flow", "Notifications"]
+    );
+}
+
+#[test]
+fn field_kinds_are_choice_bool_number_or_text() {
+    let get = |key: &str| fields().iter().find(|f| f.key == key).unwrap();
+    for key in ["planner.model", "worker.model", "review.model"] {
+        assert_eq!(
+            get(key).kind,
+            FieldKind::Choice(&["opus", "sonnet", "haiku"]),
+            "{key}"
+        );
+    }
+    assert_eq!(get("merge.target").kind, FieldKind::Choice(&["local", "github"]));
+    for key in ["review.required", "merge.verify_main_after", "notify.on_new"] {
+        assert_eq!(get(key).kind, FieldKind::Bool, "{key}");
+    }
+    for key in [
+        "planner.budget_usd",
+        "worker.budget_usd",
+        "scheduler.max_parallel",
+        "review.max_rounds",
+        "notify.after_minutes",
+        "notify.every_minutes",
+    ] {
+        assert_eq!(get(key).kind, FieldKind::Number, "{key}");
+    }
+}
+
+#[test]
+fn field_defaults_are_read_from_config_default() {
+    let get = |key: &str| fields().iter().find(|f| f.key == key).unwrap();
+    assert_eq!(get("planner.budget_usd").default_value().as_deref(), Some("1.0"));
+    assert_eq!(get("worker.budget_usd").default_value().as_deref(), Some("5.0"));
+    assert_eq!(
+        get("scheduler.max_parallel").default_value().as_deref(),
+        Some("3")
+    );
+    assert_eq!(get("review.required").default_value().as_deref(), Some("false"));
+    assert_eq!(get("review.model").default_value().as_deref(), Some("opus"));
+    assert_eq!(get("merge.target").default_value().as_deref(), Some("local"));
+    assert_eq!(get("notify.on_new").default_value().as_deref(), Some("true"));
+    // an optional key that is absent by default has no default value to write
+    assert_eq!(get("worker.model").default_value(), None);
+}
+
+#[test]
+fn every_field_default_and_every_choice_is_accepted_by_set_key() {
+    for f in fields() {
+        if let Some(default) = f.default_value() {
+            set_key("", f.key, &default).unwrap_or_else(|e| panic!("{}: default {default}: {e}", f.key));
+        }
+        if let FieldKind::Choice(choices) = f.kind {
+            for c in choices {
+                set_key("", f.key, c).unwrap_or_else(|e| panic!("{}: {c}: {e}", f.key));
+            }
+        }
+    }
 }
 
 #[test]
