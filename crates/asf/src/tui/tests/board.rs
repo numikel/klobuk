@@ -435,6 +435,120 @@ fn a_long_epic_title_keeps_its_bar_and_count_on_screen() {
     }
 }
 
+// ---- cost ----------------------------------------------------------------------------------------
+
+/// Epic asf-1: a done task that cost 30 (one review of 4.2) and an open task whose aborted run cost 10;
+/// epic asf-10 has not run anything.
+fn costed() -> Snapshot {
+    let mut review = issue("asf-4", "Review asf-2", Status::Done);
+    review.kind = IssueType::Review;
+    review.parent_id = Some(id("asf-2"));
+    let mut s = desk(vec![
+        epic("asf-1", "Costly round", Status::Backlog),
+        kid("asf-2", "Done work", Status::Done, "asf-1"),
+        kid("asf-3", "Open work", Status::InProgress, "asf-1"),
+        review,
+        epic("asf-10", "Cheap round", Status::Backlog),
+        kid("asf-11", "Idle", Status::Backlog, "asf-10"),
+    ]);
+    s.all_runs = vec![
+        run("asf-2", RunState::Succeeded, 30.0),
+        run("asf-3", RunState::Aborted, 10.0),
+        run("asf-4", RunState::Succeeded, 4.2),
+    ];
+    s
+}
+
+/// The list part of the screen line with `needle`: from 120 columns the detail panel sits to the right of
+/// a `│`, and it is not part of the header.
+fn list_line(text: &str, needle: &str) -> String {
+    let line = line_with(text, needle);
+    line.split('│').next().unwrap_or("").trim_end().to_string()
+}
+
+#[test]
+fn the_epic_header_ends_with_the_epics_total_cost_after_the_bar_and_the_count() {
+    for width in [100, 120] {
+        let t = render_to_text(&board_app(costed()), width, 30);
+        let h = list_line(&t, "▾ asf-1 ");
+        // task runs (aborted ones too) and the review of a task: 30 + 10 + 4.2
+        assert!(h.trim_end().ends_with("$44.2"), "{width}: {h:?}");
+        assert!(
+            h.find("1/2").unwrap() < h.find("$44.2").unwrap(),
+            "{width}: {h:?}"
+        );
+        let cheap = list_line(&t, "▾ asf-10");
+        assert!(cheap.trim_end().ends_with("$0.0"), "{width}: {cheap:?}");
+        // the cost column lines up whatever the counts are
+        assert_eq!(
+            text_width(h.trim_end()),
+            text_width(cheap.trim_end()),
+            "{width}:\n{h:?}\n{cheap:?}"
+        );
+    }
+}
+
+#[test]
+fn a_long_epic_title_gives_way_to_the_cost() {
+    let mut s = costed();
+    s.issues[0].title =
+        "An epic whose title is far too long to fit next to its progress bar at any width".into();
+    for width in [100, 120] {
+        let t = render_to_text(&board_app(s.clone()), width, 30);
+        let h = list_line(&t, "▾ asf-1 ");
+        assert!(
+            h.contains('…') && h.contains("1/2") && h.trim_end().ends_with("$44.2"),
+            "{width}: {h:?}"
+        );
+    }
+}
+
+#[test]
+fn a_folded_epic_header_shows_its_cost_too() {
+    let mut s = costed();
+    for i in &mut s.issues {
+        i.status = Status::Done;
+    }
+    let t = render_to_text(&board_app(s), 100, 30);
+    let h = list_line(&t, "▸ asf-1 ");
+    assert!(h.contains("2/2 ✓") && h.trim_end().ends_with("$44.2"), "{h:?}");
+}
+
+#[test]
+fn the_epic_detail_breaks_the_cost_down_into_tasks_reviews_and_total() {
+    let mut a = board_app(costed());
+    board::select(&mut a.board, &a.snap, &id("asf-1"));
+    let t = render_to_text(&a, 120, 30);
+    let field = |label: &str, text: &str| format!("{label:<12}{text}");
+    for needle in [
+        "Cost",
+        &field("Tasks", "$40.00 · 1/2 done"),
+        &field("Reviews", "$4.20 · 1 run"),
+        &field("Total", "$44.20"),
+    ] {
+        assert!(t.contains(needle), "missing {needle:?}:\n{t}");
+    }
+    // the same breakdown on the full-screen detail below 120 columns
+    a.handle_key(code(KeyCode::Enter));
+    let t = render_to_text(&a, 100, 30);
+    assert!(t.contains(&field("Total", "$44.20")), "{t}");
+}
+
+#[test]
+fn an_epic_that_ran_nothing_shows_zero_and_a_task_has_no_cost_block() {
+    let mut a = board_app(costed());
+    board::select(&mut a.board, &a.snap, &id("asf-10"));
+    let t = render_to_text(&a, 120, 30);
+    assert!(t.contains(&format!("{:<12}{}", "Total", "$0.00")), "{t}");
+    assert!(
+        t.contains(&format!("{:<12}{}", "Reviews", "$0.00 · 0 runs")),
+        "{t}"
+    );
+    board::select(&mut a.board, &a.snap, &id("asf-2"));
+    let t = render_to_text(&a, 120, 30);
+    assert!(!t.contains("Reviews  ") && !t.contains("$44.20"), "{t}");
+}
+
 // ---- keys ----------------------------------------------------------------------------------------
 
 #[test]

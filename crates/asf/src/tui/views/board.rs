@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use asf_core::cost::{rollup, Costs};
 use asf_core::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -1068,6 +1069,32 @@ fn count_text(g: &EpicGroup<'_>) -> String {
     format!("{}/{}{}", g.done, g.total, if g.complete { " ✓" } else { "" })
 }
 
+/// What every epic cost so far (all its runs, and the runs of the reviews of its tasks), by epic id.
+fn epic_costs(snap: &Snapshot) -> BTreeMap<IssueId, Costs> {
+    rollup(&snap.issues, &snap.all_runs)
+        .epics
+        .into_iter()
+        .map(|e| (e.epic, e.cost))
+        .collect()
+}
+
+/// `$44.2`: the total in the epic header, one decimal to stay narrow.
+fn header_cost(c: &Costs) -> String {
+    format!("${:.1}", c.total)
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Column widths of an epic header; the title takes whatever the other columns leave.
+struct HeaderCols {
+    id_w: usize,
+    title_w: usize,
+    count_w: usize,
+    cost_w: usize,
+}
+
 fn render_list(
     frame: &mut Frame,
     area: Rect,
@@ -1102,7 +1129,8 @@ fn render_list(
         .max()
         .unwrap_or(0)
         .max(6);
-    // header: margin, marker, blank, id, two blanks, title, two blanks, bar, two blanks, count
+    // header: margin, marker, blank, id, two blanks, title, two blanks, bar, two blanks, count, a
+    // blank, cost
     let count_w = listing
         .groups
         .iter()
@@ -1110,9 +1138,28 @@ fn render_list(
         .map(|g| text_width(&count_text(g)))
         .max()
         .unwrap_or(0);
+    let costs = epic_costs(snap);
+    let cost_of = |g: &EpicGroup<'_>| {
+        g.epic
+            .and_then(|e| costs.get(&e.id))
+            .map(header_cost)
+            .unwrap_or_default()
+    };
+    let cost_w = listing
+        .groups
+        .iter()
+        .map(|g| text_width(&cost_of(g)))
+        .max()
+        .unwrap_or(0);
     let head_title_w = width
-        .saturating_sub(1 + 1 + 1 + id_w + 2 + 2 + BAR + 2 + count_w)
+        .saturating_sub(1 + 1 + 1 + id_w + 2 + 2 + BAR + 2 + count_w + 1 + cost_w)
         .max(8);
+    let cols = HeaderCols {
+        id_w,
+        title_w: head_title_w,
+        count_w,
+        cost_w,
+    };
     // rows: the dependency column starts right after the longest title among the rows that have one
     let avail = width.saturating_sub(ROW_FIXED + id_w).max(8);
     let deps: Vec<(&Issue, String)> = listing
@@ -1147,7 +1194,7 @@ fn render_list(
                 if is_selected {
                     style = style.patch(theme.selected());
                 }
-                header_line(g, listing.folded[*gi], id_w, head_title_w, theme).style(style)
+                header_line(g, listing.folded[*gi], &cols, &cost_of(g), theme).style(style)
             }
             Row::Issue(i) => {
                 after_rows = true;
@@ -1180,19 +1227,28 @@ fn render_list(
     frame.render_widget(Paragraph::new(shown), area);
 }
 
-fn header_line(g: &EpicGroup<'_>, folded: bool, id_w: usize, title_w: usize, theme: &Theme) -> Line<'static> {
+/// `▾ asf-23  Title  ▓░░░░░░░░░  1/10 $44.2`: the count and the cost are padded to the widest of all
+/// headers, so the cost column lines up (right-aligned) whatever the counts are.
+fn header_line(
+    g: &EpicGroup<'_>,
+    folded: bool,
+    cols: &HeaderCols,
+    cost: &str,
+    theme: &Theme,
+) -> Line<'static> {
     let marker = if folded { "▸" } else { "▾" };
     let mut spans = vec![Span::raw(format!(" {marker} "))];
     match g.epic {
         Some(e) => {
             let filled = bar_cells(g);
-            spans.push(Span::styled(fit(e.id.as_str(), id_w), theme.bold()));
-            spans.push(Span::raw(format!("  {}  ", fit(&e.title, title_w))));
+            spans.push(Span::styled(fit(e.id.as_str(), cols.id_w), theme.bold()));
+            spans.push(Span::raw(format!("  {}  ", fit(&e.title, cols.title_w))));
             spans.push(Span::raw(format!(
-                "{}{}  {}",
+                "{}{}  {} {cost:>w$}",
                 "▓".repeat(filled),
                 "░".repeat(BAR - filled),
-                count_text(g)
+                fit(&count_text(g), cols.count_w),
+                w = cols.cost_w,
             )));
         }
         None => spans.push(Span::styled("No epic", theme.bold())),
@@ -1294,6 +1350,10 @@ fn detail_lines(snap: &Snapshot, id: &IssueId, width: usize, theme: &Theme) -> V
     out.push(Line::from(head));
     out.extend(wrap_text(&i.title, width).into_iter().map(Line::from));
 
+    if i.kind == IssueType::Epic {
+        out.extend(cost_lines(snap, &i.id, theme));
+    }
+
     if let Some((state, facts)) = run_lines(snap, i) {
         out.push(Line::raw(""));
         let mark = issue_mark(snap, i);
@@ -1372,6 +1432,26 @@ fn detail_lines(snap: &Snapshot, id: &IssueId, width: usize, theme: &Theme) -> V
             out.push(Line::from(format!("{prefix}{l}")));
         }
     }
+    out
+}
+
+/// The cost breakdown of epic `id`: what its tasks cost, what the reviews of those tasks cost, the sum.
+fn cost_lines(snap: &Snapshot, id: &IssueId, theme: &Theme) -> Vec<Line<'static>> {
+    let Some(c) = epic_costs(snap).remove(id) else {
+        return Vec::new();
+    };
+    let mut out = vec![Line::raw(""), Line::styled("Cost", theme.bold())];
+    out.extend(field(
+        "Tasks",
+        vec![format!("${:.2} · {}/{} done", c.task_cost, c.done, c.tasks)],
+        theme,
+    ));
+    out.extend(field(
+        "Reviews",
+        vec![format!("${:.2} · {}", c.review_cost, plural(c.reviews, "run"))],
+        theme,
+    ));
+    out.extend(field("Total", vec![format!("${:.2}", c.total)], theme));
     out
 }
 

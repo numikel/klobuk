@@ -38,6 +38,8 @@ pub struct Snapshot {
     pub claims: Vec<Claim>,
     /// Active runs only.
     pub runs: Vec<Run>,
+    /// Every run of every issue, finished ones included: what the Board sums into the cost of an epic.
+    pub all_runs: Vec<Run>,
     pub agents: BTreeMap<IssueId, AgentInfo>,
     /// Unread comments addressed to the human (peeked).
     pub inbox: Vec<Comment>,
@@ -702,9 +704,10 @@ pub fn load_snapshot(
     questions.sort_by(|a, b| (&a.created_at, a.id).cmp(&(&b.created_at, b.id)));
     // `runs` is active-only, so a `failed` run is found among all runs: the newest run of a live
     // issue, when it failed and no run of the issue is active.
+    let all_runs = store.runs(None, false)?;
     let mut newest: BTreeMap<IssueId, Run> = BTreeMap::new();
-    for r in store.runs(None, false)? {
-        newest.insert(r.issue_id.clone(), r); // ordered by start: the last one wins
+    for r in &all_runs {
+        newest.insert(r.issue_id.clone(), r.clone()); // ordered by start: the last one wins
     }
     let failed_runs: Vec<Run> = issues
         .iter()
@@ -764,6 +767,7 @@ pub fn load_snapshot(
         issues,
         claims: store.active_claims()?,
         runs,
+        all_runs,
         agents,
         inbox: store.inbox(LANE_HUMAN, true, false)?,
         questions,

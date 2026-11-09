@@ -130,6 +130,31 @@ fn story() -> (Ctx, [IssueId; 4]) {
 }
 
 #[test]
+fn the_loader_carries_every_run_not_only_the_latest_one_per_issue() {
+    let (ctx, [a, _b, c, _r]) = story();
+    // a second, failed attempt at `a`: `last_runs` keeps one row for it, `all_runs` both
+    let again = ctx.store.create_run(&new_run(&a)).unwrap();
+    ctx.store
+        .update_run(
+            &again.id,
+            &RunPatch {
+                state: Some(RunState::Failed),
+                cost_usd: Some(0.5),
+                ..RunPatch::default()
+            },
+        )
+        .unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    assert!(s.runs.is_empty(), "no run is active");
+    assert_eq!(s.all_runs.len(), 3);
+    let of = |id: &IssueId| s.all_runs.iter().filter(|r| &r.issue_id == id).count();
+    assert_eq!((of(&a), of(&c)), (2, 1));
+    let spent: f64 = s.all_runs.iter().map(|r| r.cost_usd).sum();
+    assert!((spent - 2.0).abs() < 1e-9, "{spent}");
+    assert_eq!(s.last_runs.iter().filter(|l| l.issue == a).count(), 1);
+}
+
+#[test]
 fn the_loader_carries_deps_the_latest_run_per_issue_merged_today_review_links_and_needs_you() {
     let (ctx, [a, b, c, r]) = story();
     let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
