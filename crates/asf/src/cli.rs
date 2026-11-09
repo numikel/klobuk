@@ -94,6 +94,15 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// What the runs cost: totals per epic, averages per task run and per review run (read-only).
+    Cost(CostArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CostArgs {
+    /// List the tasks of this epic with their own cost and the cost of their reviews.
+    #[arg(long, value_name = "ID")]
+    pub epic: Option<IssueId>,
 }
 
 #[derive(Subcommand, Debug)]

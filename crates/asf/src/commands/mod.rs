@@ -1,4 +1,5 @@
 pub mod config;
+pub mod cost;
 pub mod doctor;
 pub mod export;
 pub mod gh;
@@ -22,7 +23,8 @@ use crate::output::{AppError, Rendered};
 /// orchestrator's and is refused there, whatever the Claude Code allowlist says.
 fn allowed_in_worker(cmd: &Cmd) -> bool {
     match cmd {
-        Cmd::Hook { .. } | Cmd::Lane { .. } | Cmd::Method { .. } => true,
+        // `cost` only reads the store.
+        Cmd::Hook { .. } | Cmd::Lane { .. } | Cmd::Method { .. } | Cmd::Cost(_) => true,
         Cmd::Repo { cmd } => !matches!(cmd, crate::cli::RepoCmd::Init(_)),
         // Reading the settings is harmless; changing them is the operator's.
         Cmd::Config { cmd } => matches!(cmd, ConfigCmd::Show),
@@ -63,6 +65,7 @@ fn top_level_name(cmd: &Cmd) -> &'static str {
         Cmd::Export(_) => "export",
         Cmd::Import(_) => "import",
         Cmd::Config { .. } => "config",
+        Cmd::Cost(_) => "cost",
     }
 }
 
@@ -90,5 +93,6 @@ pub fn dispatch(cli: &Cli) -> Result<Rendered, AppError> {
         Cmd::Export(a) => export::export(cli, a),
         Cmd::Import(a) => export::import(cli, a),
         Cmd::Config { cmd } => config::run(cli, cmd),
+        Cmd::Cost(a) => cost::run(cli, a),
     }
 }
