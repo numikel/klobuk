@@ -19,6 +19,7 @@ use crate::tui::app::{Action, View};
 use crate::tui::bindings::{b, Binding, Group, Slot, HELP_MOVE, HELP_OPEN, NORMAL};
 use crate::tui::snapshot::{move_selection, offset_of, parse_time, text_width, trunc, Snapshot};
 use crate::tui::theme::{Mark, Theme};
+use crate::tui::views::agents;
 
 /// The sentence of an empty log.
 pub const EMPTY: &str = "Nothing has happened yet. Events appear here as the factory works.";
@@ -248,31 +249,13 @@ fn find_merge(snap: &Snapshot, merge_id: i64) -> Option<&MergeItem> {
         .find(|m| m.id == merge_id)
 }
 
-/// The Claude Code session name of a worker (`worker.rs` `session_name`): the issue id and a slug of
-/// its title.
-fn session_name(id: &IssueId, title: &str) -> String {
-    let mut slug = String::new();
-    for c in title.chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-        } else if !slug.is_empty() && !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    slug.truncate(60usize.saturating_sub(id.as_str().len() + 1));
-    let slug = slug.trim_end_matches('-');
-    if slug.is_empty() {
-        id.to_string()
-    } else {
-        format!("{id}-{slug}")
-    }
-}
-
 /// `worker started · <model> · <session name>`.
 fn worker_started(snap: &Snapshot, e: &Event) -> Option<Said> {
     let issue = e.issue_id.as_ref()?;
     let model = snap.last_run(issue).and_then(|r| r.model.clone());
-    let session = snap.issue(issue).map(|i| session_name(issue, &i.title));
+    let session = snap
+        .issue(issue)
+        .map(|i| agents::session_name(issue.as_str(), &i.title));
     said(Sym::Working, "worker started", &[model, session])
 }
 
@@ -363,6 +346,11 @@ fn run_state(snap: &Snapshot, idx: usize, e: &Event) -> Option<Said> {
         "starting" => (!reviewer)
             .then(|| said(Sym::Waiting, "worker is starting", &[]))
             .flatten(),
+        // a worker that never came up is blocked with the start error as the reason (`block_start`);
+        // the dialog case (`worker asked ...`) has no reason
+        "blocked" if reason.is_some() || text(e, "from") == Some("starting") => {
+            said(Sym::Needs, "worker could not start", &[reason])
+        }
         "blocked" => said(Sym::Needs, "worker asked a question and is waiting", &[]),
         "finishing" => (!reviewer)
             .then(|| said(Sym::Working, "worker finished and handed over its report", &[]))

@@ -137,6 +137,36 @@ fn a_run_goes_from_started_to_verified_in_plain_sentences() {
 }
 
 #[test]
+fn a_worker_that_could_not_start_is_not_reported_as_asking_a_question() {
+    let s = log_desk(vec![
+        ev(
+            2,
+            "2026-11-06T11:00:30Z",
+            "run.state",
+            Some("asf-24"),
+            serde_json::json!({
+                "from":"working","to":"blocked",
+                "reason":"the agent did not come up\nscreen: login required"
+            }),
+        ),
+        ev(
+            1,
+            "2026-11-06T11:00:10Z",
+            "run.state",
+            Some("asf-24"),
+            serde_json::json!({"from":"starting","to":"blocked","reason":"start timed out"}),
+        ),
+    ]);
+    assert_eq!(
+        lines(&s),
+        [
+            "■ worker could not start · the agent did not come up",
+            "■ worker could not start · start timed out",
+        ]
+    );
+}
+
+#[test]
 fn a_verified_run_says_how_many_files_and_gates_when_the_event_knows() {
     let s = log_desk(vec![
         ev(
