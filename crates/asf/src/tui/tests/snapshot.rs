@@ -282,10 +282,17 @@ fn the_model_of_a_run_follows_the_config_file_too() {
     ctx.store.create_run(&new_run(&r)).unwrap();
     let path = ctx.root.join(".factory/config.toml");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, "[worker]\nmodel = \"haiku\"\n[review]\nmodel = \"sonnet\"\n").unwrap();
+    std::fs::write(
+        &path,
+        "[worker]\nmodel = \"haiku\"\n[review]\nmodel = \"sonnet\"\n",
+    )
+    .unwrap();
     let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
     assert_eq!(s.last_run(&a).unwrap().model.as_deref(), Some("haiku"));
-    assert_eq!(s.last_run(&r).and_then(|l| l.model.clone()).as_deref(), Some("sonnet"));
+    assert_eq!(
+        s.last_run(&r).and_then(|l| l.model.clone()).as_deref(),
+        Some("sonnet")
+    );
 }
 
 #[test]

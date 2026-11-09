@@ -22,9 +22,12 @@ fn footer_fits_100_columns_in_every_view_and_ends_with_help_and_quit() {
     }
     let (board, config) = (&seen[1], &seen[6]);
     assert_ne!(board, config, "Board and Config show different hints");
-    assert!(board.contains("s start") && !board.contains("d unset"), "{board}");
     assert!(
-        config.contains("d unset") && !config.contains("s start"),
+        board.contains("s start") && !board.contains("d back to default"),
+        "{board}"
+    );
+    assert!(
+        config.contains("d back to default") && !config.contains("s start"),
         "{config}"
     );
 }

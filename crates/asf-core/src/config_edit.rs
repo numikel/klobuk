@@ -207,7 +207,7 @@ const FIELDS: &[ConfigField] = &[
         label: "First reminder",
         group: ConfigGroup::Notifications,
         kind: FieldKind::Number,
-        help: "minutes of waiting before the first reminder (0: no reminders)",
+        help: "minutes before the first reminder (0: off)",
     },
     ConfigField {
         key: "notify.every_minutes",
