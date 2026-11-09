@@ -366,8 +366,14 @@ impl App {
             self.overlays.extend(keep);
             return self.dispatch(action);
         }
-        // The Board's filter takes every key as text, also the ones that are bound elsewhere (q, t, 1-7).
-        if self.view == View::Board && self.board.typing() {
+        // The Board's and the Log's filters take every key as text, also the ones that are bound
+        // elsewhere (q, t, 1-7).
+        let typing = match self.view {
+            View::Board => self.board.typing(),
+            View::Log => self.log.typing(),
+            _ => false,
+        };
+        if typing {
             let action = self.view_key(key);
             return self.dispatch(action);
         }
