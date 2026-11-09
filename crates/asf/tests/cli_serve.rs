@@ -1067,10 +1067,17 @@ fn queue_states(g: &Gated) -> Vec<MergeState> {
     g.store().merge_queue().unwrap().iter().map(|m| m.state).collect()
 }
 
-/// A test that waits for the loop stops it itself (`LiveServe::wait_until` + `stop`), so `--max-ticks` is
-/// only a safety net that ends a loop the test forgot about in seconds, not minutes. The tests that let
-/// the loop end by itself (`finish`, `output`) finish their work in the first ticks.
-const LOOP: [&str; 6] = ["serve", "--until-done", "--max-ticks", "30", "--interval", "1"];
+/// The tick limit can never be hit in a test: under load a tick with a gate or a git call takes seconds,
+/// so no tick count is both short enough to be a safety net and long enough for the work to finish. The
+/// test owns the loop's lifetime instead: `LiveServe::wait_until` has a deadline and `stop` kills the loop.
+const LOOP: [&str; 6] = [
+    "serve",
+    "--until-done",
+    "--max-ticks",
+    "100000",
+    "--interval",
+    "1",
+];
 
 fn all_merged(g: &Gated, n: usize) -> bool {
     let states = queue_states(g);
@@ -1393,8 +1400,9 @@ fn serve_start_puts_items_left_in_rebasing_or_gating_back_in_the_queue() {
     }
     drop(store);
 
-    let out = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let mut live = LiveServe::start(&g.repo, &LOOP);
+    live.wait_until(|_| all_merged(&g, 2) && g.issue_status(&a) == "done" && g.issue_status(&b) == "done");
+    live.stop();
     assert_eq!(queue_states(&g), vec![MergeState::Merged, MergeState::Merged]);
     assert_eq!(g.issue_status(&a), "done");
     assert_eq!(g.issue_status(&b), "done");
@@ -1426,8 +1434,9 @@ fn serve_start_verifies_again_a_run_a_stopped_serve_left_verifying() {
         .unwrap();
     drop(store);
 
-    let out = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let mut live = LiveServe::start(&g.repo, &LOOP);
+    live.wait_until(|_| g.repo.ok(&["run", "list"])[0]["state"] == "succeeded" && all_merged(&g, 1));
+    live.stop();
     let runs = g.repo.ok(&["run", "list"]);
     assert_eq!(runs[0]["state"], "succeeded", "{runs}");
     assert_eq!(queue_states(&g), vec![MergeState::Merged]);
