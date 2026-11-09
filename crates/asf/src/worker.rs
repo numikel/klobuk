@@ -303,6 +303,27 @@ impl GateSlot {
         })
     }
 
+    /// Blocks until the gate run in flight is over (each gate is bounded by its own `timeout_s`) and hands
+    /// it over; frees the slot. `None` when nothing is in flight. For a loop that must not leave while a
+    /// gate command is still running: the command is a child of this process and would outlive it.
+    pub fn wait_finished(&mut self) -> Option<Finished> {
+        let results = match self.running.as_ref()?.results.recv() {
+            Ok(results) => results,
+            Err(_) => {
+                let name = self.current().map(|r| r.gate).unwrap_or_default();
+                vec![gate_failure(
+                    &name,
+                    "the gate thread died before it reported".into(),
+                )]
+            }
+        };
+        let running = self.running.take()?;
+        Some(Finished {
+            job: running.job,
+            results,
+        })
+    }
+
     /// The gate run in flight: whose it is, which gate runs now and for how long the run has been going.
     pub fn current(&self) -> Option<GateRun> {
         let r = self.running.as_ref()?;
@@ -2163,6 +2184,22 @@ mod gate_slot_tests {
             !slot.is_busy() && slot.current().is_none(),
             "the slot is free again"
         );
+    }
+
+    #[test]
+    fn waiting_for_the_run_in_flight_hands_over_its_results_and_frees_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = GateSlot::new();
+        assert!(
+            slot.wait_finished().is_none(),
+            "nothing in flight, nothing to wait for"
+        );
+        let slow = spec("slow", "import time; time.sleep(1)");
+        assert!(slot.start(job(7), vec![slow], dir.path().to_path_buf()).is_none());
+        let done = slot.wait_finished().expect("the run in flight");
+        assert_eq!(done.job.issue().to_string(), "asf-7");
+        assert!(done.results[0].ok, "{:?}", done.results);
+        assert!(!slot.is_busy());
     }
 
     #[test]

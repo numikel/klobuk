@@ -426,8 +426,22 @@ impl LiveServe {
         (std::mem::take(&mut self.seen), err)
     }
 
-    /// Waits for a loop that ends by itself; returns the lines after the first one and the stderr.
+    /// Whether the loop is still going.
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Waits for a loop that ends by itself (at most `WAIT`; a loop that does not end is a failure, and
+    /// `Drop` kills it); returns the lines after the first one and the stderr.
     fn finish(mut self) -> (Vec<serde_json::Value>, String) {
+        let deadline = std::time::Instant::now() + WAIT;
+        while self.running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "`asf serve` did not end within {WAIT:?}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
         self.child.wait().unwrap();
         for l in self.lines.iter() {
             self.seen
@@ -1161,6 +1175,41 @@ fn a_merge_gate_in_flight_does_not_stop_the_loop() {
         merged,
         "the tick that reaped the result reports the merge: {lines:?}"
     );
+}
+
+#[test]
+fn serve_does_not_exit_at_the_tick_limit_while_a_gate_run_is_in_flight() {
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+
+    // two ticks only, one second apart; the gate is held for much longer than that
+    let mut live = LiveServe::start(
+        &g.repo,
+        &["serve", "--until-done", "--max-ticks", "2", "--interval", "1"],
+    );
+    assert_eq!(
+        live.first["result"]["gate_run"]["issue"],
+        a.as_str(),
+        "{}",
+        live.first
+    );
+    std::thread::sleep(Duration::from_secs(5)); // well past the limit
+    assert!(
+        live.running(),
+        "serve left while its gate command was still running: the process would outlive asf"
+    );
+    assert_eq!(queue_states(&g), vec![MergeState::Gating]);
+
+    g.release();
+    let (lines, stderr) = live.finish();
+    // it exited only after the result was concluded: merged, not left `gating`
+    assert_eq!(queue_states(&g), vec![MergeState::Merged], "{lines:?}\n{stderr}");
+    assert_eq!(g.issue_status(&a), "done");
+    // the limit was passed long ago; with the run concluded and nothing open, `all_done` is the reason
+    let summary = &lines.last().expect("the summary")["result"];
+    assert_eq!(summary["reason"], "all_done", "{lines:?}");
+    assert!(summary["ticks"].as_u64().unwrap() > 2, "{summary}");
+    assert_eq!(g.runs().len(), 1, "the gate ran once: {:?}", g.runs());
 }
 
 #[test]

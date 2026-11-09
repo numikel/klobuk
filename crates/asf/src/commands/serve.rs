@@ -370,7 +370,9 @@ fn assess(ctx: &Ctx, dispatch: bool, gate: &GateSlot) -> Result<Assessment, AppE
 /// Checked after every tick. `all_done` wins over `stuck`, which wins over `max_ticks`, so the
 /// most informative reason is reported when several hold at once. A failed tick never yields
 /// `stuck`: its half-applied state is not evidence that nothing can move. A gate run still in flight
-/// (or a check of main still owed) keeps the loop going even with nothing open: stopping would kill it.
+/// (or a check of main still owed) keeps the loop going even with nothing open and past the tick limit:
+/// the gate command is a child of this process and would outlive it, and the next serve would start a
+/// second gate run in the same worktree. The run has a timeout, so the wait is bounded.
 fn decide(a: &Assessment, ticks: u64, max_ticks: Option<u64>, tick_ok: bool) -> Option<StopReason> {
     if a.open.is_empty() && !a.gate_busy {
         return Some(StopReason::AllDone);
@@ -378,7 +380,7 @@ fn decide(a: &Assessment, ticks: u64, max_ticks: Option<u64>, tick_ok: bool) -> 
     if tick_ok && !a.busy && !a.can_start {
         return Some(StopReason::Stuck);
     }
-    if max_ticks.is_some_and(|n| ticks >= n) {
+    if max_ticks.is_some_and(|n| ticks >= n) && !a.gate_busy {
         return Some(StopReason::MaxTicks);
     }
     None
@@ -455,14 +457,32 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         );
     }
     let mut gate = GateSlot::new();
-    let mut watch = ConfigWatch::new(&ctx);
+    let result = serve_loop(cli, a, &mut ctx, &mut reminders, &mut gate);
+    // Whatever ended the loop (an error included), a gate command still running is a child of this
+    // process: wait for it so that it does not outlive asf. Its result is not concluded here; the item
+    // is still `gating`/`verifying` in the store and the next start deals with it like with any other.
+    if gate.is_busy() {
+        eprintln!("asf serve: waiting for the gate run in flight before it exits");
+        let _ = gate.wait_finished();
+    }
+    result
+}
+
+fn serve_loop(
+    cli: &Cli,
+    a: &ServeArgs,
+    ctx: &mut Ctx,
+    reminders: &mut RemindState,
+    gate: &mut GateSlot,
+) -> Result<Rendered, AppError> {
+    let mut watch = ConfigWatch::new(ctx);
     let mut ticks: u64 = 0;
     loop {
         ticks += 1;
-        if let Some(warning) = watch.refresh(&mut ctx) {
+        if let Some(warning) = watch.refresh(ctx) {
             eprintln!("asf serve: {warning}");
         }
-        let tick_ok = match tick(&ctx, a.dispatch, &mut reminders, Some(&mut gate)) {
+        let tick_ok = match tick(ctx, a.dispatch, reminders, Some(&mut *gate)) {
             Ok(t) => {
                 if !t.promoted.is_empty()
                     || !t.closed_epics.is_empty()
@@ -484,7 +504,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
             }
         };
         if a.until_done {
-            let assessment = assess(&ctx, a.dispatch, &gate)?;
+            let assessment = assess(ctx, a.dispatch, gate)?;
             if let Some(reason) = decide(&assessment, ticks, a.max_ticks, tick_ok) {
                 return finish(cli, ticks, reason, assessment);
             }
@@ -547,7 +567,21 @@ mod tests {
             None,
             "stopping would kill the gate run"
         );
-        assert_eq!(decide(&a, 4, Some(4), true), Some(StopReason::MaxTicks));
+        assert_eq!(
+            decide(&a, 4, Some(4), true),
+            None,
+            "not even the tick limit ends the loop under a gate run: its process would outlive asf"
+        );
+        let over = Assessment {
+            gate_busy: false,
+            busy: false,
+            ..assessment(1, false, true)
+        };
+        assert_eq!(
+            decide(&over, 5, Some(4), true),
+            Some(StopReason::MaxTicks),
+            "once the run is concluded the limit applies"
+        );
     }
 
     #[test]
