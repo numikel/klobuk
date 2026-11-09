@@ -21,7 +21,7 @@ use crate::tui::app::{Action, View};
 use crate::tui::bindings::*;
 use crate::tui::overlays::InputTarget;
 use crate::tui::snapshot::{
-    age, fit, money, move_selection, offset_of, parse_time, Need, NeedSource, Snapshot,
+    age, first_line, fit, money, move_selection, offset_of, parse_time, Need, NeedSource, Snapshot,
 };
 use crate::tui::theme::{Mark, Theme};
 
@@ -37,6 +37,9 @@ const OVERDUE_MARK: &str = "!";
 /// Width of the age cell of a NEEDS YOU row: the mark or two blanks, then the age (at most `59 min`),
 /// and a gap before the key.
 const AGE_W: usize = 10;
+
+/// Width of the state cell of a RUNNING row: room for `fixing after review`.
+const RUN_STATE_W: usize = 19;
 
 /// Selection over the NEEDS YOU rows followed by the RUNNING rows.
 #[derive(Debug, Clone, Default)]
@@ -144,8 +147,27 @@ pub const BINDINGS: &[Binding] = &[
 
 const NOW: &[View] = &[View::Now];
 
+/// `fixing after review` / `fixing after gate`: what a working run is doing when its issue still has a
+/// failed merge item, i.e. a reviewer or a post-rebase gate sent the worker back (the item stays
+/// `failed` until the worker finishes again). The text of the item's error tells which of the two.
+fn fixing_label(snap: &Snapshot, issue: &IssueId) -> Option<&'static str> {
+    let item = snap
+        .queue
+        .iter()
+        .find(|m| &m.issue_id == issue && m.state == MergeState::Failed)?;
+    let error = first_line(item.last_error.as_deref()?)?;
+    if error.starts_with("review asks for changes") {
+        Some("fixing after review")
+    } else if error.starts_with("gate `") {
+        Some("fixing after gate")
+    } else {
+        None
+    }
+}
+
 /// Active runs that are not already a NEEDS YOU row (a blocked, stalled or over-budget run is listed
-/// there, once), including reviewer runs, oldest first.
+/// there, once), including reviewer runs, oldest first. A worker fixing what a reviewer or a gate
+/// found says so (`fixing after review`), which is why its failed merge item is not in NEEDS YOU.
 pub fn running(snap: &Snapshot) -> Vec<RunRow> {
     snap.runs
         .iter()
@@ -168,6 +190,10 @@ pub fn running(snap: &Snapshot) -> Vec<RunRow> {
                 reviewer,
                 state: if reviewer {
                     "review".into()
+                } else if let Some(fixing) =
+                    fixing_label(snap, &r.issue_id).filter(|_| r.state == RunState::Working)
+                {
+                    fixing.into()
                 } else {
                     r.state.to_string()
                 },
@@ -399,9 +425,9 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
             theme.dim(),
         )));
     }
-    // fixed columns: margin 1, selector 2, mark 2, id, gap 2, state 15, gap 2, money 14, gap 2, elapsed 8
+    // fixed columns: margin 1, selector 2, mark 2, id, gap 2, state 19, gap 2, money 14, gap 2, elapsed 8
     let title_w = width
-        .saturating_sub(1 + 2 + 2 + id_w + 2 + 15 + 2 + 14 + 2 + 8)
+        .saturating_sub(1 + 2 + 2 + id_w + 2 + RUN_STATE_W + 2 + 14 + 2 + 8)
         .max(8);
     for (j, r) in running.iter().enumerate() {
         let i = needs.len() + j;
@@ -414,7 +440,7 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
                 Span::raw(format!(" {}", select_marker(i))),
                 Span::styled(format!("{} ", mark.glyph()), theme.mark(mark)),
                 Span::styled(format!("{}  ", fit(r.issue.as_str(), id_w)), theme.bold()),
-                Span::raw(fit(&r.state, 15)),
+                Span::raw(fit(&r.state, RUN_STATE_W)),
                 Span::raw(format!("{}  ", fit(&r.title, title_w))),
                 Span::raw(format!("{}  ", fit(&money(r.cost, r.budget), 14))),
                 Span::raw(age(&snap.now, &r.since)),

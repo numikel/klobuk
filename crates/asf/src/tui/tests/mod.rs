@@ -83,6 +83,9 @@ mod frame;
 mod help;
 mod inbox;
 mod log;
+// `now` is the imported view, so the module that tests the one-row-per-issue rule has another name
+#[path = "now.rs"]
+mod now_rows;
 mod now_view;
 mod queue;
 mod render;

@@ -205,14 +205,15 @@ fn the_loader_carries_deps_the_latest_run_per_issue_merged_today_review_links_an
         kinds.contains(&(c.clone(), NeedSource::Run(RunState::Failed))),
         "{kinds:?}"
     );
+    // `c` also has a failed merge item, but one issue gets one row: the run, which is what to act on first
     assert!(
-        kinds.contains(&(c.clone(), NeedSource::Merge(MergeState::Failed))),
+        !kinds.contains(&(c.clone(), NeedSource::Merge(MergeState::Failed))),
         "{kinds:?}"
     );
     assert!(kinds
         .iter()
         .any(|(i, k)| *i == b && matches!(k, NeedSource::Question(_))));
-    assert_eq!(kinds.len(), 3);
+    assert_eq!(kinds.len(), 2);
     let since: Vec<&str> = s.needs_you.iter().map(|n| n.since.as_str()).collect();
     assert!(since.windows(2).all(|w| w[0] <= w[1]), "oldest first: {since:?}");
     assert!(s.detail.is_none() && s.pane_preview.is_none(), "loaded on demand");

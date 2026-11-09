@@ -356,8 +356,31 @@ fn state_since(snap: &Snapshot, run: &Run) -> String {
         .unwrap_or_else(|| run.started_at.clone())
 }
 
-/// What needs the human, oldest first: blocked runs, unanswered QUESTIONs to the human, runs in
-/// `failed`/`stalled`/`over_budget`, and merge items in `failed`/`blocked`.
+/// How actionable a source is now (lower first): a blocked run is a live prompt, a QUESTION is a
+/// person waiting for a reply, a failed/stalled/over-budget run is the cause of what follows, and a
+/// merge item is only the consequence. (`asf serve` ranks its alerts alike, except that it puts a
+/// QUESTION before a blocked run.) A blocked *issue* has no row of its own: no key acts on it.
+fn actionability(source: &NeedSource) -> u8 {
+    match source {
+        NeedSource::BlockedRun => 0,
+        NeedSource::Question(_) => 1,
+        NeedSource::Run(_) => 2,
+        NeedSource::Merge(_) => 3,
+    }
+}
+
+/// Whether the worker of `id` is working right now (it has an active run). A failed merge item of
+/// such an issue is not waiting for the human: a reviewer or a post-rebase gate sent the worker back
+/// to fix it, and `asf merge retry` refuses the issue until that run ends. `asf serve` applies the
+/// same guard before it reminds (`commands/remind.rs`).
+pub fn is_being_fixed(snap: &Snapshot, id: &IssueId) -> bool {
+    snap.runs.iter().any(|r| &r.issue_id == id)
+}
+
+/// What needs the human: one row per issue, oldest first. Candidates are blocked runs, unanswered
+/// QUESTIONs to the human, runs in `failed`/`stalled`/`over_budget`, and merge items in
+/// `failed`/`blocked` of a live issue whose worker is not running. When several wait on one issue the
+/// row is the most actionable of them ([`actionability`]) and its age is the oldest one's.
 pub fn compute_needs(snap: &Snapshot) -> Vec<Need> {
     let mut out = Vec::new();
     for run in snap.runs.iter().chain(&snap.failed_runs) {
@@ -420,6 +443,11 @@ pub fn compute_needs(snap: &Snapshot) -> Vec<Need> {
             MergeState::Blocked => "merge blocked",
             _ => continue,
         };
+        // the same guard as `asf serve`: a closed issue, or one whose worker is fixing it, waits for nobody
+        let live = snap.issue(&m.issue_id).is_some_and(|i| !i.status.is_terminal());
+        if !live || is_being_fixed(snap, &m.issue_id) {
+            continue;
+        }
         out.push(Need {
             issue: m.issue_id.clone(),
             source: NeedSource::Merge(m.state),
@@ -434,9 +462,23 @@ pub fn compute_needs(snap: &Snapshot) -> Vec<Need> {
             act: Act::Retry,
         });
     }
+    // One row per issue: the most actionable candidate, aged by the oldest one. A tie keeps the first
+    // candidate, which is the older QUESTION (the questions are sorted by time).
+    let mut rows: Vec<Need> = Vec::new();
+    for need in out {
+        let Some(row) = rows.iter_mut().find(|r| r.issue == need.issue) else {
+            rows.push(need);
+            continue;
+        };
+        let oldest = row.since.clone().min(need.since.clone());
+        if actionability(&need.source) < actionability(&row.source) {
+            *row = need;
+        }
+        row.since = oldest;
+    }
     // RFC 3339 UTC strings sort by time; the issue id keeps ties stable.
-    out.sort_by(|a, b| (&a.since, &a.issue).cmp(&(&b.since, &b.issue)));
-    out
+    rows.sort_by(|a, b| (&a.since, &a.issue).cmp(&(&b.since, &b.issue)));
+    rows
 }
 
 // ---------------------------------------------------------------------------------------------
