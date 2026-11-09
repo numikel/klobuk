@@ -967,7 +967,10 @@ fn queue_states(g: &Gated) -> Vec<MergeState> {
     g.store().merge_queue().unwrap().iter().map(|m| m.state).collect()
 }
 
-const LOOP: [&str; 6] = ["serve", "--until-done", "--max-ticks", "10", "--interval", "1"];
+/// `--until-done` ends the loop when the work is over. `--max-ticks` is only a safety net, and it is far
+/// above what the tests need: a tick that spawns git and a gate takes seconds on a loaded machine, so a
+/// count close to the number of ticks a test expects would end the loop before the work is done.
+const LOOP: [&str; 6] = ["serve", "--until-done", "--max-ticks", "300", "--interval", "1"];
 
 #[test]
 fn a_merge_gate_in_flight_does_not_stop_the_loop() {
