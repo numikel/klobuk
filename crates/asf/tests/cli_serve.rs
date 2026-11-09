@@ -299,17 +299,29 @@ fn fake_runtime_one_slot(repo: &Repo) {
     git(repo.path(), &["commit", "-q", "-m", "cfg"]);
 }
 
+/// How long a test waits for the loop to reach a state before it gives up. It only matters when the loop
+/// hangs: a test that waits for a condition returns the moment it holds. The 37 tests of this file run
+/// in parallel next to other cargo jobs and the antivirus, where one test alone can take a minute.
+const WAIT: Duration = Duration::from_secs(240);
+
 /// A running `asf serve ... --json` whose first stdout line has already been read, so the test can
-/// edit the config while the loop sleeps between ticks.
+/// edit the config while the loop sleeps between ticks. A thread reads the pipes, so a test can look at
+/// the lines the loop has printed so far, wait for a condition and then stop the loop itself: no test
+/// depends on the loop ending by its own tick count.
 struct LiveServe {
     child: std::process::Child,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    lines: std::sync::mpsc::Receiver<String>,
+    out_reader: Option<std::thread::JoinHandle<()>>,
+    err_reader: Option<std::thread::JoinHandle<()>>,
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
     first: serde_json::Value,
+    /// The lines after the first one that `wait_until` has taken from the pipe.
+    seen: Vec<serde_json::Value>,
 }
 
 impl LiveServe {
     fn start(repo: &Repo, args: &[&str]) -> LiveServe {
-        use std::io::BufRead;
+        use std::io::{BufRead, Read};
         use std::process::Stdio;
         let mut child = repo
             .asf()
@@ -319,36 +331,124 @@ impl LiveServe {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        stdout.read_line(&mut line).unwrap();
-        let first = serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("first line {line:?}: {e}"));
-        LiveServe { child, stdout, first }
+        let out = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let out_reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut err = child.stderr.take().unwrap();
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = stderr.clone();
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = err.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let mut live = LiveServe {
+            child,
+            lines,
+            out_reader: Some(out_reader),
+            err_reader: Some(err_reader),
+            stderr,
+            first: serde_json::Value::Null,
+            seen: Vec::new(),
+        };
+        let line = live.recv("the first line");
+        live.first = serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("first line {line:?}: {e}"));
+        live
+    }
+
+    fn recv(&mut self, what: &str) -> String {
+        match self.lines.recv_timeout(WAIT) {
+            Ok(l) => l,
+            Err(e) => panic!(
+                "no {what} from `asf serve` within {WAIT:?}: {e}\n{}",
+                self.stderr.lock().unwrap()
+            ),
+        }
     }
 
     /// Blocks until the loop prints its next line (a tick with an event, or the summary).
     fn next_line(&mut self) -> serde_json::Value {
-        use std::io::BufRead;
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
+        let line = self.recv("next line");
         serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("next line {line:?}: {e}"))
     }
 
-    /// Waits for the process; returns the remaining stdout lines (JSON) and the whole stderr.
+    /// Polls `cond` every 250 ms, with the lines printed so far, until it holds. Panics when the loop
+    /// ends first or `WAIT` passes: the test asserts on the condition, never on the loop having ended.
+    fn wait_until(&mut self, mut cond: impl FnMut(&[serde_json::Value]) -> bool) {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            while let Ok(l) = self.lines.try_recv() {
+                if let Ok(v) = serde_json::from_str(l.trim()) {
+                    self.seen.push(v);
+                }
+            }
+            if cond(&self.seen) {
+                return;
+            }
+            let gone = matches!(self.child.try_wait(), Ok(Some(_)));
+            assert!(
+                !gone,
+                "`asf serve` ended before the condition held: {:?}\n{}",
+                self.seen,
+                self.stderr.lock().unwrap()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the condition did not hold within {WAIT:?}: {:?}\n{}",
+                self.seen,
+                self.stderr.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Ends the loop now; returns the lines after the first one and the stderr so far.
+    fn stop(mut self) -> (Vec<serde_json::Value>, String) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // a gate command that outlived the loop may keep the pipes open: take what is there
+        while let Ok(l) = self.lines.recv_timeout(Duration::from_secs(2)) {
+            if let Ok(v) = serde_json::from_str(l.trim()) {
+                self.seen.push(v);
+            }
+        }
+        let err = self.stderr.lock().unwrap().clone();
+        (std::mem::take(&mut self.seen), err)
+    }
+
+    /// Waits for a loop that ends by itself; returns the lines after the first one and the stderr.
     fn finish(mut self) -> (Vec<serde_json::Value>, String) {
-        use std::io::Read;
-        let mut rest = String::new();
-        self.stdout.read_to_string(&mut rest).unwrap();
-        let mut err = String::new();
-        self.child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
         self.child.wait().unwrap();
-        let lines = rest.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        (lines, err)
+        for l in self.lines.iter() {
+            self.seen
+                .push(serde_json::from_str(l.trim()).unwrap_or_else(|e| panic!("line {l:?}: {e}")));
+        }
+        for t in [self.out_reader.take(), self.err_reader.take()]
+            .into_iter()
+            .flatten()
+        {
+            t.join().unwrap();
+        }
+        let err = self.stderr.lock().unwrap().clone();
+        (std::mem::take(&mut self.seen), err)
+    }
+}
+
+impl Drop for LiveServe {
+    fn drop(&mut self) {
+        // a test that panicked must not leave the loop running
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -967,10 +1067,22 @@ fn queue_states(g: &Gated) -> Vec<MergeState> {
     g.store().merge_queue().unwrap().iter().map(|m| m.state).collect()
 }
 
-/// `--until-done` ends the loop when the work is over. `--max-ticks` is only a safety net, and it is far
-/// above what the tests need: a tick that spawns git and a gate takes seconds on a loaded machine, so a
-/// count close to the number of ticks a test expects would end the loop before the work is done.
-const LOOP: [&str; 6] = ["serve", "--until-done", "--max-ticks", "300", "--interval", "1"];
+/// A test that waits for the loop stops it itself (`LiveServe::wait_until` + `stop`), so `--max-ticks` is
+/// only a safety net that ends a loop the test forgot about in seconds, not minutes. The tests that let
+/// the loop end by itself (`finish`, `output`) finish their work in the first ticks.
+const LOOP: [&str; 6] = ["serve", "--until-done", "--max-ticks", "30", "--interval", "1"];
+
+fn all_merged(g: &Gated, n: usize) -> bool {
+    let states = queue_states(g);
+    states.len() == n && states.iter().all(|s| *s == MergeState::Merged)
+}
+
+fn merged_events(g: &Gated) -> usize {
+    g.event_kinds()
+        .iter()
+        .filter(|(k, _)| k == "merge.merged")
+        .count()
+}
 
 #[test]
 fn a_merge_gate_in_flight_does_not_stop_the_loop() {
@@ -1017,7 +1129,15 @@ fn a_merge_gate_in_flight_does_not_stop_the_loop() {
     assert_eq!(queue_states(&g), vec![MergeState::Gating]);
 
     g.release();
-    let (lines, stderr) = live.finish();
+    live.wait_until(|lines| {
+        let reported = lines.iter().any(|l| {
+            l["result"]["merge"]["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|m| m["state"] == "merged"))
+        });
+        reported && all_merged(&g, 1)
+    });
+    let (lines, stderr) = live.stop();
     assert_eq!(queue_states(&g), vec![MergeState::Merged], "{lines:?}\n{stderr}");
     assert_eq!(g.issue_status(&a), "done");
     assert_eq!(g.runs().len(), 1, "the gate ran once: {:?}", g.runs());
@@ -1078,7 +1198,8 @@ fn a_review_verdict_is_read_while_a_gate_run_is_in_flight() {
         .contains(&("merge.merged".to_string(), Some(r.clone()))));
 
     g.release();
-    live.finish();
+    live.wait_until(|_| all_merged(&g, 2));
+    live.stop();
 }
 
 #[test]
@@ -1107,7 +1228,7 @@ fn an_approved_item_is_not_merged_while_main_is_being_checked() {
     std::fs::remove_file(&g.release).ok();
     let before = main_head(&g);
 
-    let live = LiveServe::start(&g.repo, &LOOP);
+    let mut live = LiveServe::start(&g.repo, &LOOP);
     assert_eq!(live.first["result"]["gate_run"]["kind"], "main", "{}", live.first);
     review_verdict(&g, &r, "approve");
     std::thread::sleep(Duration::from_secs(3)); // several ticks with the check of main held
@@ -1128,7 +1249,8 @@ fn an_approved_item_is_not_merged_while_main_is_being_checked() {
     );
 
     g.release();
-    let (lines, stderr) = live.finish();
+    live.wait_until(|_| all_merged(&g, 2));
+    let (lines, stderr) = live.stop();
     assert_eq!(
         queue_states(&g),
         vec![MergeState::Merged, MergeState::Merged],
@@ -1182,11 +1304,11 @@ fn nothing_is_merged_in_the_tick_that_finds_main_red() {
         "and merges nothing on top of it: {red}"
     );
     // The approved item is only parked. Whether this serve goes on to merge it in a later tick or
-    // reports `stuck` first depends on timing; the next serve merges it in any case.
-    live.finish();
-    let again = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
-    assert!(matches!(again.status.code(), Some(0 | 3)), "{again:?}");
-    assert_eq!(queue_states(&g)[1], MergeState::Merged, "{again:?}");
+    // reports `stuck` first depends on timing; a serve started afterwards merges it in any case.
+    live.stop();
+    let mut again = LiveServe::start(&g.repo, &LOOP);
+    again.wait_until(|_| queue_states(&g)[1] == MergeState::Merged);
+    again.stop();
 }
 
 #[test]
@@ -1195,7 +1317,7 @@ fn only_one_gate_run_is_in_flight_and_the_queue_stays_fifo() {
     let a = queued_item(&g.repo, "src/**", "src/a.rs");
     let b = queued_item(&g.repo, "docs/**", "docs/b.md");
 
-    let live = LiveServe::start(&g.repo, &LOOP);
+    let mut live = LiveServe::start(&g.repo, &LOOP);
     assert_eq!(live.first["result"]["gate_run"]["issue"], a.as_str());
     std::thread::sleep(Duration::from_secs(3)); // several ticks with the first gate held
     assert_eq!(
@@ -1207,7 +1329,8 @@ fn only_one_gate_run_is_in_flight_and_the_queue_stays_fifo() {
     assert_eq!(queue_states(&g), vec![MergeState::Gating, MergeState::Queued]);
 
     g.release();
-    let (lines, stderr) = live.finish();
+    live.wait_until(|_| all_merged(&g, 2) && merged_events(&g) == 2);
+    let (lines, stderr) = live.stop();
     assert_eq!(
         queue_states(&g),
         vec![MergeState::Merged, MergeState::Merged],
@@ -1231,12 +1354,14 @@ fn only_one_gate_run_is_in_flight_and_the_queue_stays_fifo() {
 fn the_result_of_an_item_skipped_while_its_gates_ran_is_dropped() {
     let g = gated(HOLD_GATE, "[\"merge\"]", false);
     let a = queued_item(&g.repo, "src/**", "src/a.rs");
-    let live = LiveServe::start(&g.repo, &LOOP);
+    let mut live = LiveServe::start(&g.repo, &LOOP);
     assert_eq!(live.first["result"]["gate_run"]["issue"], a.as_str());
     // the operator gives up on the item while its gates run
     g.repo.ok(&["merge", "skip", &a]);
     g.release();
-    let (lines, stderr) = live.finish();
+    // the tick that takes the finished gate run off the slot is printed, with no gate run in flight
+    live.wait_until(|lines| lines.iter().any(|l| l["result"]["gate_run"].is_null()));
+    let (lines, stderr) = live.stop();
     assert_eq!(queue_states(&g), vec![MergeState::Skipped], "{lines:?}\n{stderr}");
     assert_eq!(g.issue_status(&a), "validating", "nothing was merged or closed");
     assert!(!g.event_kinds().iter().any(|(k, _)| k == "merge.merged"));
@@ -1343,7 +1468,7 @@ fn verification_of_finished_runs_leaves_the_tick_and_shares_the_single_slot() {
 
     let mut args = LOOP.to_vec();
     args.push("--dispatch");
-    let live = LiveServe::start(&g.repo, &args);
+    let mut live = LiveServe::start(&g.repo, &args);
     let first = &live.first["result"];
     assert_eq!(first["gate_run"]["kind"], "verify", "{first}");
     assert_eq!(first["gate_run"]["issue"], a.as_str(), "{first}");
@@ -1357,7 +1482,17 @@ fn verification_of_finished_runs_leaves_the_tick_and_shares_the_single_slot() {
     );
 
     g.release();
-    let (lines, stderr) = live.finish();
+    live.wait_until(|_| {
+        let runs = g.repo.ok(&["run", "list"]);
+        let done = |id: &str| {
+            runs.as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["issue_id"] == id && r["state"] == "succeeded")
+        };
+        done(&a) && done(&b) && all_merged(&g, 2)
+    });
+    let (lines, stderr) = live.stop();
     let runs = g.repo.ok(&["run", "list"]);
     let state_of = |id: &str| {
         runs.as_array()
@@ -1381,7 +1516,7 @@ fn the_check_of_main_after_a_merge_runs_in_the_background() {
     let g = gated(HOLD_GATE, "[\"main\"]", true);
     let a = queued_item(&g.repo, "src/**", "src/a.rs");
 
-    let live = LiveServe::start(&g.repo, &LOOP);
+    let mut live = LiveServe::start(&g.repo, &LOOP);
     let first = &live.first["result"];
     assert_eq!(first["merge"]["items"][0]["state"], "merged", "{first}");
     assert_eq!(first["gate_run"]["kind"], "main", "{first}");
@@ -1397,7 +1532,11 @@ fn the_check_of_main_after_a_merge_runs_in_the_background() {
         .contains(&("merge.main_check_pending".to_string(), Some(a.clone()))));
 
     g.release();
-    let (lines, stderr) = live.finish();
+    live.wait_until(|_| {
+        g.event_kinds()
+            .contains(&("merge.main_checked".to_string(), Some(a.clone())))
+    });
+    let (lines, stderr) = live.stop();
     let kinds = g.event_kinds();
     assert!(
         kinds.contains(&("merge.main_checked".to_string(), Some(a.clone()))),
@@ -1432,8 +1571,13 @@ fn a_check_of_main_left_pending_by_a_stopped_serve_is_run_again_and_a_red_one_is
         })
         .unwrap();
 
-    let out = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let mut live = LiveServe::start(&g.repo, &LOOP);
+    live.wait_until(|_| {
+        g.event_kinds()
+            .contains(&("merge.main_red".to_string(), Some(a.clone())))
+            && g.store().merge_queue().unwrap()[0].last_error.is_some()
+    });
+    live.stop();
     let kinds = g.event_kinds();
     assert!(
         kinds.contains(&("merge.main_red".to_string(), Some(a.clone()))),
@@ -1445,8 +1589,14 @@ fn a_check_of_main_left_pending_by_a_stopped_serve_is_run_again_and_a_red_one_is
         item.last_error.as_deref(),
         Some("main red after merge: gate `hold` failed (exit 7)")
     );
-    // the check is over: a further serve does not run it again
-    let again = g.repo.asf().args(LOOP).arg("--json").output().unwrap();
+    // the check is over: a further serve does not run it again (a few ticks are enough to see it not run)
+    let again = g
+        .repo
+        .asf()
+        .args(["serve", "--until-done", "--max-ticks", "3", "--interval", "1"])
+        .arg("--json")
+        .output()
+        .unwrap();
     assert_eq!(again.status.code(), Some(0), "{again:?}");
     let reds = g
         .event_kinds()
