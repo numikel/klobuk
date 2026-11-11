@@ -1662,6 +1662,13 @@ struct Flaky {
 }
 
 fn flaky_setup(scope: &str, worker_file: &str, test: &str, fail_times: u32) -> Flaky {
+    flaky_setup_noisy(scope, worker_file, test, fail_times, 0)
+}
+
+/// `flaky_setup` where a failing run also writes the `Running` line and then `noise` more lines to
+/// stderr, after the failures list on stdout, as `cargo test --workspace` does: with enough noise the
+/// 40-line tail of the gate holds no test name.
+fn flaky_setup_noisy(scope: &str, worker_file: &str, test: &str, fail_times: u32, noise: u32) -> Flaky {
     let f = setup();
     commit_in(f.repo.path(), "crates/foo/src/main.rs", "fn main() {}\n");
     commit_in(f.repo.path(), FLAKY_FILE, "// holds the flaky test\n");
@@ -1669,7 +1676,7 @@ fn flaky_setup(scope: &str, worker_file: &str, test: &str, fail_times: u32) -> F
     let script = dir.path().join("gate.py");
     let lines = [
         "import sys",
-        "counter, fail_times, test = sys.argv[1], int(sys.argv[2]), sys.argv[3]",
+        "counter, fail_times, test, noise = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])",
         "try:",
         "    n = int(open(counter).read())",
         "except OSError:",
@@ -1678,7 +1685,9 @@ fn flaky_setup(scope: &str, worker_file: &str, test: &str, fail_times: u32) -> F
         "if n >= fail_times:",
         "    print('all tests passed')",
         "    sys.exit(0)",
-        "print('     Running unittests src/main.rs (target/debug/deps/foo-0123456789abcdef.exe)')",
+        "running = '     Running unittests src/main.rs (target/debug/deps/foo-0123456789abcdef.exe)'",
+        "if noise == 0:",
+        "    print(running)",
         "print('running 1 test')",
         "print('test ' + test + ' ... FAILED')",
         "print('')",
@@ -1691,6 +1700,11 @@ fn flaky_setup(scope: &str, worker_file: &str, test: &str, fail_times: u32) -> F
         "print('    ' + test)",
         "print('')",
         "print('test result: FAILED. 0 passed; 1 failed')",
+        "sys.stdout.flush()",
+        "if noise > 0:",
+        "    sys.stderr.write(running + '\\n')",
+        "    for i in range(noise):",
+        "        sys.stderr.write('   Compiling crate%d v0.1.0\\n' % i)",
         "sys.exit(101)",
     ];
     std::fs::write(&script, lines.join("\n")).unwrap();
@@ -1699,7 +1713,7 @@ fn flaky_setup(scope: &str, worker_file: &str, test: &str, fail_times: u32) -> F
     let cfg = f.repo.path().join(".factory/config.toml");
     let mut s = std::fs::read_to_string(&cfg).unwrap();
     s.push_str(&format!(
-        "\n[[gate]]\nname = \"test\"\nwhen = [\"merge\"]\ncmd = ['python', '{}', '{}', '{fail_times}', '{test}']\n",
+        "\n[[gate]]\nname = \"test\"\nwhen = [\"merge\"]\ncmd = ['python', '{}', '{}', '{fail_times}', '{test}', '{noise}']\n",
         fwd(&script),
         fwd(&counter)
     ));
@@ -1814,6 +1828,29 @@ fn a_rerun_that_fails_again_is_an_ordinary_failure_and_files_nothing() {
     assert!(cs
         .iter()
         .any(|c| c.kind == CommentType::Blocker && c.body.contains("gate `test` failed")));
+}
+
+/// A failure deep in `cargo test --workspace`: the failures list is on stdout and 60 stderr lines
+/// follow it, so the 40-line tail of the gate names no test. The item must still be recognised.
+#[test]
+fn a_foreign_failure_is_found_even_when_the_stderr_after_it_cuts_the_tail() {
+    let fl = flaky_setup_noisy("src/**", "src/greet.rs", FLAKY_TEST, 1, 60);
+    let f = &fl.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(gate_runs(&fl), 2);
+    assert_eq!(flaky_issues(f).len(), 1);
+    assert_eq!(foreign_rerun_events(f).len(), 1);
+}
+
+#[test]
+fn a_noisy_failure_in_a_file_the_branch_changed_is_not_rerun() {
+    let fl = flaky_setup_noisy("crates/**", FLAKY_FILE, FLAKY_TEST, 1, 60);
+    let f = &fl.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(gate_runs(&fl), 1);
+    assert!(foreign_rerun_events(f).is_empty());
 }
 
 #[test]

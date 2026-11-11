@@ -13,6 +13,8 @@ use asf_core::config::{GateCfg, GateWhen};
 use asf_core::{GateResult, GateSpec};
 
 const TAIL_LINES: usize = 40;
+/// How many failing tests the summary at the end of a cut tail names (see `failed_summary`).
+const SUMMARY_MAX_TESTS: usize = 20;
 /// How long to wait for the output pipes to close once the gate has exited or been killed. A
 /// descendant of the gate (`sh -c`, `cargo test`, ...) can inherit the pipes and keep them open long
 /// after the gate itself is gone; whatever was read by then is the output.
@@ -171,12 +173,20 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
         ));
     }
     let exit_code = status.and_then(|s| s.code());
+    let ok = !timed_out && exit_code == Some(0);
+    let mut cut = tail(&combined);
+    if !ok {
+        if let Some(summary) = failed_summary(&combined, &cut) {
+            cut.push('\n');
+            cut.push_str(&summary);
+        }
+    }
     GateResult {
         name: spec.name.clone(),
-        ok: !timed_out && exit_code == Some(0),
+        ok,
         exit_code,
         duration_ms: started.elapsed().as_millis() as u64,
-        tail: tail(&combined),
+        tail: cut,
         attempts: 1,
     }
 }
@@ -479,11 +489,20 @@ pub fn failed_tests(tail: &str) -> Vec<FailedTest> {
     let mut in_list = false;
     let mut listed = false;
     fn add(name: &str, binary: &Option<TestBinary>, found: &mut Vec<FailedTest>) {
-        if !name.is_empty() && !found.iter().any(|f| f.name == name) {
-            found.push(FailedTest {
+        if name.is_empty() {
+            return;
+        }
+        match found.iter_mut().find(|f| f.name == name) {
+            // seen before its binary was known (stdout comes first): a later sighting names it
+            Some(f) => {
+                if f.binary.is_none() {
+                    f.binary = binary.clone();
+                }
+            }
+            None => found.push(FailedTest {
                 name: name.to_string(),
                 binary: binary.clone(),
-            });
+            }),
         }
     }
     for line in tail.lines() {
@@ -522,6 +541,53 @@ pub fn failed_tests(tail: &str) -> Vec<FailedTest> {
         }
     }
     found
+}
+
+/// The `Running` line that makes [`failed_tests`] read the names below it as belonging to `binary`.
+fn running_line(binary: Option<&TestBinary>) -> String {
+    match binary {
+        Some(TestBinary::Unit { krate }) => {
+            format!("     Running unittests src/lib.rs (target/debug/deps/{krate}-summary)")
+        }
+        Some(TestBinary::Integration { file }) => {
+            format!("     Running {file} (target/debug/deps/summary)")
+        }
+        Some(TestBinary::Doc) => "   Doc-tests summary".to_string(),
+        // a line this reader cannot place: the names below it stay without a binary
+        None => "     Running unknown".to_string(),
+    }
+}
+
+/// A short block for the end of a gate tail that lists the failing tests of `full`, when the cut
+/// `cut` no longer tells the same story. The tail is the last [`TAIL_LINES`] lines of stdout followed
+/// by stderr, and cargo writes a stderr line for every crate it builds and every binary it runs, so in
+/// a workspace run the failures list is pushed out by the lines after it. The block is in the format
+/// [`failed_tests`] reads: the `Running` line of the binary, `failures:`, the indented names.
+///
+/// At most [`SUMMARY_MAX_TESTS`] names are listed. A run with more failures than that ends in a line
+/// that maps to no file, so it never counts as foreign: that many failures are not a flake.
+fn failed_summary(full: &str, cut: &str) -> Option<String> {
+    let all = failed_tests(full);
+    if all.is_empty() || failed_tests(cut) == all {
+        return None;
+    }
+    let mut out = String::from("[asf] failed tests, read from the output before the tail cut it:");
+    let mut group: Option<&Option<TestBinary>> = None;
+    for t in all.iter().take(SUMMARY_MAX_TESTS) {
+        if group != Some(&t.binary) {
+            out.push_str(&format!("\n{}\nfailures:", running_line(t.binary.as_ref())));
+            group = Some(&t.binary);
+        }
+        out.push_str(&format!("\n    {}", t.name));
+    }
+    if all.len() > SUMMARY_MAX_TESTS {
+        out.push_str(&format!(
+            "\n{}\nfailures:\n    ... and {} more",
+            running_line(None),
+            all.len() - SUMMARY_MAX_TESTS
+        ));
+    }
+    Some(out)
 }
 
 /// The source file (relative to `repo`, `/` separators) that holds `test`, or `None` when it cannot

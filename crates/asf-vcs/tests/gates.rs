@@ -690,6 +690,9 @@ mod failing_tests {
     use std::path::Path;
 
     use asf_vcs::gates::{failed_tests, foreign_tests, test_source_file, FailedTest, TestBinary};
+    use asf_vcs::run_gates;
+
+    use super::{py, spec};
 
     const UNIT_TAIL: &str =
         "     Running unittests src\\main.rs (target\\debug\\deps\\asf-ce36f34fbf868c1a.exe)\n\
@@ -901,5 +904,64 @@ error: test failed, to rerun pass `-p asf-vcs --lib`\n";
             None
         );
         assert_eq!(foreign_tests(dir.path(), "", &changed), None);
+    }
+
+    /// `cargo test --workspace` prints a stderr line for every binary and every crate it builds, and
+    /// the gate output is stdout followed by stderr: the failures list ends up above a long block of
+    /// stderr and the 40-line tail holds no test name. The names and their binary are taken from the
+    /// full output before it is cut.
+    #[test]
+    fn the_failing_tests_survive_the_cut_of_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf-vcs/tests/git.rs");
+        let code = "import sys\n\
+print('running 1 test')\n\
+print('test head_and_branch ... FAILED')\n\
+print('')\n\
+print('failures:')\n\
+print('')\n\
+print('---- head_and_branch stdout ----')\n\
+print('boom')\n\
+print('')\n\
+print('failures:')\n\
+print('    head_and_branch')\n\
+print('')\n\
+print('test result: FAILED. 0 passed; 1 failed')\n\
+sys.stdout.flush()\n\
+sys.stderr.write('     Running tests/git.rs (target/debug/deps/git-0123456789abcdef.exe)\\n')\n\
+for i in range(60):\n    sys.stderr.write('   Compiling crate%d v0.1.0\\n' % i)\n\
+sys.exit(101)";
+        let results = run_gates(&[spec("test", &py(code), 30)], dir.path());
+        assert!(!results[0].ok);
+        let tail = &results[0].tail;
+        let found = foreign_tests(dir.path(), tail, &["README.md".to_string()]).expect(tail);
+        assert_eq!(found.len(), 1, "{tail}");
+        assert_eq!(found[0].name, "head_and_branch");
+        assert_eq!(found[0].file, "crates/asf-vcs/tests/git.rs");
+        // and a branch that changed that file still owns the failure
+        let own = vec!["crates/asf-vcs/tests/git.rs".to_string()];
+        assert_eq!(foreign_tests(dir.path(), tail, &own), None);
+        assert!(
+            tail.contains("Compiling crate59"),
+            "the end of the output is kept: {tail}"
+        );
+    }
+
+    /// The names added to the tail are capped: a run with hundreds of failures does not bloat it.
+    #[test]
+    fn the_summary_added_to_a_cut_tail_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = "import sys\n\
+print('failures:')\n\
+for i in range(200):\n    print('    t%d' % i)\n\
+print('')\n\
+sys.stdout.flush()\n\
+sys.stderr.write('     Running unittests src/lib.rs (target/debug/deps/asf_core-0123456789abcdef.exe)\\n')\n\
+for i in range(60):\n    sys.stderr.write('   Compiling crate%d v0.1.0\\n' % i)\n\
+sys.exit(101)";
+        let results = run_gates(&[spec("test", &py(code), 30)], dir.path());
+        let lines = results[0].tail.lines().count();
+        assert!(lines < 100, "{lines} lines in the tail");
+        assert!(results[0].tail.contains("    t0\n"), "{}", results[0].tail);
     }
 }
