@@ -455,7 +455,11 @@ pub enum LaneCmd {
     Check,
     /// Remove the worktree of a finished lane (branch kept; refuses claimed, dirty or unmerged lanes).
     Clean {
-        id: IssueId,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<IssueId>,
+        /// Clean every finished lane under the worktrees directory; a refused lane is reported, not an error.
+        #[arg(long)]
+        all: bool,
         /// Run every check but remove nothing.
         #[arg(long)]
         dry_run: bool,
