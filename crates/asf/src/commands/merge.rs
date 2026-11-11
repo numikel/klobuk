@@ -335,23 +335,27 @@ pub fn conclude_merge(
     job: MergeJob,
     results: Vec<GateResult>,
 ) -> Result<Option<MergeItem>, AppError> {
-    let still_gating = ctx
-        .store
-        .merge_queue()?
-        .iter()
-        .any(|m| m.id == job.item.id && m.state == MergeState::Gating);
-    if !still_gating {
+    if !still_gating(ctx, job.item.id)? {
         return Ok(None);
     }
     let item = job.item.clone();
     match conclude(ctx, job, results, GateMode::Background) {
-        Ok(done) => Ok(Some(done)),
+        Ok(done) => Ok(done),
         Err(e) => {
             let msg = format!("concluding the gate run failed: {}", e.message);
             let _ = fail(ctx, &item, MergeState::Failed, msg, None);
             Err(e)
         }
     }
+}
+
+/// Whether merge item `id` is still `gating`: the operator can skip or retry it while its gates run.
+fn still_gating(ctx: &Ctx, id: i64) -> Result<bool, AppError> {
+    Ok(ctx
+        .store
+        .merge_queue()?
+        .iter()
+        .any(|m| m.id == id && m.state == MergeState::Gating))
 }
 
 /// The end of a check of the default branch that ran on the slot (see `verify_main`). It answers for
@@ -604,8 +608,18 @@ fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
     match prepare(ctx, item)? {
         Prepared::Ended(done) => Ok(*done),
         Prepared::Gates(job) => {
+            let id = job.item.id;
             let results = run_gates(&gate_specs(ctx, GateWhen::Merge), &job.wt);
-            conclude(ctx, *job, results, GateMode::Inline)
+            match conclude(ctx, *job, results, GateMode::Inline)? {
+                Some(done) => Ok(done),
+                // the operator skipped or retried the item during a rerun: the item is theirs now
+                None => ctx
+                    .store
+                    .merge_queue()?
+                    .into_iter()
+                    .find(|m| m.id == id)
+                    .ok_or_else(|| AppError::not_found(format!("merge item #{id} is gone"))),
+            }
         }
     }
 }
@@ -758,15 +772,20 @@ fn prepare(ctx: &Ctx, item: &MergeItem) -> Result<Prepared, AppError> {
 
 /// The part of `process` after the gates: the gates' verdict, then the review (if one is wanted) and
 /// the integration. `mode` says where a check of the default branch after a merge will run.
+///
+/// `None` when the item stopped being `gating` while a foreign rerun ran (the operator skipped or
+/// retried it): the result belongs to nobody and the item is left alone.
 fn conclude(
     ctx: &Ctx,
     job: MergeJob,
     results: Vec<GateResult>,
     mode: GateMode,
-) -> Result<MergeItem, AppError> {
+) -> Result<Option<MergeItem>, AppError> {
     let MergeJob { item, run, wt } = job;
     let item = &item;
-    let results = rerun_foreign(ctx, item, &wt, results)?;
+    let Some(results) = rerun_foreign(ctx, item, &wt, results)? else {
+        return Ok(None);
+    };
     if let Some(bad) = results.iter().find(|r| !r.ok) {
         let msg = format!(
             "gate `{}` failed (exit {:?}) after rebase:\n{}",
@@ -782,7 +801,7 @@ fn conclude(
             LANE_HUMAN,
             format!("{msg}\n\nFix and `asf merge retry {}`.", item.issue_id),
         )?;
-        return Ok(updated);
+        return Ok(Some(updated));
     }
     set(
         ctx,
@@ -805,12 +824,12 @@ fn conclude(
                     payload: serde_json::json!({ "patch_id": patch_id, "branch": item.branch }),
                 })?;
             }
-            None => return enter_review(ctx, item, &run),
+            None => return enter_review(ctx, item, &run).map(Some),
         }
     }
 
     // 5. integrate
-    integrate(ctx, item, &run, &wt, false, mode)
+    integrate(ctx, item, &run, &wt, false, mode).map(Some)
 }
 
 /// A gate that fails only on tests outside the branch's diff (see `foreign_tests`) is not the worker's
@@ -819,6 +838,10 @@ fn conclude(
 /// other gate failure. A failure in a file the branch changed, or one that cannot be placed, is
 /// returned untouched.
 ///
+/// The rerun takes minutes, and the operator may skip or retry the item meanwhile (`gating` allows
+/// both): `None` when the item is no longer `gating` once the rerun is over, so the caller leaves it
+/// alone instead of merging or failing an item that was taken out of the queue.
+///
 /// shortcut: the rerun runs on the tick thread, so `asf serve` stalls for one gate run; move it onto
 /// the gate slot (worker.rs) when serve must stay responsive during a rerun.
 fn rerun_foreign(
@@ -826,20 +849,20 @@ fn rerun_foreign(
     item: &MergeItem,
     wt: &std::path::Path,
     mut results: Vec<GateResult>,
-) -> Result<Vec<GateResult>, AppError> {
+) -> Result<Option<Vec<GateResult>>, AppError> {
     let Some(at) = results.iter().position(|r| !r.ok) else {
-        return Ok(results);
+        return Ok(Some(results));
     };
     // a diff that cannot be read says nothing about the branch, so the failure stays the worker's
     let Ok(changed) = GitCli.changed_files(wt, &ctx.config.repo.default_branch) else {
-        return Ok(results);
+        return Ok(Some(results));
     };
     let Some(foreign) = foreign_tests(wt, &results[at].tail, &changed) else {
-        return Ok(results);
+        return Ok(Some(results));
     };
     let specs = gate_specs(ctx, GateWhen::Merge);
     let Some(from) = specs.iter().position(|s| s.name == results[at].name) else {
-        return Ok(results);
+        return Ok(Some(results));
     };
     let gate = results[at].name.clone();
     let names: Vec<&str> = foreign.iter().map(|t| t.name.as_str()).collect();
@@ -864,11 +887,15 @@ fn rerun_foreign(
         ));
     }
     if rerun.first().is_some_and(|r| r.ok) {
+        // the test did flake, whatever happened to the item meanwhile
         file_flaky_issues(ctx, item, &gate, &foreign, &results[at].tail);
+    }
+    if !still_gating(ctx, item.id)? {
+        return Ok(None);
     }
     results.truncate(at);
     results.extend(rerun);
-    Ok(results)
+    Ok(Some(results))
 }
 
 /// Files an issue `Flaky test: <name>` (task, priority 2, label `flaky`, scoped to the file that holds

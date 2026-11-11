@@ -1658,17 +1658,32 @@ struct Flaky {
     f: F,
     issue: String,
     counter: std::path::PathBuf,
+    /// `<hold>.started` appears when the rerun begins, the rerun ends once `<hold>.go` exists.
+    hold: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
 fn flaky_setup(scope: &str, worker_file: &str, test: &str, fail_times: u32) -> Flaky {
-    flaky_setup_noisy(scope, worker_file, test, fail_times, 0)
+    flaky_setup_with(scope, worker_file, test, fail_times, 0, false)
 }
 
 /// `flaky_setup` where a failing run also writes the `Running` line and then `noise` more lines to
 /// stderr, after the failures list on stdout, as `cargo test --workspace` does: with enough noise the
 /// 40-line tail of the gate holds no test name.
 fn flaky_setup_noisy(scope: &str, worker_file: &str, test: &str, fail_times: u32, noise: u32) -> Flaky {
+    flaky_setup_with(scope, worker_file, test, fail_times, noise, false)
+}
+
+/// The general form. With `hold` the second run of the gate (the rerun) writes `<hold>.started` and
+/// waits for `<hold>.go` before it answers, so a test can act while the rerun is in flight.
+fn flaky_setup_with(
+    scope: &str,
+    worker_file: &str,
+    test: &str,
+    fail_times: u32,
+    noise: u32,
+    hold: bool,
+) -> Flaky {
     let f = setup();
     commit_in(f.repo.path(), "crates/foo/src/main.rs", "fn main() {}\n");
     commit_in(f.repo.path(), FLAKY_FILE, "// holds the flaky test\n");
@@ -1682,6 +1697,14 @@ fn flaky_setup_noisy(scope: &str, worker_file: &str, test: &str, fail_times: u32
         "except OSError:",
         "    n = 0",
         "open(counter, 'w').write(str(n + 1))",
+        "hold = sys.argv[5]",
+        "if hold != '-' and n == 1:",
+        "    import os, time",
+        "    open(hold + '.started', 'w').write('x')",
+        "    for _ in range(300):",
+        "        if os.path.exists(hold + '.go'):",
+        "            break",
+        "        time.sleep(0.1)",
         "if n >= fail_times:",
         "    print('all tests passed')",
         "    sys.exit(0)",
@@ -1709,11 +1732,13 @@ fn flaky_setup_noisy(scope: &str, worker_file: &str, test: &str, fail_times: u32
     ];
     std::fs::write(&script, lines.join("\n")).unwrap();
     let counter = dir.path().join("count");
+    let hold_path = dir.path().join("hold");
     let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let hold_arg = if hold { fwd(&hold_path) } else { "-".to_string() };
     let cfg = f.repo.path().join(".factory/config.toml");
     let mut s = std::fs::read_to_string(&cfg).unwrap();
     s.push_str(&format!(
-        "\n[[gate]]\nname = \"test\"\nwhen = [\"merge\"]\ncmd = ['python', '{}', '{}', '{fail_times}', '{test}', '{noise}']\n",
+        "\n[[gate]]\nname = \"test\"\nwhen = [\"merge\"]\ncmd = ['python', '{}', '{}', '{fail_times}', '{test}', '{noise}', '{hold_arg}']\n",
         fwd(&script),
         fwd(&counter)
     ));
@@ -1728,6 +1753,7 @@ fn flaky_setup_noisy(scope: &str, worker_file: &str, test: &str, fail_times: u32
         f,
         issue,
         counter,
+        hold: hold_path,
         _dir: dir,
     }
 }
@@ -1841,6 +1867,60 @@ fn a_foreign_failure_is_found_even_when_the_stderr_after_it_cuts_the_tail() {
     assert_eq!(gate_runs(&fl), 2);
     assert_eq!(flaky_issues(f).len(), 1);
     assert_eq!(foreign_rerun_events(f).len(), 1);
+}
+
+/// Runs `merge tick --once` in a child process and, while the rerun of the gate is in flight, skips
+/// the item as the operator would. The rerun then answers (green when `fail_times` is 1, red when 2).
+fn skip_while_the_rerun_runs(fail_times: u32) -> Flaky {
+    let fl = flaky_setup_with("src/**", "src/greet.rs", FLAKY_TEST, fail_times, 0, true);
+    let f = &fl.f;
+    let mut cmd = f.repo.asf();
+    cmd.args(["merge", "tick", "--once", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let tick = cmd.spawn().unwrap();
+    let started = std::path::PathBuf::from(format!("{}.started", fl.hold.display()));
+    for _ in 0..600 {
+        if started.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(started.exists(), "the rerun never began");
+    f.repo.ok(&["merge", "skip", &fl.issue]);
+    std::fs::write(format!("{}.go", fl.hold.display()), "x").unwrap();
+    let out = tick.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "tick: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(gate_runs(&fl), 2, "the gate ran and was rerun");
+    fl
+}
+
+#[test]
+fn an_item_skipped_while_a_green_rerun_runs_stays_skipped_and_is_not_merged() {
+    let fl = skip_while_the_rerun_runs(1);
+    let f = &fl.f;
+    assert_eq!(item_state(f), MergeState::Skipped);
+    assert!(
+        !main_has(f, "src/greet.rs"),
+        "the skipped branch must not reach main"
+    );
+}
+
+#[test]
+fn an_item_skipped_while_a_red_rerun_runs_stays_skipped_without_a_blocker() {
+    let fl = skip_while_the_rerun_runs(2);
+    let f = &fl.f;
+    assert_eq!(item_state(f), MergeState::Skipped);
+    let cs = store(f).comments(&fl.issue.parse().unwrap()).unwrap();
+    assert!(
+        cs.iter().all(|c| c.kind != CommentType::Blocker),
+        "no BLOCKER for an item the operator skipped: {cs:?}"
+    );
 }
 
 #[test]
