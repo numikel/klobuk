@@ -100,6 +100,9 @@ pub struct WorkerCfg {
     pub auto_trust: bool,
     /// Pre-write `hasTrustDialogAccepted` for the repo root in `~/.claude.json` before launch.
     pub pre_trust: bool,
+    /// Start worker and reviewer sessions with `claude --remote-control <session name>`, so they show
+    /// up in claude.ai/code and the mobile app. Planner calls (headless `claude -p`) are not affected.
+    pub remote_control: bool,
     pub start_timeout_ms: u64,
     pub prompt_timeout_ms: u64,
     pub heartbeat_s: u64,
@@ -126,6 +129,7 @@ impl Default for WorkerCfg {
             nudges: 1,
             auto_trust: true,
             pre_trust: false,
+            remote_control: false,
             start_timeout_ms: 90_000,
             prompt_timeout_ms: 15_000,
             heartbeat_s: 30,
@@ -369,6 +373,7 @@ deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)"]
 permission_mode = "auto"  # auto | acceptEdits | dontAsk | bypassPermissions (deny rules always win)
 auto_trust = true         # answer Claude's trust dialog for worktrees of this repo
 pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json before launch
+# remote_control = false  # true: worker and reviewer sessions join Remote Control (claude.ai/code, mobile app)
 
 # Gates run in the worktree before merge, in order; first failure stops.
 # [[gate]]
@@ -634,6 +639,21 @@ mod tests {
         assert!(c.merge.require_clean_main, "other merge defaults survive");
         let t = Config::from_toml(Config::default_toml()).unwrap();
         assert!(!t.merge.verify_main_after);
+    }
+
+    #[test]
+    fn remote_control_is_off_by_default_parses_and_is_documented_in_the_template() {
+        assert!(!Config::default().worker.remote_control);
+        assert!(!Config::from_toml("").unwrap().worker.remote_control);
+        let c = Config::from_toml("[worker]\nremote_control = true\n").unwrap();
+        assert!(c.worker.remote_control);
+        assert_eq!(c.worker.permission_mode, "auto", "other worker defaults survive");
+        let t = Config::default_toml();
+        assert!(
+            t.contains("# remote_control = false"),
+            "commented line in [worker]"
+        );
+        assert!(!Config::from_toml(t).unwrap().worker.remote_control);
     }
 
     #[test]

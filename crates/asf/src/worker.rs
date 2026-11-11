@@ -834,6 +834,10 @@ impl<'a> Worker<'a> {
             "--name".to_string(),
             l.session_name.clone(),
         ];
+        if self.ctx.config.worker.remote_control {
+            args.push("--remote-control".into());
+            args.push(l.session_name.clone());
+        }
         if let Some(m) = &l.model {
             args.push("--model".into());
             args.push(m.clone());
@@ -2090,6 +2094,40 @@ mod tests {
         );
         let log = FakeRuntime::new(fake_path(&fx)).log();
         assert_eq!(log.iter().filter(|e| e.op == "start_agent").count(), 1);
+    }
+
+    /// The `claude` arguments of the one `start_agent` call in the fake runtime's log.
+    fn started_args(fx: &Fx) -> Vec<String> {
+        let log = FakeRuntime::new(fake_path(fx)).log();
+        let start = log.iter().find(|e| e.op == "start_agent").unwrap();
+        start.args["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_reviewer_joins_remote_control_under_its_session_name_only_when_switched_on() {
+        let mut fx = fixture();
+        fx.ctx.config.worker.remote_control = true;
+        worker(&fx).start_review(&fx.issue, &fx.run).unwrap();
+        let args = started_args(&fx);
+        let name = "review-asf-1-add-greeting";
+        assert!(args.windows(2).any(|p| p == ["--name", name]), "{args:?}");
+        assert!(
+            args.windows(2).any(|p| p == ["--remote-control", name]),
+            "{args:?}"
+        );
+
+        let fx = fixture();
+        worker(&fx).start_review(&fx.issue, &fx.run).unwrap();
+        let args = started_args(&fx);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--remote-control")),
+            "off by default: {args:?}"
+        );
     }
 
     #[test]

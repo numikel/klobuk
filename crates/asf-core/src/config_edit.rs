@@ -34,6 +34,10 @@ const EDITABLE: &[(&str, &str)] = &[
         "run the gates in the repo root after each merge",
     ),
     (
+        "worker.remote_control",
+        "worker and reviewer sessions join Remote Control (claude.ai/code, mobile app)",
+    ),
+    (
         "notify.on_new",
         "notify at once when something new waits for you (false: only reminders)",
     ),
@@ -80,6 +84,7 @@ const APPLIES: &[(&str, Applies)] = &[
     ("review.max_rounds", Applies::NextTick),
     ("merge.target", Applies::NextTick),
     ("merge.verify_main_after", Applies::NextTick),
+    ("worker.remote_control", Applies::NextTick),
     ("notify.on_new", Applies::NextTick),
     ("notify.after_minutes", Applies::NextTick),
     ("notify.every_minutes", Applies::NextTick),
@@ -246,6 +251,13 @@ const FIELDS: &[ConfigField] = &[
         group: ConfigGroup::Flow,
         kind: FieldKind::Bool,
         help: "run the gates again after each merge",
+    },
+    ConfigField {
+        key: "worker.remote_control",
+        label: "Remote control",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Bool,
+        help: "sessions show up in claude.ai/code and mobile app",
     },
     ConfigField {
         key: "notify.on_new",
@@ -431,6 +443,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 13);
+        assert_eq!(EDITABLE.len(), 14);
     }
 }

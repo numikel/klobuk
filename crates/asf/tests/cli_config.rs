@@ -21,11 +21,12 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_thirteen_editable_keys_with_current_values() {
+fn show_lists_the_fourteen_editable_keys_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 13, "{res}");
+    assert_eq!(rows.len(), 14, "{res}");
+    assert_eq!(entry(rows, "worker.remote_control")["value"], false);
     assert_eq!(entry(rows, "notify.on_new")["value"], true);
     assert_eq!(entry(rows, "notify.after_minutes")["value"], 15);
     assert_eq!(entry(rows, "notify.every_minutes")["value"], 30);
@@ -113,6 +114,7 @@ fn every_key_a_serve_tick_reloads_says_so_and_never_hints_at_a_restart() {
         ("review.max_rounds", "3"),
         ("scheduler.max_parallel", "2"),
         ("merge.verify_main_after", "true"),
+        ("worker.remote_control", "true"),
         ("notify.on_new", "false"),
         ("notify.after_minutes", "10"),
         ("notify.every_minutes", "0"),

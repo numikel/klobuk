@@ -179,6 +179,10 @@ fn start_happy_path_creates_worktree_files_workspace_and_agent() {
         "{args:?}"
     );
     assert_eq!(log[3].args["name"], "asf-1", "the Herdr agent name is unchanged");
+    assert!(
+        !args.iter().any(|a| a.starts_with("--remote-control")),
+        "Remote Control is off by default: {args:?}"
+    );
     assert!(log[4].args["text"].as_str().unwrap().contains("brief.md"));
 
     let run = active_run(&f);
@@ -190,6 +194,37 @@ fn start_happy_path_creates_worktree_files_workspace_and_agent() {
     assert_eq!(
         f.repo.ok(&["issue", "show", &f.issue])["issue"]["status"],
         "in-progress"
+    );
+}
+
+#[test]
+fn start_adds_remote_control_with_the_session_name_when_the_worker_switch_is_on() {
+    let f = setup();
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("# remote_control = false"), "{s}");
+    std::fs::write(
+        &cfg,
+        s.replacen("[worker]\n", "[worker]\nremote_control = true\n", 1),
+    )
+    .unwrap();
+    f.repo.ok(&["run", "start", &f.issue]);
+    let log = fake(&f).log();
+    let start = log.iter().find(|e| e.op == "start_agent").unwrap();
+    let args: Vec<&str> = start.args["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--remote-control", "asf-1-add-greeting"]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2).any(|w| w == ["--name", "asf-1-add-greeting"]),
+        "{args:?}"
     );
 }
 
