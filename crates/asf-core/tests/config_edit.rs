@@ -550,7 +550,7 @@ fn serve_keys_set_validate_and_the_tick_limit_can_be_unset() {
     assert!(asf_core::config_edit::unset_key(&out, "serve.interval_s").is_err());
     assert_eq!(
         asf_core::config_edit::applies("serve.interval_s"),
-        asf_core::config_edit::Applies::Restart,
-        "the loop reads [serve] once, at start"
+        asf_core::config_edit::Applies::NextTick,
+        "the loop takes [serve] from the refreshed config every tick"
     );
 }

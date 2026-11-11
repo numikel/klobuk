@@ -453,6 +453,14 @@ fn finish(cli: &Cli, ticks: u64, reason: StopReason, a: Assessment) -> Result<Re
     Ok(rendered)
 }
 
+/// Seconds between ticks and the tick limit: a flag wins, else `[serve]` of the config in force.
+fn limits(a: &ServeArgs, cfg: &asf_core::Config) -> (u64, Option<u64>) {
+    (
+        a.interval.unwrap_or(cfg.serve.interval_s),
+        a.max_ticks.or(cfg.serve.max_ticks),
+    )
+}
+
 fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -500,6 +508,12 @@ impl Heartbeat {
         hb
     }
 
+    /// The limits in force this tick (an edit of `[serve]` reaches the next tick).
+    fn set_limits(&mut self, interval_s: u64, max_ticks: Option<u64>) {
+        self.pulse.interval_s = interval_s;
+        self.pulse.max_ticks = max_ticks;
+    }
+
     fn beat(&mut self, ticks: u64) {
         self.pulse.tick(ticks, &now_rfc3339());
         self.save();
@@ -530,9 +544,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         let t = tick(&ctx, a.dispatch, &mut reminders, None)?;
         return Rendered::new(&t, text(&t));
     }
-    // flags win over `[serve]`; the loop reads both once, here
-    let interval = a.interval.unwrap_or(ctx.config.serve.interval_s);
-    let max_ticks = a.max_ticks.or(ctx.config.serve.max_ticks);
+    let (interval, max_ticks) = limits(a, &ctx.config);
     let on_disk = serve_pulse::read(&ctx.root).ok().flatten();
     let alive = on_disk
         .as_ref()
@@ -596,6 +608,8 @@ fn serve_loop(
         if let Some(warning) = watch.refresh(ctx) {
             eprintln!("asf serve: {warning}");
         }
+        let (interval, max_ticks) = limits(a, &ctx.config);
+        hb.set_limits(interval, max_ticks);
         let tick_ok = match tick(ctx, a.dispatch, reminders, Some(&mut *gate)) {
             Ok(t) => {
                 if !t.promoted.is_empty()
@@ -647,6 +661,23 @@ mod tests {
             can_start,
             questions_waiting: 0,
         }
+    }
+
+    #[test]
+    fn a_flag_wins_over_the_config_and_the_config_over_the_default() {
+        let mut cfg = asf_core::Config::default();
+        let args = |interval, max_ticks| ServeArgs {
+            interval,
+            once: false,
+            dispatch: false,
+            until_done: true,
+            max_ticks,
+        };
+        assert_eq!(limits(&args(None, None), &cfg), (10, None));
+        cfg.serve.interval_s = 3;
+        cfg.serve.max_ticks = Some(600);
+        assert_eq!(limits(&args(None, None), &cfg), (3, Some(600)));
+        assert_eq!(limits(&args(Some(7), Some(2)), &cfg), (7, Some(2)));
     }
 
     fn pulse_at(last_tick: &str, interval: u64) -> Pulse {

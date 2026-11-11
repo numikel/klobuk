@@ -210,6 +210,34 @@ impl LoopState {
     }
 }
 
+impl LoopState {
+    /// The long form of [`LoopState::banner`] for a window: what the state means and what to do.
+    /// `None` while the loop runs.
+    pub fn explain(&self, mode_hint: ServeMode, waiting: Option<&str>) -> Option<String> {
+        let headline = self.banner(mode_hint, waiting)?;
+        let fix = restart_command(mode_hint);
+        let meaning = match self {
+            LoopState::Running { .. } => return None,
+            LoopState::NeverStarted => {
+                "No `asf serve` has written a pulse on this repo yet, so nothing starts workers, merges queued work or sends notifications."
+                    .to_string()
+            }
+            LoopState::Stopped { reason, ticks, .. } => match reason.as_deref() {
+                None => format!(
+                    "The pulse went silent after {ticks} tick(s) and no stop reason was written: the process was killed (Ctrl+C), crashed or the machine restarted."
+                ),
+                Some("max_ticks") => format!(
+                    "The loop reached its tick limit ({ticks} tick(s)): `--max-ticks` or `[serve] max_ticks`. Leave the limit out or raise it."
+                ),
+                Some("stuck") => "Nothing is running and nothing can start without you: answer the question or unblock the issue, then start the loop.".to_string(),
+                Some("all_done") => "Every open issue is finished.".to_string(),
+                Some(other) => format!("The loop stopped with: {other}."),
+            },
+        };
+        Some(format!("{headline}\n\n{meaning}\n\nStart it again: {fix}"))
+    }
+}
+
 /// `.factory/runs/serve.json` of the repository at `root`.
 pub fn pulse_path(root: &Path) -> PathBuf {
     root.join(".factory").join(RUNS_DIR).join(PULSE_FILE)
@@ -408,6 +436,35 @@ mod tests {
             age_s: 1,
         };
         assert_eq!(running.banner(ServeMode::Dispatch, None), None);
+    }
+
+    #[test]
+    fn the_explanation_adds_the_meaning_and_the_command() {
+        let stopped = LoopState::Stopped {
+            reason: Some("max_ticks".into()),
+            age_s: 60,
+            ticks: 633,
+            max_ticks: Some(633),
+        };
+        let text = stopped.explain(ServeMode::Dispatch, None).unwrap();
+        assert!(
+            text.starts_with("the loop stopped 1 min ago: max_ticks (633)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tick limit") && text.ends_with("Start it again: asf serve --dispatch"),
+            "{text}"
+        );
+        let running = LoopState::Running {
+            mode: ServeMode::Observe,
+            age_s: 1,
+        };
+        assert_eq!(running.explain(ServeMode::Observe, None), None);
+        let never = LoopState::NeverStarted.explain(ServeMode::Observe, None).unwrap();
+        assert!(
+            never.starts_with("the loop is not running") && never.ends_with("Start it again: asf serve"),
+            "{never}"
+        );
     }
 
     #[test]

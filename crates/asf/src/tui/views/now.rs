@@ -17,6 +17,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use time::OffsetDateTime;
 
+use asf_store::serve_pulse::{self, LoopState};
+
 use crate::tui::app::{Action, View};
 use crate::tui::bindings::*;
 use crate::tui::overlays::InputTarget;
@@ -64,21 +66,32 @@ pub struct RunRow {
 /// The row the Now view's selection points at.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NowRow {
+    /// The loop is not running (first NEEDS YOU row; `Enter` explains it).
+    Loop,
     Need(Need),
     Running(RunRow),
 }
 
 impl NowRow {
-    pub fn issue(&self) -> &IssueId {
+    /// The issue of the row; the loop row has none.
+    pub fn issue(&self) -> Option<&IssueId> {
         match self {
-            NowRow::Need(n) => &n.issue,
-            NowRow::Running(r) => &r.issue,
+            NowRow::Loop => None,
+            NowRow::Need(n) => Some(&n.issue),
+            NowRow::Running(r) => Some(&r.issue),
         }
+    }
+
+    /// What the row is called in a message: its issue, or `loop`.
+    fn name(&self) -> String {
+        self.issue()
+            .map_or_else(|| "loop".to_string(), ToString::to_string)
     }
 
     /// What to say after a key that does not fit the row.
     pub fn advice(&self) -> String {
         match self {
+            NowRow::Loop => "Enter explains why the loop is not running".to_string(),
             NowRow::Need(n) => format!("this row takes {}", n.act.hint()),
             NowRow::Running(_) => "it is running".to_string(),
         }
@@ -287,9 +300,14 @@ pub fn done_today(snap: &Snapshot) -> Vec<IssueId> {
     closed.into_iter().map(|(_, id)| id.clone()).collect()
 }
 
-/// Number of selectable rows: NEEDS YOU, then RUNNING.
+/// 1 when the loop is not running (its row leads NEEDS YOU), else 0.
+fn loop_rows(snap: &Snapshot) -> usize {
+    usize::from(snap.loop_notice().is_some())
+}
+
+/// Number of selectable rows: the loop row, NEEDS YOU, then RUNNING.
 pub fn rows(snap: &Snapshot) -> usize {
-    snap.needs_you.len() + running(snap).len()
+    loop_rows(snap) + snap.needs_you.len() + running(snap).len()
 }
 
 /// The selection, kept inside the rows.
@@ -300,9 +318,12 @@ pub fn selected(snap: &Snapshot, state: &State) -> usize {
 /// What the selection points at: the NEEDS YOU rows first, then the RUNNING rows.
 pub fn selected_row(snap: &Snapshot, state: &State) -> Option<NowRow> {
     let i = selected(snap, state);
-    let n = snap.needs_you.len();
-    if i < n {
-        snap.needs_you.get(i).cloned().map(NowRow::Need)
+    let lead = loop_rows(snap);
+    let n = lead + snap.needs_you.len();
+    if i < lead {
+        Some(NowRow::Loop)
+    } else if i < n {
+        snap.needs_you.get(i - lead).cloned().map(NowRow::Need)
     } else {
         running(snap).into_iter().nth(i - n).map(NowRow::Running)
     }
@@ -358,6 +379,8 @@ fn title(text: String, theme: &Theme) -> Line<'static> {
 pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, theme: &Theme) {
     let width = area.width as usize;
     let needs = &snap.needs_you;
+    let notice = snap.loop_notice();
+    let lead = usize::from(notice.is_some());
     let running = running(snap);
     let selected = selected(snap, state);
     let id_w = needs
@@ -379,16 +402,38 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut selected_line = 0;
+    // fixed columns: margin 1, selector 2, mark 2, id, gap 2, label 15, gap 2, age 10, key 13 (`Enter explain`)
+    let text_w = width
+        .saturating_sub(1 + 2 + 2 + id_w + 2 + 15 + 2 + AGE_W + 13)
+        .max(8);
 
-    lines.push(title(format!("NEEDS YOU ({})", needs.len()), theme));
-    if needs.is_empty() {
+    lines.push(title(format!("NEEDS YOU ({})", lead + needs.len()), theme));
+    if needs.is_empty() && lead == 0 {
         lines.push(Line::from(Span::styled("   Nothing needs you.", theme.dim())));
     }
-    // fixed columns: margin 1, selector 2, mark 2, id, gap 2, label 15, gap 2, age 10, key 8
-    let text_w = width
-        .saturating_sub(1 + 2 + 2 + id_w + 2 + 15 + 2 + AGE_W + 8)
-        .max(8);
-    for (i, n) in needs.iter().enumerate() {
+    if let Some(notice) = &notice {
+        if selected == 0 {
+            selected_line = lines.len();
+        }
+        let waited = match snap.serve.as_ref().map(|i| &i.state) {
+            Some(LoopState::Stopped { age_s, .. }) => serve_pulse::fmt_age(*age_s),
+            _ => "-".to_string(),
+        };
+        lines.push(
+            Line::from(vec![
+                Span::raw(format!(" {}", select_marker(0))),
+                Span::styled(format!("{} ", Mark::Needs.glyph()), theme.mark(Mark::Needs)),
+                Span::styled(format!("{}  ", fit("loop", id_w)), theme.bold()),
+                Span::raw(fit(if waited == "-" { "not running" } else { "stopped" }, 15)),
+                Span::styled(format!("{}  ", fit(notice, text_w)), theme.warn()),
+                Span::raw(fit(&format!("  {waited}"), AGE_W)),
+                Span::styled("Enter explain", theme.key()),
+            ])
+            .style(row_style(0)),
+        );
+    }
+    for (j, n) in needs.iter().enumerate() {
+        let i = lead + j;
         if i == selected {
             selected_line = lines.len();
         }
@@ -430,7 +475,7 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
         .saturating_sub(1 + 2 + 2 + id_w + 2 + RUN_STATE_W + 2 + 14 + 2 + 8)
         .max(8);
     for (j, r) in running.iter().enumerate() {
-        let i = needs.len() + j;
+        let i = lead + needs.len() + j;
         if i == selected {
             selected_line = lines.len();
         }
@@ -532,14 +577,41 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
     }
     let row = selected_row(snap, state);
     match key.code {
-        KeyCode::Enter => row.map_or(Action::None, |r| Action::OpenOnBoard(r.issue().clone())),
-        KeyCode::Char('f') => row.map_or(Action::None, |r| Action::Focus(r.issue().clone())),
+        KeyCode::Enter => match row {
+            Some(NowRow::Loop) => explain_loop(snap),
+            Some(r) => r.issue().map_or(Action::None, |i| Action::OpenOnBoard(i.clone())),
+            None => Action::None,
+        },
+        KeyCode::Char('f') => match row {
+            Some(NowRow::Loop) => Action::Status("the loop has no pane; Enter explains it".into()),
+            Some(r) => r.issue().map_or(Action::None, |i| Action::Focus(i.clone())),
+            None => Action::None,
+        },
         KeyCode::Char('a') => answer(row),
         KeyCode::Char('v') => verify(row),
         KeyCode::Char('r') => retry(row),
         KeyCode::Char('x') => abort(row),
         _ => Action::None,
     }
+}
+
+/// `Enter` on the loop row: the notice with what it means and the command, in a window (the way the
+/// Queue view shows gate output). The window is a comment of the pseudo issue `loop-1`.
+fn explain_loop(snap: &Snapshot) -> Action {
+    let Some(body) = snap.loop_explanation() else {
+        return Action::None;
+    };
+    Action::OpenComment(Comment {
+        id: 0,
+        issue_id: IssueId::new("loop", 1),
+        author: "asf serve".into(),
+        kind: CommentType::Status,
+        to_lane: LANE_HUMAN.to_string(),
+        body,
+        reply_to: None,
+        resolved_at: None,
+        created_at: snap.now.clone(),
+    })
 }
 
 /// `a`: a blocked or stalled worker gets the answer overlay (a reply moves a stalled run back to
@@ -560,6 +632,9 @@ fn answer(row: Option<NowRow>) -> Action {
             )),
         },
         Some(NowRow::Running(r)) => Action::Status(format!("{} is running; nothing to answer", r.issue)),
+        Some(NowRow::Loop) => {
+            Action::Status("the loop needs a restart, not an answer; Enter explains it".into())
+        }
         None => Action::None,
     }
 }
@@ -571,7 +646,7 @@ fn verify(row: Option<NowRow>) -> Action {
         Some(NowRow::Need(n)) if n.source == NeedSource::Run(RunState::Failed) => Action::Verify(n.issue),
         Some(row) => Action::Status(format!(
             "{}: v verifies a failed run; {}",
-            row.issue(),
+            row.name(),
             row.advice()
         )),
         None => Action::None,
@@ -587,7 +662,7 @@ fn abort(row: Option<NowRow>) -> Action {
         },
         Some(row) => Action::Status(format!(
             "{}: x aborts an over-budget run; {}",
-            row.issue(),
+            row.name(),
             row.advice()
         )),
         None => Action::None,
@@ -600,7 +675,7 @@ fn retry(row: Option<NowRow>) -> Action {
         Some(NowRow::Need(n)) if matches!(n.source, NeedSource::Merge(_)) => Action::Retry(n.issue),
         Some(row) => Action::Status(format!(
             "{}: r retries a failed or blocked merge; {}",
-            row.issue(),
+            row.name(),
             row.advice()
         )),
         None => Action::None,

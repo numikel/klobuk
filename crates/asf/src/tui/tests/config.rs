@@ -643,6 +643,10 @@ fn every_field_kind_has_a_key_that_edits_it() {
             FieldKind::Bool => a.handle_key(key(' ')),
             FieldKind::Number | FieldKind::Text => {
                 a.handle_key(code(KeyCode::Enter));
+                if f.default_value().is_none() {
+                    // an optional number starts empty (`serve.max_ticks`): there is nothing to confirm
+                    a.handle_key(key('5'));
+                }
                 a.handle_key(code(KeyCode::Enter))
             }
         };

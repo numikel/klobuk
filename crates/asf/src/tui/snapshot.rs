@@ -8,6 +8,7 @@ use std::path::Path;
 
 use asf_core::config_edit::editable_keys;
 use asf_core::*;
+use asf_store::serve_pulse::{self, LoopState, ServeMode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::Span;
 use time::format_description::well_known::Rfc3339;
@@ -133,9 +134,41 @@ pub struct Snapshot {
     pub detail: Option<IssueDetail>,
     /// The last lines of one worker pane; loaded on demand (`Action::Peek`), `None` until then.
     pub pane_preview: Option<PanePreview>,
+    /// What the pulse of `asf serve` says about the loop; `None` in a snapshot nobody loaded (the header
+    /// and the banners then say nothing about the loop).
+    pub serve: Option<LoopInfo>,
+}
+
+/// The loop as [`serve_pulse::judge`] sees it, with the mode its restart command is shown in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopInfo {
+    pub state: LoopState,
+    pub mode: ServeMode,
 }
 
 impl Snapshot {
+    /// What `stuck` waits for, in a few words: the oldest thing that needs the human.
+    fn stuck_waiting(&self) -> Option<String> {
+        let n = self.needs_you.first()?;
+        Some(match n.source {
+            NeedSource::Question(_) | NeedSource::BlockedRun => format!("{} waits for your answer", n.issue),
+            _ => format!("{} {}", n.issue, n.label),
+        })
+    }
+
+    /// The one-line notice for a loop that is not running (`None` while it runs or when unknown): the
+    /// banner under the tabs and the first NEEDS YOU row of the Now view.
+    pub fn loop_notice(&self) -> Option<String> {
+        let info = self.serve.as_ref()?;
+        info.state.banner(info.mode, self.stuck_waiting().as_deref())
+    }
+
+    /// The notice with what it means and what to do, for the window `Enter` opens.
+    pub fn loop_explanation(&self) -> Option<String> {
+        let info = self.serve.as_ref()?;
+        info.state.explain(info.mode, self.stuck_waiting().as_deref())
+    }
+
     /// Recomputes the fields that are a pure function of the others (today: `needs_you`).
     pub fn derive(&mut self) {
         self.needs_you = compute_needs(self);
@@ -914,7 +947,14 @@ pub fn load_snapshot(
         needs_you: Vec::new(),
         detail: None,
         pane_preview: None,
+        serve: None,
     };
+    // age only: a process lookup is a child process on Windows and the snapshot refreshes every few seconds
+    let pulse = serve_pulse::read(&ctx.root).ok().flatten();
+    snap.serve = parse_time(&snap.now).map(|now| LoopInfo {
+        state: serve_pulse::judge(pulse.as_ref(), now, None),
+        mode: pulse.as_ref().map_or(ServeMode::Dispatch, |p| p.mode),
+    });
     snap.merged_today = merged_today(&snap, merge_all);
     snap.derive();
     Ok(snap)

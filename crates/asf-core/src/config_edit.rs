@@ -98,9 +98,9 @@ const APPLIES: &[(&str, Applies)] = &[
     ("merge.verify_main_after", Applies::NextTick),
     ("merge.clean_after", Applies::NextTick),
     ("worker.remote_control", Applies::NextTick),
-    // the loop reads both once when it starts: a flag may override them, so a live re-read would lie
-    ("serve.interval_s", Applies::Restart),
-    ("serve.max_ticks", Applies::Restart),
+    // `serve::serve_loop` takes both from the refreshed config every tick, unless a flag sets them
+    ("serve.interval_s", Applies::NextTick),
+    ("serve.max_ticks", Applies::NextTick),
     ("notify.on_new", Applies::NextTick),
     ("notify.after_minutes", Applies::NextTick),
     ("notify.every_minutes", Applies::NextTick),
@@ -294,7 +294,7 @@ const FIELDS: &[ConfigField] = &[
         label: "Loop tick limit",
         group: ConfigGroup::Flow,
         kind: FieldKind::Number,
-        help: "with --until-done the loop stops after this many ticks",
+        help: "stop after this many ticks with --until-done",
     },
     ConfigField {
         key: "notify.on_new",

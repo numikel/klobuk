@@ -51,8 +51,21 @@ fn header_line(app: &App) -> Line<'static> {
         Span::styled(s.repo_name.clone(), t.bold()),
         Span::raw(format!(" · {} · ", s.branch)),
         runtime,
-        Span::raw(format!(" · workers {}/{}", counts.workers, s.max_parallel)),
     ];
+    // right after the runtime so a narrow terminal never cuts it off
+    if let Some(info) = &s.serve {
+        spans.push(Span::raw(" · "));
+        let style = if info.state.is_running() {
+            t.dim()
+        } else {
+            t.warn()
+        };
+        spans.push(Span::styled(info.state.header(), style));
+    }
+    spans.push(Span::raw(format!(
+        " · workers {}/{}",
+        counts.workers, s.max_parallel
+    )));
     // Reviewers have their own limit; they are named only when one runs, so a RUNNING list of
     // `workers + reviewers` rows can be read off the header.
     if counts.reviewers > 0 {
@@ -205,9 +218,21 @@ fn split(area: Rect, banner: bool) -> Rows {
     }
 }
 
-/// Whether the banner row exists for `snap` on `view`.
+/// Whether the banner row exists for `snap` on `view`: something needs the human, or the loop is
+/// not running. The Now view lists both itself.
 fn has_banner(snap: &Snapshot, view: View) -> bool {
-    view != View::Now && !snap.needs_you.is_empty()
+    view != View::Now && (!snap.needs_you.is_empty() || snap.loop_notice().is_some())
+}
+
+/// The banner row: what needs the human wins over the state of the loop.
+fn banner(snap: &Snapshot, width: usize, theme: &Theme) -> Line<'static> {
+    match (snap.needs_you.is_empty(), snap.loop_notice()) {
+        (true, Some(notice)) => Line::styled(
+            trunc(&format!("{} {notice}", Mark::Needs.glyph()), width),
+            theme.warn(),
+        ),
+        _ => banner_line(&snap.needs_you, width, theme),
+    }
 }
 
 /// Draws one frame: below [`MIN_WIDTH`]x[`MIN_HEIGHT`] only the too-small line, otherwise the chrome,
@@ -232,7 +257,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(tab_bar(app), rows.tabs);
     if let Some(r) = rows.banner {
         frame.render_widget(
-            Paragraph::new(banner_line(&app.snap.needs_you, area.width as usize, &app.theme)),
+            Paragraph::new(banner(&app.snap, area.width as usize, &app.theme)),
             r,
         );
     }

@@ -54,7 +54,7 @@ impl App {
     fn selected_issue(&self) -> Option<IssueId> {
         let s = &self.snap;
         match self.view {
-            View::Now => now::selected_row(s, &self.now).map(|r| r.issue().clone()),
+            View::Now => now::selected_row(s, &self.now).and_then(|r| r.issue().cloned()),
             View::Board => super::views::board::selected_issue(s, &self.board),
             View::Agents => super::views::agents::selected_issue(s, &self.agents),
             View::Inbox => super::views::inbox::selected_issue(s, &self.inbox),
@@ -83,6 +83,7 @@ mod frame;
 mod help;
 mod inbox;
 mod log;
+mod loop_state;
 // `now` is the imported view, so the module that tests the one-row-per-issue rule has another name
 #[path = "now.rs"]
 mod now_rows;
