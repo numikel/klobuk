@@ -21,11 +21,16 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_fourteen_editable_keys_with_current_values() {
+fn show_lists_the_fifteen_editable_keys_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 14, "{res}");
+    assert_eq!(rows.len(), 15, "{res}");
+    assert_eq!(
+        entry(rows, "merge.clean_after")["value"],
+        serde_json::json!(["worktree", "review_worktrees"]),
+        "{res}"
+    );
     assert_eq!(entry(rows, "worker.remote_control")["value"], false);
     assert_eq!(entry(rows, "notify.on_new")["value"], true);
     assert_eq!(entry(rows, "notify.after_minutes")["value"], 15);
@@ -114,6 +119,7 @@ fn every_key_a_serve_tick_reloads_says_so_and_never_hints_at_a_restart() {
         ("review.max_rounds", "3"),
         ("scheduler.max_parallel", "2"),
         ("merge.verify_main_after", "true"),
+        ("merge.clean_after", "[\"worktree\", \"branch\"]"),
         ("worker.remote_control", "true"),
         ("notify.on_new", "false"),
         ("notify.after_minutes", "10"),
@@ -310,4 +316,48 @@ fn a_negative_reminder_delay_and_the_command_list_are_refused() {
     assert_eq!(code, 1);
     assert!(message.contains("notify.command"), "{message}");
     assert_eq!(config_bytes(&r), before, "a refused edit leaves the file alone");
+}
+
+#[test]
+fn set_changes_clean_after_as_a_list_and_refuses_an_unknown_kind() {
+    let r = Repo::initialised();
+    let res = r.ok(&[
+        "config",
+        "set",
+        "merge.clean_after",
+        "[\"worktree\", \"branch\", \"review_worktrees\"]",
+    ]);
+    assert_eq!(
+        res["old"],
+        serde_json::json!(["worktree", "review_worktrees"]),
+        "{res}"
+    );
+    assert_eq!(
+        res["new"],
+        serde_json::json!(["worktree", "branch", "review_worktrees"]),
+        "{res}"
+    );
+    let after = String::from_utf8(config_bytes(&r)).unwrap();
+    assert!(
+        after.contains("clean_after = [\"worktree\", \"branch\", \"review_worktrees\"]"),
+        "{after}"
+    );
+    assert!(
+        after.contains("git branch -d"),
+        "the comment on the line stays: {after}"
+    );
+
+    r.ok(&["config", "set", "merge.clean_after", "[]"]);
+    let rows = r.ok(&["config", "show"]);
+    assert_eq!(
+        entry(rows.as_array().unwrap(), "merge.clean_after")["value"],
+        serde_json::json!([])
+    );
+
+    let before = config_bytes(&r);
+    for bad in ["[\"remote_branch\"]", "worktree"] {
+        let (code, ecode, _) = r.err(&["config", "set", "merge.clean_after", bad]);
+        assert_eq!((code, ecode.as_str()), (1, "validation"), "{bad}");
+        assert_eq!(config_bytes(&r), before, "{bad} changed the file");
+    }
 }

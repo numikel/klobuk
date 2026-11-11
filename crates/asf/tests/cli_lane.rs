@@ -209,7 +209,10 @@ fn clean_all_removes_every_finished_lane_and_reports_each_refusal_with_its_reaso
     assert_eq!(ids(&res["cleaned"]), [l.done.0.clone()], "{res}");
     assert_eq!(res["cleaned"][0]["removed"], true, "{res}");
     assert!(!l.done.1.exists(), "the finished lane is gone");
-    assert!(branch_exists(&l.r, &format!("feat/{}", l.done.0)), "the branch stays");
+    assert!(
+        branch_exists(&l.r, &format!("feat/{}", l.done.0)),
+        "the branch stays"
+    );
 
     let refused = res["refused"].as_array().unwrap();
     let mut refused_ids = ids(&res["refused"]);
@@ -246,7 +249,11 @@ fn clean_all_dry_run_lists_what_it_would_remove_and_removes_nothing() {
     for (_, wt) in [&l.done, &l.dirty, &l.claimed, &l.unmerged] {
         assert!(wt.is_dir(), "dry-run removed {}", wt.display());
     }
-    let human = l.r.asf().args(["lane", "clean", "--all", "--dry-run"]).output().unwrap();
+    let human =
+        l.r.asf()
+            .args(["lane", "clean", "--all", "--dry-run"])
+            .output()
+            .unwrap();
     assert_eq!(human.status.code(), Some(0));
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(text.contains(&l.done.0) && text.contains("dry-run"), "{text}");

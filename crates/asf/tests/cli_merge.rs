@@ -700,8 +700,8 @@ fn an_approve_decision_merges_and_closes_the_issue_and_the_review_issue() {
     assert_eq!(status_of(&f, &rid), "done");
     assert!(store(&f).active_claims().unwrap().is_empty(), "claims released");
     assert!(
-        f.repo.path().join(".worktrees").join(&rid).is_dir(),
-        "the review worktree is left for lane clean"
+        !f.repo.path().join(".worktrees").join(&rid).exists(),
+        "the review worktree is removed by the default [merge] clean_after"
     );
 }
 
@@ -1953,4 +1953,215 @@ fn a_failing_test_that_maps_to_no_file_counts_as_the_branchs_own() {
     assert_eq!(gate_runs(&fl), 1);
     assert!(foreign_rerun_events(f).is_empty());
     assert!(flaky_issues(f).is_empty());
+}
+
+// ---- [merge] clean_after: the clean-up after a merge -------------------------------------------
+
+const CLEAN_DEFAULT: &str = "clean_after = [\"worktree\", \"review_worktrees\"]";
+
+fn set_clean_after(f: &F, list: &str) {
+    set_config(f, CLEAN_DEFAULT, &format!("clean_after = {list}"));
+}
+
+fn wt_dir(f: &F, id: &str) -> std::path::PathBuf {
+    f.repo.path().join(".worktrees").join(id)
+}
+
+fn branch_listed(f: &F, id: &str) -> bool {
+    let out = std::process::Command::new("git")
+        .args(["branch", "--list", &format!("feat/{id}")])
+        .current_dir(f.repo.path())
+        .output()
+        .unwrap();
+    !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+}
+
+/// `(kind, target)` of every entry of `res.cleanup.<which>`.
+fn cleanup(res: &serde_json::Value, which: &str) -> Vec<(String, String)> {
+    res["cleanup"][which]
+        .as_array()
+        .unwrap_or_else(|| panic!("no cleanup.{which} in {res}"))
+        .iter()
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap().to_string(),
+                e["target"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_default_clean_up_removes_the_worktree_keeps_the_branch_and_reports_it() {
+    let f = setup();
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(!wt_dir(&f, &f.issue).exists(), "the worktree is gone");
+    assert!(branch_listed(&f, &f.issue), "the branch stays by default");
+    assert_eq!(
+        cleanup(&res, "cleaned"),
+        [("worktree".to_string(), format!(".worktrees/{}", f.issue))],
+        "{res}"
+    );
+    assert!(cleanup(&res, "refused").is_empty(), "{res}");
+    assert_eq!(res["cleanup"]["cleaned"][0]["issue"], f.issue.as_str(), "{res}");
+    let events = events_of(&f, "merge.cleaned");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].payload["kind"], "worktree");
+}
+
+#[test]
+fn an_empty_clean_after_keeps_everything_as_before() {
+    let f = setup();
+    set_clean_after(&f, "[]");
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(wt_dir(&f, &f.issue).is_dir() && branch_listed(&f, &f.issue));
+    assert!(
+        cleanup(&res, "cleaned").is_empty() && cleanup(&res, "refused").is_empty(),
+        "{res}"
+    );
+    assert!(events_of(&f, "merge.cleaned").is_empty());
+}
+
+#[test]
+fn branch_in_the_list_deletes_the_branch_after_the_worktree_is_gone() {
+    let f = setup();
+    set_clean_after(&f, "[\"worktree\", \"branch\", \"review_worktrees\"]");
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(!wt_dir(&f, &f.issue).exists());
+    assert!(!branch_listed(&f, &f.issue), "git branch -d removed it");
+    assert!(main_has(&f, "src/greet.rs"), "the work is on main");
+    assert_eq!(
+        cleanup(&res, "cleaned"),
+        [
+            ("worktree".to_string(), format!(".worktrees/{}", f.issue)),
+            ("branch".to_string(), format!("feat/{}", f.issue)),
+        ],
+        "{res}"
+    );
+}
+
+#[test]
+fn branch_alone_is_refused_while_a_worktree_still_holds_it_and_the_merge_stands() {
+    let f = setup();
+    set_clean_after(&f, "[\"branch\"]");
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(
+        res["items"][0]["state"], "merged",
+        "a refusal never fails the merge: {res}"
+    );
+    assert!(res["items"][0]["last_error"].is_null(), "{res}");
+    assert!(branch_listed(&f, &f.issue) && wt_dir(&f, &f.issue).is_dir());
+    let refused = &res["cleanup"]["refused"];
+    assert_eq!(refused.as_array().unwrap().len(), 1, "{res}");
+    assert_eq!(refused[0]["kind"], "branch", "{res}");
+    assert!(!refused[0]["reason"].as_str().unwrap().is_empty(), "{res}");
+    assert_eq!(events_of(&f, "merge.clean_refused").len(), 1);
+}
+
+#[test]
+fn a_dirty_worktree_is_refused_reported_and_left_for_lane_clean() {
+    let f = setup();
+    set_clean_after(&f, "[\"worktree\", \"branch\"]");
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let wt = wt_dir(&f, &f.issue);
+    std::fs::write(wt.join("scratch.txt"), "wip\n").unwrap();
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(
+        wt.join("scratch.txt").exists(),
+        "uncommitted work is never touched"
+    );
+    assert!(
+        branch_listed(&f, &f.issue),
+        "the branch cannot go while its worktree stays"
+    );
+    assert!(cleanup(&res, "cleaned").is_empty(), "{res}");
+    let refused = res["cleanup"]["refused"].as_array().unwrap();
+    assert_eq!(refused[0]["kind"], "worktree", "{res}");
+    assert!(
+        refused[0]["reason"].as_str().unwrap().contains("scratch.txt"),
+        "{res}"
+    );
+    let events = events_of(&f, "merge.clean_refused");
+    assert!(
+        events.iter().any(|e| e.payload["kind"] == "worktree"),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn review_worktrees_go_with_the_merge_and_only_with_review_worktrees_in_the_list() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    assert!(
+        wt_dir(&f, &rid).is_dir(),
+        "the reviewer works in a detached worktree"
+    );
+    decide_as(&f, &rid, "approve");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(!wt_dir(&f, &rid).exists(), "review worktree removed");
+    assert!(!wt_dir(&f, &f.issue).exists(), "worktree removed");
+    let cleaned = cleanup(&res, "cleaned");
+    assert!(
+        cleaned.contains(&("review_worktrees".to_string(), format!(".worktrees/{rid}"))),
+        "{res}"
+    );
+    assert!(
+        cleaned.contains(&("worktree".to_string(), format!(".worktrees/{}", f.issue))),
+        "{res}"
+    );
+
+    // the config is committed before the worker starts, so main does not move while the review runs
+    let f = setup();
+    require_review(&f);
+    set_clean_after(&f, "[\"worktree\"]");
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    f.repo.ok(&["merge", "tick", "--once"]);
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "approve");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(wt_dir(&f, &rid).is_dir(), "not listed, so it stays");
+    assert!(!wt_dir(&f, &f.issue).exists());
+}
+
+#[test]
+fn a_review_worktree_with_loose_files_stays() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    std::fs::write(wt_dir(&f, &rid).join("notes.txt"), "x\n").unwrap();
+    decide_as(&f, &rid, "approve");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(wt_dir(&f, &rid).join("notes.txt").exists());
+    let refused = res["cleanup"]["refused"].as_array().unwrap();
+    assert!(refused.iter().any(|e| e["kind"] == "review_worktrees"), "{res}");
+}
+
+#[test]
+fn a_red_main_cleans_nothing_and_a_green_main_cleans_after_the_check() {
+    let r = red_setup(true);
+    let res = r.f.repo.ok(&["merge", "tick"]);
+    assert_eq!(res["processed"], 1, "{res}");
+    assert!(res["items"][0]["last_error"].is_string(), "main is red: {res}");
+    assert!(wt_dir(&r.f, &r.f.issue).is_dir(), "a red main cleans nothing");
+    assert!(cleanup(&res, "cleaned").is_empty(), "{res}");
+    assert!(events_of(&r.f, "merge.cleaned").is_empty());
+
+    let r = red_setup(true);
+    std::fs::write(r.f.repo.path().join("PASS"), "").unwrap(); // the root gate passes now
+    let res = r.f.repo.ok(&["merge", "tick"]);
+    assert_eq!(res["processed"], 2, "{res}");
+    for id in [&r.f.issue, &r.second] {
+        assert!(!wt_dir(&r.f, id).exists(), "{id} cleaned after its green main");
+    }
+    assert_eq!(cleanup(&res, "cleaned").len(), 2, "{res}");
 }

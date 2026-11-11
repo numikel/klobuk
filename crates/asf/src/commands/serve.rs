@@ -187,16 +187,22 @@ fn tick_background(
         }
     }
     let main_red = items.iter().any(merge::is_main_red);
+    // what the clean-up did for the merges concluded above; poll and start_next report their own
+    let mut cleanup = merge::take_cleanup();
 
     let mut watch = worker.watch_in(GateMode::Background)?;
     transitions.append(&mut watch.transitions);
     watch.transitions = transitions;
     // a merge would change the tree that a running check of main is testing (or that just came back red)
-    items.extend(merge::poll(ctx, main_red || slot.checks_main())?.items);
+    let polled = merge::poll(ctx, main_red || slot.checks_main())?;
+    items.extend(polled.items);
+    cleanup.append(polled.cleanup);
     let done = promote_and_dispatch(ctx, &worker, dispatch)?;
 
     if !main_red {
-        items.extend(merge::start_next(ctx, slot)?.items);
+        let next = merge::start_next(ctx, slot)?;
+        items.extend(next.items);
+        cleanup.append(next.cleanup);
         watch.transitions.extend(worker.start_verification(slot)?);
     }
     gate_event |= slot.started() != started_before;
@@ -210,6 +216,7 @@ fn tick_background(
         merge: TickResult {
             processed: items.len(),
             items,
+            cleanup,
         },
         started: done.started,
         start_errors: done.start_errors,
@@ -239,6 +246,17 @@ fn text(t: &TickReport) -> String {
     }
     for m in &t.merge.items {
         s.push_str(&format!("\nmerge #{} {} -> {}", m.id, m.issue_id, m.state));
+    }
+    for c in &t.merge.cleanup.cleaned {
+        s.push_str(&format!("\ncleaned {} ({})", c.target, c.issue));
+    }
+    for c in &t.merge.cleanup.refused {
+        s.push_str(&format!(
+            "\nkept {} ({}): {}",
+            c.target,
+            c.issue,
+            c.reason.as_deref().unwrap_or("")
+        ));
     }
     for id in &t.closed_epics {
         s.push_str(&format!("\nclosed epic {id}"));

@@ -141,7 +141,10 @@ fn merged_into_head(root: &std::path::Path, branch: &str) -> bool {
         return true;
     }
     let range = format!("HEAD..{branch}");
-    match (git(&["cherry", "HEAD", branch]), git(&["rev-list", "--count", &range])) {
+    match (
+        git(&["cherry", "HEAD", branch]),
+        git(&["rev-list", "--count", &range]),
+    ) {
         (Some(cherry), Some(ahead)) => {
             !cherry.lines().any(|l| l.starts_with('+')) && ahead.trim().parse::<u64>().is_ok_and(|n| n > 0)
         }
@@ -191,7 +194,11 @@ fn clean_all(ctx: &Ctx, dry_run: bool) -> Result<Rendered, AppError> {
             }),
         }
     }
-    let verb = if dry_run { "dry-run: would remove" } else { "removed" };
+    let verb = if dry_run {
+        "dry-run: would remove"
+    } else {
+        "removed"
+    };
     let mut lines: Vec<String> = cleaned
         .iter()
         .map(|c| format!("{verb} worktree {} (branch kept)", c.worktree))
@@ -210,16 +217,24 @@ fn clean_all(ctx: &Ctx, dry_run: bool) -> Result<Rendered, AppError> {
             cleaned,
             refused,
         },
-        lines.join("
-"),
+        lines.join(
+            "
+",
+        ),
     )
 }
 
 pub fn run(cli: &Cli, cmd: &LaneCmd) -> Result<Rendered, AppError> {
     let ctx = Ctx::load(cli)?;
     match cmd {
-        LaneCmd::Clean { all: true, dry_run, .. } => clean_all(&ctx, *dry_run),
-        LaneCmd::Clean { id: Some(id), dry_run, .. } => clean(&ctx, id, *dry_run),
+        LaneCmd::Clean {
+            all: true, dry_run, ..
+        } => clean_all(&ctx, *dry_run),
+        LaneCmd::Clean {
+            id: Some(id),
+            dry_run,
+            ..
+        } => clean(&ctx, id, *dry_run),
         // clap guarantees an id unless `--all`
         LaneCmd::Clean { id: None, .. } => Err(AppError::usage("`asf lane clean` needs an id or --all")),
         LaneCmd::List => {

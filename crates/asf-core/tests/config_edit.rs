@@ -225,7 +225,11 @@ fn field_kinds_are_choice_bool_number_or_text() {
         );
     }
     assert_eq!(get("merge.target").kind, FieldKind::Choice(&["local", "github"]));
-    assert_eq!(get("merge.clean_after").kind, FieldKind::Text, "a list is typed with Enter");
+    assert_eq!(
+        get("merge.clean_after").kind,
+        FieldKind::Text,
+        "a list is typed with Enter"
+    );
     for key in [
         "review.required",
         "merge.verify_main_after",
@@ -499,7 +503,12 @@ fn clean_after_is_set_as_a_list_keeping_the_comment_on_the_line() {
     let out = set_key(t, "merge.clean_after", "[\"worktree\", \"branch\"]").unwrap();
     let changed: Vec<(&str, &str)> = t.lines().zip(out.lines()).filter(|(b, a)| b != a).collect();
     assert_eq!(changed.len(), 1, "{changed:?}");
-    assert!(changed[0].1.starts_with("clean_after = [\"worktree\", \"branch\"]"), "{changed:?}");
+    assert!(
+        changed[0]
+            .1
+            .starts_with("clean_after = [\"worktree\", \"branch\"]"),
+        "{changed:?}"
+    );
     assert!(changed[0].1.contains('#'), "inline comment lost: {changed:?}");
     assert_eq!(
         Config::from_toml(&out).unwrap().merge.clean_after,

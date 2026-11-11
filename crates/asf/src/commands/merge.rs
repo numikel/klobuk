@@ -4,7 +4,7 @@
 //! `blocked`, and a BLOCKER comment names the files.
 
 use asf_core::brief::{parse_verdict, Verdict};
-use asf_core::config::GateWhen;
+use asf_core::config::{CleanKind, GateWhen};
 use asf_core::github::{ChecksState, GitHub, Mergeable, PrState};
 use asf_core::vcs::VcsError;
 use asf_core::*;
@@ -16,6 +16,8 @@ use crate::cli::{Cli, MergeCmd};
 use crate::ctx::{Ctx, FACTORY_DIR};
 use crate::output::{AppError, ErrorCode, Rendered};
 use crate::worker::{Finished, GateMode, GateSlot, Job, MainJob, MergeJob, Worker, RUNS_DIR};
+
+use super::lane;
 
 /// Event `asf serve` appends for a merged item whose check of the default branch (`[merge]
 /// verify_main_after`) has to run in the background. It is pending until `MAIN_CHECKED` or `MAIN_RED`
@@ -90,10 +92,12 @@ pub fn enqueue_checked(ctx: &Ctx, id: &IssueId, force: bool) -> Result<MergeItem
         .enqueue_merge(id, run_id.as_deref(), &format!("feat/{id}"))?)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct TickResult {
     pub processed: usize,
     pub items: Vec<MergeItem>,
+    /// What the clean-up after the merges of this tick removed and what it refused (`[merge] clean_after`).
+    pub cleanup: CleanReport,
 }
 
 pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
@@ -117,10 +121,25 @@ pub fn run(cli: &Cli, cmd: &MergeCmd) -> Result<Rendered, AppError> {
         }
         MergeCmd::Tick { once } => {
             let res = tick_all(&ctx, *once)?;
-            let text = if res.items.is_empty() {
+            let mut lines: Vec<String> = res.items.iter().map(item_line).collect();
+            lines.extend(
+                res.cleanup
+                    .cleaned
+                    .iter()
+                    .map(|c| format!("cleaned {} ({})", c.target, c.issue)),
+            );
+            lines.extend(res.cleanup.refused.iter().map(|c| {
+                format!(
+                    "kept {} ({}): {}",
+                    c.target,
+                    c.issue,
+                    c.reason.as_deref().unwrap_or("")
+                )
+            }));
+            let text = if lines.is_empty() {
                 "merge queue: nothing queued".to_string()
             } else {
-                res.items.iter().map(item_line).collect::<Vec<_>>().join("\n")
+                lines.join("\n")
             };
             Rendered::new(&res, text)
         }
@@ -227,6 +246,7 @@ pub fn tick_all(ctx: &Ctx, once: bool) -> Result<TickResult, AppError> {
     Ok(TickResult {
         processed: items.len(),
         items,
+        cleanup: take_cleanup(),
     })
 }
 
@@ -258,6 +278,7 @@ pub fn poll(ctx: &Ctx, hold_main: bool) -> Result<TickResult, AppError> {
     Ok(TickResult {
         processed: items.len(),
         items,
+        cleanup: take_cleanup(),
     })
 }
 
@@ -314,6 +335,7 @@ pub fn start_next(ctx: &Ctx, slot: &mut GateSlot) -> Result<TickResult, AppError
     Ok(TickResult {
         processed: items.len(),
         items,
+        cleanup: take_cleanup(),
     })
 }
 
@@ -364,6 +386,21 @@ pub fn conclude_main(ctx: &Ctx, job: MainJob, results: Vec<GateResult>) -> Resul
     let MainJob { item, head, covered } = job;
     let green = results.iter().all(|r| r.ok);
     let verdict = main_verdict(ctx, item.clone(), &head, &results)?;
+    if green {
+        // a green main is what the clean-up waits for: the item and every merged item this run answered for
+        let queue = ctx.store.merge_queue()?;
+        let merged = |id: &IssueId| {
+            queue
+                .iter()
+                .any(|m| &m.issue_id == id && m.state == MergeState::Merged)
+        };
+        for id in std::iter::once(&item.issue_id)
+            .chain(&covered)
+            .filter(|id| merged(id))
+        {
+            clean_after_merge(ctx, id);
+        }
+    }
     let mut ended: Vec<(&IssueId, serde_json::Value)> = Vec::new();
     if green {
         ended.push((&item.issue_id, serde_json::json!({ "head": head })));
@@ -1662,10 +1699,17 @@ fn finalize_merged(
     })?;
     if ctx.config.merge.verify_main_after {
         return match mode {
-            GateMode::Inline => verify_main(ctx, updated, &new_head),
+            GateMode::Inline => {
+                let checked = verify_main(ctx, updated, &new_head)?;
+                if !is_main_red(&checked) {
+                    clean_after_merge(ctx, &checked.issue_id);
+                }
+                Ok(checked)
+            }
             GateMode::Background => defer_main_check(ctx, updated),
         };
     }
+    clean_after_merge(ctx, &updated.issue_id);
     Ok(updated)
 }
 
@@ -1674,6 +1718,8 @@ fn finalize_merged(
 /// serve cannot lose it. The next `start_next` runs it (nothing else is gated before it).
 fn defer_main_check(ctx: &Ctx, merged: MergeItem) -> Result<MergeItem, AppError> {
     if gate_specs(ctx, GateWhen::Main).is_empty() {
+        // nothing will check main, so the merge is the last word: clean up now
+        clean_after_merge(ctx, &merged.issue_id);
         return Ok(merged);
     }
     ctx.store.append_event(&NewEvent {
@@ -1741,6 +1787,148 @@ fn main_verdict(
         }),
     })?;
     Ok(updated)
+}
+
+// ---- clean-up after a merge (`[merge] clean_after`) -----------------------------------------------
+
+/// Event for one thing the clean-up removed; its payload names the `kind` and the `target`.
+const CLEANED: &str = "merge.cleaned";
+
+/// Event for one thing the clean-up left alone; the payload adds the `reason`.
+const CLEAN_REFUSED: &str = "merge.clean_refused";
+
+/// One removed or refused thing of a clean-up: a worktree directory or a branch of `issue`.
+#[derive(Serialize, Clone, Debug)]
+pub struct CleanEntry {
+    pub issue: IssueId,
+    pub kind: CleanKind,
+    /// The worktree relative to the repo root, or the branch name.
+    pub target: String,
+    /// Why it was left alone (refused entries only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// What the clean-up after merges removed and what it refused, for the tick report.
+#[derive(Serialize, Default, Clone, Debug)]
+pub struct CleanReport {
+    pub cleaned: Vec<CleanEntry>,
+    pub refused: Vec<CleanEntry>,
+}
+
+impl CleanReport {
+    pub fn append(&mut self, mut other: CleanReport) {
+        self.cleaned.append(&mut other.cleaned);
+        self.refused.append(&mut other.refused);
+    }
+}
+
+thread_local! {
+    /// Entries of the clean-ups that ran on this thread since the last `take_cleanup`. A merge ends deep
+    /// inside the gate and review paths, which return only the item; the tick that started it collects
+    /// the report here when it builds its `TickResult`. Everything a tick does runs on its own thread.
+    static CLEANUP: std::cell::RefCell<CleanReport> = std::cell::RefCell::default();
+}
+
+/// The clean-up report collected so far on this thread; the next call starts empty.
+pub fn take_cleanup() -> CleanReport {
+    CLEANUP.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Records one thing the clean-up did or refused: an event for the history, an entry for the tick report.
+fn record_clean(ctx: &Ctx, issue: &IssueId, kind: CleanKind, target: String, outcome: Result<(), String>) {
+    let (event, reason) = match &outcome {
+        Ok(()) => (CLEANED, None),
+        Err(why) => (CLEAN_REFUSED, Some(why.clone())),
+    };
+    let mut payload = serde_json::json!({ "kind": kind, "target": target });
+    if let Some(why) = &reason {
+        payload["reason"] = serde_json::Value::String(why.clone());
+    }
+    // the merge is done and recorded; a clean-up that cannot even log itself must not undo that
+    let _ = ctx.store.append_event(&NewEvent {
+        kind: event.into(),
+        issue_id: Some(issue.clone()),
+        run_id: None,
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload,
+    });
+    let entry = CleanEntry {
+        issue: issue.clone(),
+        kind,
+        target,
+        reason,
+    };
+    CLEANUP.with(|c| {
+        let mut report = c.borrow_mut();
+        if entry.reason.is_some() {
+            report.refused.push(entry);
+        } else {
+            report.cleaned.push(entry);
+        }
+    });
+}
+
+/// `lane clean` for `id` when its worktree exists; a refusal is recorded, a missing directory is nothing to do.
+fn clean_worktree_of(ctx: &Ctx, issue: &IssueId, id: &IssueId, kind: CleanKind) {
+    let rel = lane::lane_rel(ctx, id);
+    if !ctx.root.join(&rel).is_dir() {
+        return;
+    }
+    let outcome = lane::clean_finished_lane(ctx, id, false)
+        .map(|_| ())
+        .map_err(|e| e.message);
+    record_clean(ctx, issue, kind, rel, outcome);
+}
+
+/// `git branch -d <branch>` in the repo root: lowercase `-d`, so git itself refuses a branch that is not
+/// fully merged or that a worktree still has checked out. An absent branch is nothing to do.
+fn delete_branch(ctx: &Ctx, issue: &IssueId) {
+    use std::process::{Command, Stdio};
+    let branch = format!("feat/{issue}");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&ctx.root)
+            .stdin(Stdio::null())
+            .output()
+    };
+    let exists = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}"),
+    ])
+    .is_ok_and(|o| o.status.success());
+    if !exists {
+        return;
+    }
+    let outcome = match git(&["branch", "-d", &branch]) {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(last_lines(String::from_utf8_lossy(&o.stderr).trim(), 2)),
+        Err(e) => Err(format!("cannot run git: {e}")),
+    };
+    record_clean(ctx, issue, CleanKind::Branch, branch, outcome);
+}
+
+/// Removes what `[merge] clean_after` lists for the merged `issue`, once the merge stands (and, with
+/// `verify_main_after`, once main is green; the callers see to that). Always in the same order: the
+/// worktree, then the branch (git refuses a branch that a worktree still has checked out), then the
+/// review worktrees. A refusal (claimed, dirty or unmerged lane, a branch git will not delete) is
+/// recorded and reported and never fails the merge; nothing is forced.
+fn clean_after_merge(ctx: &Ctx, issue: &IssueId) {
+    let kinds = &ctx.config.merge.clean_after;
+    if kinds.contains(&CleanKind::Worktree) {
+        clean_worktree_of(ctx, issue, issue, CleanKind::Worktree);
+    }
+    if kinds.contains(&CleanKind::Branch) {
+        delete_branch(ctx, issue);
+    }
+    if kinds.contains(&CleanKind::ReviewWorktrees) {
+        for review in review_children(ctx, issue).unwrap_or_default() {
+            clean_worktree_of(ctx, issue, &review, CleanKind::ReviewWorktrees);
+        }
+    }
 }
 
 fn github(ctx: &Ctx) -> Result<(Box<dyn GitHub>, String, String), AppError> {

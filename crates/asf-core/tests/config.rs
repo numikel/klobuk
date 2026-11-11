@@ -95,7 +95,8 @@ fn clean_after_defaults_to_the_worktree_and_the_review_worktrees() {
 
 #[test]
 fn clean_after_takes_any_subset_and_an_empty_list_keeps_everything() {
-    let c = Config::from_toml("[merge]\nclean_after = [\"worktree\", \"branch\", \"review_worktrees\"]\n").unwrap();
+    let c = Config::from_toml("[merge]\nclean_after = [\"worktree\", \"branch\", \"review_worktrees\"]\n")
+        .unwrap();
     assert_eq!(
         c.merge.clean_after,
         [CleanKind::Worktree, CleanKind::Branch, CleanKind::ReviewWorktrees]
