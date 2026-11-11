@@ -21,11 +21,13 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_fifteen_editable_keys_with_current_values() {
+fn show_lists_the_seventeen_editable_keys_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 15, "{res}");
+    assert_eq!(rows.len(), 17, "{res}");
+    assert_eq!(entry(rows, "serve.interval_s")["value"], 10);
+    assert_eq!(entry(rows, "serve.max_ticks")["value"], Value::Null);
     assert_eq!(
         entry(rows, "merge.clean_after")["value"],
         serde_json::json!(["worktree", "review_worktrees"]),

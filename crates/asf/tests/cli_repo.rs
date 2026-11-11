@@ -364,6 +364,85 @@ fn doctor_gitignore_warns_when_neither_file_exists() {
     assert!(d.contains(".factory/plan/") && d.contains(".worktrees/"), "{d}");
 }
 
+fn write_pulse(r: &Repo, pid: u32, last_tick_at: &str, stop_reason: Option<&str>) {
+    let dir = r.path().join(".factory/runs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pulse = serde_json::json!({
+        "pid": pid, "started_at": last_tick_at, "last_tick_at": last_tick_at,
+        "mode": "dispatch", "interval_s": 10, "max_ticks": 633, "ticks": 633,
+        "stopped_at": stop_reason.map(|_| last_tick_at), "stop_reason": stop_reason,
+    });
+    std::fs::write(dir.join("serve.json"), pulse.to_string()).unwrap();
+}
+
+fn doctor_loop(r: &Repo) -> serde_json::Value {
+    let out = r.asf().args(["repo", "doctor", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "the loop never fails doctor");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    check(&v["result"], "loop").clone()
+}
+
+#[test]
+fn doctor_reports_a_loop_that_never_ran() {
+    let r = Repo::initialised();
+    let c = doctor_loop(&r);
+    assert_eq!(
+        (c["ok"].clone(), c["required"].clone()),
+        (false.into(), false.into()),
+        "{c}"
+    );
+    assert_eq!(
+        c["detail"], "the loop is not running — start it: asf serve --dispatch",
+        "{c}"
+    );
+}
+
+#[test]
+fn doctor_reports_a_live_loop_as_ok_and_names_its_pid() {
+    let r = Repo::initialised();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    write_pulse(&r, std::process::id(), &now, None); // this test process is alive
+    let c = doctor_loop(&r);
+    assert_eq!(c["ok"], true, "{c}");
+    let d = c["detail"].as_str().unwrap();
+    assert!(
+        d.contains("running (dispatch)") && d.contains(&format!("pid {}", std::process::id())),
+        "{d}"
+    );
+}
+
+#[test]
+fn doctor_reports_a_stopped_loop_with_the_reason_and_the_same_words_as_the_tui() {
+    let r = Repo::initialised();
+    write_pulse(&r, 1, "2020-01-01T00:00:00Z", Some("max_ticks"));
+    let c = doctor_loop(&r);
+    assert_eq!(c["ok"], false, "{c}");
+    let d = c["detail"].as_str().unwrap();
+    assert!(
+        d.starts_with("the loop stopped ")
+            && d.ends_with(" ago: max_ticks (633) — start it again: asf serve --dispatch"),
+        "{d}"
+    );
+    // and in the human output
+    let out = r.asf().args(["repo", "doctor"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("warn loop") && text.contains("max_ticks (633)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn doctor_treats_a_stale_pulse_without_a_stop_as_stopped_without_a_reason() {
+    let r = Repo::initialised();
+    write_pulse(&r, std::process::id(), "2020-01-01T00:00:00Z", None);
+    let c = doctor_loop(&r);
+    assert_eq!(c["ok"], false, "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("without a reason"), "{c}");
+}
+
 #[test]
 fn json_usage_error_is_still_an_envelope() {
     let r = Repo::initialised();

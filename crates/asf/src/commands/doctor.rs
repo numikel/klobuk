@@ -5,6 +5,7 @@ use std::fs;
 use std::process::Command;
 
 use asf_core::IssueStore;
+use asf_store::serve_pulse;
 use serde::Serialize;
 
 use super::repo::IGNORE_LINES;
@@ -169,6 +170,47 @@ fn gitignore_check(ctx: &Ctx) -> Check {
     }
 }
 
+/// The state of the `asf serve` loop, worded like the TUI banner. Advisory (`required: false`): a repo
+/// is healthy without a loop, it just does nothing on its own. Unlike the TUI this also looks the
+/// pid up, so a loop killed a moment ago is reported at once.
+fn loop_check(ctx: &Ctx) -> Check {
+    let pulse = match serve_pulse::read(&ctx.root) {
+        Ok(p) => p,
+        Err(e) => {
+            return Check {
+                name: "loop",
+                ok: false,
+                required: false,
+                detail: format!("the pulse is unreadable ({e}); the next `asf serve` replaces it"),
+            }
+        }
+    };
+    let alive = pulse
+        .as_ref()
+        .filter(|p| p.stopped_at.is_none())
+        .and_then(|p| serve_pulse::pid_alive(p.pid));
+    let state = serve_pulse::judge(pulse.as_ref(), time::OffsetDateTime::now_utc(), alive);
+    let mode = pulse
+        .as_ref()
+        .map_or(serve_pulse::ServeMode::Dispatch, |p| p.mode);
+    let detail = match (&state, &pulse) {
+        (serve_pulse::LoopState::Running { age_s, .. }, Some(p)) => format!(
+            "running ({}), pid {}, last tick {} ago, {} tick(s)",
+            p.mode.as_str(),
+            p.pid,
+            serve_pulse::fmt_age(*age_s),
+            p.ticks
+        ),
+        _ => state.banner(mode, None).unwrap_or_default(),
+    };
+    Check {
+        name: "loop",
+        ok: state.is_running(),
+        required: false,
+        detail,
+    }
+}
+
 pub fn run(cli: &Cli) -> Result<Rendered, AppError> {
     let ctx = Ctx::load(cli)?;
     let mut checks = vec![tool("git", "git", &["--version"], true)];
@@ -209,6 +251,7 @@ pub fn run(cli: &Cli) -> Result<Rendered, AppError> {
     checks.push(tool("claude", "claude", &["--version"], false));
     checks.push(github_check(&ctx));
     checks.push(gitignore_check(&ctx));
+    checks.push(loop_check(&ctx));
     let ok = checks.iter().filter(|c| c.required).all(|c| c.ok);
     let report = Report { ok, checks };
     let mut text = String::new();
