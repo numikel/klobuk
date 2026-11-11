@@ -482,6 +482,45 @@ fn tail(s: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// Lines of wrapped question text read after the `SCOPE:` line while looking for `because`.
+const SCOPE_WRAP_LINES: usize = 3;
+
+/// The paths of a scope request in a BLOCKER body that quotes a worker's AskUserQuestion screen: the
+/// question starts with `SCOPE: <path> because <reason>` (it may wrap onto the next lines) and option 1
+/// reads `Grant <path>`. `None` when the screen is anything else, including a scope dialog whose first
+/// option is not the grant, so that "1" never extends a scope by accident.
+fn scope_dialog_grant(body: &str) -> Option<Vec<String>> {
+    const MARK: &str = "SCOPE:";
+    let lines: Vec<&str> = body.lines().collect();
+    // the cursor / box characters before the option number are not part of the option
+    let grant_first = lines.iter().any(|l| {
+        l.trim_start_matches(|c: char| !c.is_alphanumeric())
+            .strip_prefix("1.")
+            .is_some_and(|rest| rest.trim_start().starts_with("Grant"))
+    });
+    if !grant_first {
+        return None;
+    }
+    let at = lines.iter().position(|l| l.contains(MARK))?;
+    let mut text = lines[at][lines[at].find(MARK)? + MARK.len()..].trim().to_string();
+    for next in lines[at + 1..].iter().take(SCOPE_WRAP_LINES) {
+        let next = next.trim();
+        if text.contains("because") || next.is_empty() || next.starts_with(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        text.push(' ');
+        text.push_str(next);
+    }
+    let (paths, _reason) = text.split_once("because")?;
+    let globs: Vec<String> = paths
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .map(|p| p.trim_matches(['`', '"', '\'']))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!globs.is_empty()).then_some(globs)
+}
+
 impl<'a> Worker<'a> {
     pub fn new(ctx: &'a Ctx) -> Result<Self, AppError> {
         let rt = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root).map_err(rt_err)?;
@@ -1323,12 +1362,41 @@ impl<'a> Worker<'a> {
         )?)
     }
 
+    /// Sends keys to the worker's pane. When the run waits on a `SCOPE:` dialog and the key picks its
+    /// first option (`Grant <path>`), the scope is extended first with the code of `asf issue scope add`
+    /// (which also answers the `SCOPE:` QUESTION), so the worker's hook lets the file through the moment
+    /// the dialog closes. Any other key, or a dialog that is not a scope request, only sends the keys.
     pub fn keys(&self, id: &IssueId, keys: &[String]) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
         let h = Self::handle(&run)?;
+        if let Some(globs) = self.granted_scope(&run, keys)? {
+            crate::commands::issue::scope(
+                self.ctx,
+                &crate::cli::ScopeCmd::Add {
+                    id: run.issue_id.clone(),
+                    globs,
+                },
+            )?;
+        }
         let ks: Vec<&str> = keys.iter().map(String::as_str).collect();
         self.rt.send_keys(&h, &ks).map_err(rt_err)?;
         self.unblock(&run)
+    }
+
+    /// The paths a `SCOPE:` dialog asks for when `keys` is the answer "1" and the run is blocked on that
+    /// dialog. The dialog is read from the newest BLOCKER the orchestrator posted for the run: a comment
+    /// by anyone else could be a worker faking a dialog to get a grant for the human's next "1".
+    fn granted_scope(&self, run: &Run, keys: &[String]) -> Result<Option<Vec<String>>, AppError> {
+        if run.state != RunState::Blocked || keys != ["1"] {
+            return Ok(None);
+        }
+        let comments = self.ctx.store.comments(&run.issue_id)?;
+        Ok(comments
+            .iter()
+            .rev()
+            .find(|c| c.kind == CommentType::Blocker)
+            .filter(|c| c.author == LANE_ORCHESTRATOR)
+            .and_then(|c| scope_dialog_grant(&c.body)))
     }
 
     pub fn nudge(&self, id: &IssueId) -> Result<Run, AppError> {
@@ -1829,6 +1897,60 @@ mod tests {
         assert!(
             open_questions("#hashtag open questions\nx").is_empty(),
             "a heading needs a space after #"
+        );
+    }
+
+    fn blocker_with(screen: &str) -> String {
+        format!("Worker for asf-1 is waiting for input.\n\nScreen:\n```\n{screen}\n```\nAnswer with `asf run keys asf-1 y`.")
+    }
+
+    #[test]
+    fn scope_dialog_grant_reads_the_paths_of_a_dialog_whose_first_option_is_the_grant() {
+        let one = blocker_with(" ☐ Scope\nSCOPE: Cargo.toml because a new dependency is needed\n ❯ 1. Grant Cargo.toml\n   2. Refuse");
+        assert_eq!(scope_dialog_grant(&one), Some(vec!["Cargo.toml".to_string()]));
+        let many = blocker_with(
+            "SCOPE: `src/a.rs`, \"src/b/**\" because x\n  1. Grant src/a.rs, src/b/**\n  2. Refuse",
+        );
+        assert_eq!(
+            scope_dialog_grant(&many),
+            Some(vec!["src/a.rs".to_string(), "src/b/**".to_string()])
+        );
+    }
+
+    #[test]
+    fn scope_dialog_grant_joins_a_wrapped_question() {
+        let wrapped = blocker_with("SCOPE: crates/asf/tests/cli_run.rs\nbecause the flow test lives there\n 1. Grant crates/asf/tests/cli_run.rs\n 2. Refuse");
+        assert_eq!(
+            scope_dialog_grant(&wrapped),
+            Some(vec!["crates/asf/tests/cli_run.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn scope_dialog_grant_refuses_anything_that_is_not_a_grant_first_scope_dialog() {
+        // a permission prompt
+        assert_eq!(
+            scope_dialog_grant(&blocker_with("Allow Bash(rm -rf target)?\n 1. Yes\n 2. No")),
+            None
+        );
+        // a scope question whose option 1 is not the grant
+        assert_eq!(
+            scope_dialog_grant(&blocker_with(
+                "SCOPE: Cargo.toml because x\n 1. Refuse\n 2. Grant Cargo.toml"
+            )),
+            None
+        );
+        // no reason, so no way to tell where the paths end
+        assert_eq!(
+            scope_dialog_grant(&blocker_with(
+                "SCOPE: Cargo.toml\n\n 1. Grant Cargo.toml\n 2. Refuse"
+            )),
+            None
+        );
+        // no path at all
+        assert_eq!(
+            scope_dialog_grant(&blocker_with("SCOPE: because x\n 1. Grant\n 2. Refuse")),
+            None
         );
     }
 

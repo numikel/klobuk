@@ -538,8 +538,8 @@ fn unique(globs: &[String]) -> Vec<String> {
 const SCOPE_REQUEST_PREFIX: &str = "SCOPE:";
 
 /// `scope add|rm`. Orchestrator-only: `dispatch` refuses it inside a worker run because `Scope`
-/// is not on `allowed_in_worker`'s list.
-fn scope(ctx: &Ctx, cmd: &ScopeCmd) -> Result<Rendered, AppError> {
+/// is not on `allowed_in_worker`'s list. Also the code behind a granted `SCOPE:` dialog (`Worker::keys`).
+pub(crate) fn scope(ctx: &Ctx, cmd: &ScopeCmd) -> Result<Rendered, AppError> {
     let (id, globs, adding) = match cmd {
         ScopeCmd::Add { id, globs } => (id, unique(globs), true),
         ScopeCmd::Rm { id, globs } => (id, unique(globs), false),

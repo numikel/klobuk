@@ -65,18 +65,79 @@ fn review_brief() -> String {
 
 // ---- worker protocol -------------------------------------------------------------------------
 
-#[test]
-fn worker_brief_routes_blocking_questions_through_ask_user_question() {
-    let b = worker_brief();
-    assert!(b.contains("AskUserQuestion"), "{b}");
+/// The Protocol section of the worker brief (up to the Finish ritual).
+fn protocol(b: &str) -> &str {
+    let from = b.find("## Protocol").expect("protocol section");
+    let to = b.find("## Finish ritual").expect("finish ritual section");
+    &b[from..to]
 }
 
 #[test]
-fn worker_brief_routes_non_blocking_questions_to_the_human() {
+fn worker_brief_routes_every_question_through_ask_user_question() {
+    let b = worker_brief();
+    let p = protocol(&b);
+    assert!(
+        p.contains("ask EVERY question that needs a human answer with the AskUserQuestion tool"),
+        "{p}"
+    );
+    assert!(p.contains("2-4 closed options"), "{p}");
+    assert!(p.contains("recommended one first"), "{p}");
+    assert!(
+        !p.contains("If the question does not block you"),
+        "no non-blocking exception that sends the human to the inbox:\n{p}"
+    );
+}
+
+#[test]
+fn worker_brief_still_posts_the_question_for_the_record() {
     let b = worker_brief();
     assert!(
         b.contains("D:/bin/asf.exe issue comment asf-9 --type QUESTION --to human"),
         "{b}"
+    );
+    assert!(b.contains("for the record"), "{b}");
+}
+
+#[test]
+fn worker_brief_asks_scope_requests_in_the_dialog_with_a_grant_option_first() {
+    let b = worker_brief();
+    let p = protocol(&b);
+    assert!(
+        p.contains("The question text starts with `SCOPE: <path> because <reason>`"),
+        "{p}"
+    );
+    assert!(p.contains("option 1 is `Grant <path>`"), "{p}");
+    assert!(p.contains("option 2 refuses"), "{p}");
+    assert!(
+        p.contains("asf extends your scope and answers the QUESTION"),
+        "{p}"
+    );
+}
+
+#[test]
+fn worker_brief_forbids_ai_attribution_trailers() {
+    let b = worker_brief();
+    let p = protocol(&b);
+    assert!(p.contains("Conventional Commits, in English"), "{p}");
+    assert!(
+        p.contains("no AI attribution trailers (`Co-Authored-By`, `Generated-by`)"),
+        "{p}"
+    );
+}
+
+#[test]
+fn worker_brief_has_the_rule_for_tests_that_run_a_loop_as_a_process() {
+    let b = worker_brief();
+    let p = protocol(&b);
+    assert!(
+        p.contains("waits for an observable condition with a deadline"),
+        "{p}"
+    );
+    assert!(p.contains("then stops the process"), "{p}");
+    assert!(p.contains("never relies on a tick count or a fixed sleep"), "{p}");
+    assert!(
+        p.contains("`LiveServe`") && p.contains("crates/asf/tests/cli_serve.rs"),
+        "{p}"
     );
 }
 
