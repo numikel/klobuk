@@ -759,7 +759,9 @@ pub fn load_snapshot(
     let all_runs = store.runs(None, false)?;
     let mut newest: BTreeMap<IssueId, Run> = BTreeMap::new();
     for r in &all_runs {
-        newest.insert(r.issue_id.clone(), r.clone()); // ordered by start: the last one wins
+        if newest.get(&r.issue_id).is_none_or(|n| r.attempt > n.attempt) {
+            newest.insert(r.issue_id.clone(), r.clone());
+        }
     }
     let failed_runs: Vec<Run> = issues
         .iter()

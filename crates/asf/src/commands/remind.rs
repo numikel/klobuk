@@ -282,7 +282,9 @@ fn collect(ctx: &Ctx, index: &EventIndex, now: OffsetDateTime) -> Result<Vec<Wai
     // Only the newest run of an issue counts: an older failed attempt is history once a retry exists.
     let mut newest: BTreeMap<IssueId, Run> = BTreeMap::new();
     for r in store.runs(None, false)? {
-        newest.insert(r.issue_id.clone(), r); // ordered by start: the last one wins
+        if newest.get(&r.issue_id).is_none_or(|n| r.attempt > n.attempt) {
+            newest.insert(r.issue_id.clone(), r);
+        }
     }
     for (issue, run) in newest {
         let Some(kind) = run_kind(run.state) else {

@@ -151,7 +151,9 @@ pub(crate) fn runs(
         if active_only {
             sql.push_str(" AND state NOT IN ('succeeded','failed','aborted')");
         }
-        sql.push_str(" ORDER BY started_at, id");
+        // `started_at` has second precision and ULIDs of one millisecond are random: `attempt` is the
+        // per-issue monotonic tie-break, so the last row of an issue is always its newest run.
+        sql.push_str(" ORDER BY started_at, attempt, id");
         let mut stmt = c.prepare(&sql).map_err(backend)?;
         let rows = stmt
             .query_map(

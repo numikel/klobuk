@@ -114,6 +114,49 @@ fn runs_filter_by_issue_and_active() {
 }
 
 #[test]
+fn runs_of_an_issue_come_back_in_attempt_order_back_to_back() {
+    let (_d, s) = open();
+    let a = ready_issue(&s, "a");
+    for _ in 0..50 {
+        s.create_run(&new_run(&a.id)).unwrap();
+    }
+    let attempts: Vec<i64> = s
+        .runs(Some(&a.id), false)
+        .unwrap()
+        .iter()
+        .map(|r| r.attempt)
+        .collect();
+    assert_eq!(attempts, (1..=50).collect::<Vec<_>>());
+}
+
+#[test]
+fn runs_with_equal_started_at_are_ordered_by_attempt_not_by_id() {
+    let (d, s) = open();
+    let a = ready_issue(&s, "a");
+    let r1 = s.create_run(&new_run(&a.id)).unwrap();
+    let r2 = s.create_run(&new_run(&a.id)).unwrap();
+    // Same second, and ids that sort against the attempts (ULIDs of one millisecond are random).
+    let c = rusqlite::Connection::open(d.path().join("f.db")).unwrap();
+    for (old, new) in [
+        (&r1.id, "ZZZZZZZZZZZZZZZZZZZZZZZZZZ"),
+        (&r2.id, "00000000000000000000000000"),
+    ] {
+        c.execute(
+            "UPDATE runs SET id = ?2, started_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![old, new],
+        )
+        .unwrap();
+    }
+    let attempts: Vec<i64> = s
+        .runs(Some(&a.id), false)
+        .unwrap()
+        .iter()
+        .map(|r| r.attempt)
+        .collect();
+    assert_eq!(attempts, vec![1, 2], "the lower attempt is the older run");
+}
+
+#[test]
 fn merge_queue_fifo_and_conflict_on_duplicate() {
     let (_d, s) = open();
     let a = ready_issue(&s, "a");
