@@ -8,7 +8,7 @@ use asf_core::config::GateWhen;
 use asf_core::github::{ChecksState, GitHub, Mergeable, PrState};
 use asf_core::vcs::VcsError;
 use asf_core::*;
-use asf_vcs::gates::stage_specs;
+use asf_vcs::gates::{foreign_tests, stage_specs, ForeignTest};
 use asf_vcs::{run_gates, GitCli};
 use serde::Serialize;
 
@@ -53,6 +53,13 @@ const REVIEW_APPROVED: &str = "merge.review_approved";
 
 /// Event the queue appends when a review is skipped because the patch matches an earlier approval.
 const REVIEW_SKIPPED: &str = "merge.review_skipped";
+
+/// Event the queue appends when a gate failed only on tests outside the branch and runs once more.
+/// Its payload names the `gate`, the `tests`, the `files` they live in and the `branch`.
+const GATE_RERUN_FOREIGN: &str = "merge.gate_rerun_foreign";
+
+/// Label of the issues filed for tests that failed outside the branch and passed on the rerun.
+const FLAKY_LABEL: &str = "flaky";
 
 /// Queues `feat/<id>` linked to the issue's latest run. Without `force` the latest run must be
 /// `succeeded` (independently verified): a worker cannot push its own branch into the queue.
@@ -759,6 +766,7 @@ fn conclude(
 ) -> Result<MergeItem, AppError> {
     let MergeJob { item, run, wt } = job;
     let item = &item;
+    let results = rerun_foreign(ctx, item, &wt, results)?;
     if let Some(bad) = results.iter().find(|r| !r.ok) {
         let msg = format!(
             "gate `{}` failed (exit {:?}) after rebase:\n{}",
@@ -803,6 +811,108 @@ fn conclude(
 
     // 5. integrate
     integrate(ctx, item, &run, &wt, false, mode)
+}
+
+/// A gate that fails only on tests outside the branch's diff (see `foreign_tests`) is not the worker's
+/// failure: the failed gate and those after it run once more, and that run is no attempt. A green
+/// rerun files a `Flaky test:` issue per test and the queue goes on; a red one is returned like any
+/// other gate failure. A failure in a file the branch changed, or one that cannot be placed, is
+/// returned untouched.
+///
+/// shortcut: the rerun runs on the tick thread, so `asf serve` stalls for one gate run; move it onto
+/// the gate slot (worker.rs) when serve must stay responsive during a rerun.
+fn rerun_foreign(
+    ctx: &Ctx,
+    item: &MergeItem,
+    wt: &std::path::Path,
+    mut results: Vec<GateResult>,
+) -> Result<Vec<GateResult>, AppError> {
+    let Some(at) = results.iter().position(|r| !r.ok) else {
+        return Ok(results);
+    };
+    // a diff that cannot be read says nothing about the branch, so the failure stays the worker's
+    let Ok(changed) = GitCli.changed_files(wt, &ctx.config.repo.default_branch) else {
+        return Ok(results);
+    };
+    let Some(foreign) = foreign_tests(wt, &results[at].tail, &changed) else {
+        return Ok(results);
+    };
+    let specs = gate_specs(ctx, GateWhen::Merge);
+    let Some(from) = specs.iter().position(|s| s.name == results[at].name) else {
+        return Ok(results);
+    };
+    let gate = results[at].name.clone();
+    let names: Vec<&str> = foreign.iter().map(|t| t.name.as_str()).collect();
+    ctx.store.append_event(&NewEvent {
+        kind: GATE_RERUN_FOREIGN.into(),
+        issue_id: Some(item.issue_id.clone()),
+        run_id: item.run_id.clone(),
+        actor: Some(LANE_ORCHESTRATOR.into()),
+        payload: serde_json::json!({
+            "gate": gate,
+            "tests": names,
+            "files": foreign.iter().map(|t| t.file.as_str()).collect::<Vec<_>>(),
+            "branch": item.branch,
+        }),
+    })?;
+    let mut rerun = run_gates(&specs[from..], wt);
+    if let Some(first) = rerun.first_mut() {
+        first.tail.push_str(&format!(
+            "\n[asf] gate `{gate}` failed on {} outside the branch ({}); reran once, not counted as an attempt",
+            if names.len() == 1 { "a test" } else { "tests" },
+            names.join(", ")
+        ));
+    }
+    if rerun.first().is_some_and(|r| r.ok) {
+        file_flaky_issues(ctx, item, &gate, &foreign, &results[at].tail);
+    }
+    results.truncate(at);
+    results.extend(rerun);
+    Ok(results)
+}
+
+/// Files an issue `Flaky test: <name>` (task, priority 2, label `flaky`, scoped to the file that holds
+/// the test) for each test that failed outside the branch and passed on the rerun, unless an open issue
+/// with that title exists. Best effort: a store error is reported on stderr and must not fail a merge
+/// whose gates are green.
+fn file_flaky_issues(ctx: &Ctx, item: &MergeItem, gate: &str, tests: &[ForeignTest], failed_tail: &str) {
+    let existing = match ctx.store.list_issues(&IssueFilter::default()) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("asf merge: cannot look for open flaky-test issues: {e}");
+            return;
+        }
+    };
+    let main_sha = rebased_onto_of(ctx, item).unwrap_or_else(|| "unknown".into());
+    for t in tests {
+        let title = format!("Flaky test: {}", t.name);
+        if existing
+            .iter()
+            .any(|i| i.title == title && !i.status.is_terminal())
+        {
+            continue;
+        }
+        let body = format!(
+            "The `{gate}` gate of the merge queue failed on `{}` while merging {} ({}, rebased onto main at {main_sha}). \
+             The test lives in `{}`, which the branch did not change, and a rerun of the gate passed.\n\n\
+             Tail of the failed run:\n\n```\n{}\n```",
+            t.name,
+            item.issue_id,
+            item.branch,
+            t.file,
+            last_lines(failed_tail, 15)
+        );
+        let filed = ctx.store.create_issue(&NewIssue {
+            title,
+            body,
+            labels: vec![FLAKY_LABEL.into()],
+            file_scope: vec![t.file.clone()],
+            ..NewIssue::default()
+        });
+        if let Err(e) = filed {
+            eprintln!("asf merge: cannot file the flaky test {}: {e}", t.name);
+        }
+    }
 }
 
 /// Push + pull request, or a local fast-forward. With `park_if_dirty` (an approved review) a main
@@ -879,17 +989,21 @@ fn integrate(
 /// Whether the default branch of the main checkout is no longer at the commit the item was rebased
 /// onto. `item` may be a stale snapshot, so `rebased_onto` is read from the store.
 fn main_moved_since_rebase(ctx: &Ctx, item: &MergeItem) -> bool {
-    let Ok(queue) = ctx.store.merge_queue() else {
-        return false;
-    };
-    let Some(base) = queue
-        .into_iter()
-        .find(|m| m.id == item.id)
-        .and_then(|m| m.rebased_onto)
-    else {
+    let Some(base) = rebased_onto_of(ctx, item) else {
         return false;
     };
     GitCli.head(&ctx.root).is_ok_and(|head| head != base)
+}
+
+/// The commit of the default branch the item was last rebased onto, read from the store (`item` may
+/// be a snapshot from before the rebase).
+fn rebased_onto_of(ctx: &Ctx, item: &MergeItem) -> Option<String> {
+    ctx.store
+        .merge_queue()
+        .ok()?
+        .into_iter()
+        .find(|m| m.id == item.id)
+        .and_then(|m| m.rebased_onto)
 }
 
 /// Puts an approved item whose fast-forward lost the race with another merge back to `queued`; no

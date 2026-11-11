@@ -684,3 +684,222 @@ sys.exit(101 if e else 0)",
         results[0].tail
     );
 }
+
+/// Failing tests named in a `cargo test` tail, and the source files they live in.
+mod failing_tests {
+    use std::path::Path;
+
+    use asf_vcs::gates::{failed_tests, foreign_tests, test_source_file, FailedTest, TestBinary};
+
+    const UNIT_TAIL: &str =
+        "     Running unittests src\\main.rs (target\\debug\\deps\\asf-ce36f34fbf868c1a.exe)\n\
+\n\
+running 2 tests\n\
+test commands::remind::flow_tests::finished_issues_and_older_runs_do_not_wait ... FAILED\n\
+test commands::remind::flow_tests::other ... ok\n\
+\n\
+failures:\n\
+\n\
+---- commands::remind::flow_tests::finished_issues_and_older_runs_do_not_wait stdout ----\n\
+thread 'x' panicked at crates\\asf\\src\\commands\\remind.rs:10:5:\n\
+assertion `left == right` failed\n  left: 1\n right: 2\n\
+\n\
+failures:\n    commands::remind::flow_tests::finished_issues_and_older_runs_do_not_wait\n\
+\n\
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s\n";
+
+    const NAME: &str = "commands::remind::flow_tests::finished_issues_and_older_runs_do_not_wait";
+
+    fn unit(krate: &str) -> Option<TestBinary> {
+        Some(TestBinary::Unit { krate: krate.into() })
+    }
+
+    fn write(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "// x\n").unwrap();
+    }
+
+    fn named(name: &str, binary: Option<TestBinary>) -> FailedTest {
+        FailedTest {
+            name: name.into(),
+            binary,
+        }
+    }
+
+    #[test]
+    fn reads_a_unit_test_failure_and_the_crate_from_the_running_line_above_it() {
+        let found = failed_tests(UNIT_TAIL);
+        assert_eq!(found, vec![named(NAME, unit("asf"))]);
+    }
+
+    #[test]
+    fn reads_an_integration_test_by_its_file_in_the_running_line() {
+        let tail = "     Running tests\\cli_serve.rs (target\\debug\\deps\\cli_serve-0123456789abcdef.exe)\n\
+running 1 test\n\
+test serve_stops ... FAILED\n\
+\n\
+failures:\n\
+\n\
+---- serve_stops stdout ----\n\
+boom\n\
+\n\
+failures:\n    serve_stops\n\
+\n\
+test result: FAILED. 0 passed; 1 failed\n";
+        assert_eq!(
+            failed_tests(tail),
+            vec![named(
+                "serve_stops",
+                Some(TestBinary::Integration {
+                    file: "tests/cli_serve.rs".into()
+                })
+            )]
+        );
+    }
+
+    /// The gate output is stdout followed by stderr, and cargo prints `Running` on stderr: the line
+    /// that names the binary comes after the failures, and the last one is the binary that failed.
+    #[test]
+    fn a_running_line_after_the_failures_names_their_binary() {
+        let tail = "failures:\n    a::b::tests::x\n\ntest result: FAILED. 0 passed; 1 failed\n    Finished `test` profile\n     Running unittests src/lib.rs (target/debug/deps/asf_vcs-0123456789abcdef)\n\
+error: test failed, to rerun pass `-p asf-vcs --lib`\n";
+        assert_eq!(failed_tests(tail), vec![named("a::b::tests::x", unit("asf-vcs"))]);
+    }
+
+    #[test]
+    fn lists_each_failed_test_once_in_the_order_seen() {
+        let tail = "     Running unittests src/lib.rs (target/debug/deps/asf_core-aa)\n\
+---- one stdout ----\nx\n---- two stdout ----\ny\n\nfailures:\n    two\n    one\n\ntest result: FAILED.\n";
+        let names: Vec<String> = failed_tests(tail).into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["one", "two"]);
+    }
+
+    #[test]
+    fn a_doc_test_and_a_tail_without_failures_map_to_nothing() {
+        let doc = "   Doc-tests asf_core\n---- src/lib.rs - foo (line 3) stdout ----\nboom\n\nfailures:\n    src/lib.rs - foo (line 3)\n\ntest result: FAILED.\n";
+        let found = failed_tests(doc);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].binary, Some(TestBinary::Doc));
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(test_source_file(dir.path(), &found[0]), None);
+        assert!(failed_tests("error[E0432]: unresolved import\nerror: could not compile `asf`\n").is_empty());
+        assert!(failed_tests("").is_empty());
+    }
+
+    #[test]
+    fn a_name_without_a_binary_has_no_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf/src/a.rs");
+        assert_eq!(test_source_file(dir.path(), &named("a::t", None)), None);
+        let tail = "---- a::t stdout ----\nx\n";
+        assert_eq!(failed_tests(tail), vec![named("a::t", None)]);
+    }
+
+    #[test]
+    fn a_module_path_maps_to_the_file_that_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf/src/commands/remind.rs");
+        write(dir.path(), "crates/asf/src/main.rs");
+        let t = named(NAME, unit("asf"));
+        // `flow_tests` is an inline module of remind.rs: the longest prefix that is a file wins
+        assert_eq!(
+            test_source_file(dir.path(), &t).as_deref(),
+            Some("crates/asf/src/commands/remind.rs")
+        );
+    }
+
+    #[test]
+    fn a_module_directory_maps_to_its_mod_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf-core/src/config/mod.rs");
+        let t = named("config::tests::parses", unit("asf-core"));
+        assert_eq!(
+            test_source_file(dir.path(), &t).as_deref(),
+            Some("crates/asf-core/src/config/mod.rs")
+        );
+    }
+
+    #[test]
+    fn a_test_in_no_module_file_maps_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf-core/src/lib.rs");
+        // `tests` is declared in lib.rs itself: the crate root is not guessed at
+        let t = named("tests::it_works", unit("asf-core"));
+        assert_eq!(test_source_file(dir.path(), &t), None);
+        // a crate that is not under crates/ has no file either
+        let elsewhere = named("a::t", unit("nope"));
+        assert_eq!(test_source_file(dir.path(), &elsewhere), None);
+    }
+
+    #[test]
+    fn an_integration_test_maps_to_the_one_crate_that_has_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf/tests/cli_serve.rs");
+        let t = named(
+            "serve_stops",
+            Some(TestBinary::Integration {
+                file: "tests/cli_serve.rs".into(),
+            }),
+        );
+        assert_eq!(
+            test_source_file(dir.path(), &t).as_deref(),
+            Some("crates/asf/tests/cli_serve.rs")
+        );
+        // two crates with the same file name: which one ran is not known, so nothing is claimed
+        write(dir.path(), "crates/other/tests/cli_serve.rs");
+        assert_eq!(test_source_file(dir.path(), &t), None);
+    }
+
+    fn tail_of(names: &[&str], binary: &str) -> String {
+        let mut s = format!("     Running {binary}\n");
+        for n in names {
+            s.push_str(&format!("---- {n} stdout ----\nboom\n"));
+        }
+        s.push_str("\nfailures:\n");
+        for n in names {
+            s.push_str(&format!("    {n}\n"));
+        }
+        s.push_str("\ntest result: FAILED.\n");
+        s
+    }
+
+    const BIN: &str = "unittests src\\main.rs (target\\debug\\deps\\asf-ce36.exe)";
+
+    #[test]
+    fn a_failure_is_foreign_when_no_failing_test_lives_in_a_changed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf/src/commands/remind.rs");
+        let tail = tail_of(&[NAME], BIN);
+        let changed = vec!["crates/asf/src/commands/merge.rs".to_string()];
+        let foreign = foreign_tests(dir.path(), &tail, &changed).expect("foreign");
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].name, NAME);
+        assert_eq!(foreign[0].file, "crates/asf/src/commands/remind.rs");
+    }
+
+    #[test]
+    fn a_failure_is_the_branchs_when_any_failing_test_lives_in_a_changed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf/src/commands/remind.rs");
+        write(dir.path(), "crates/asf/src/commands/merge.rs");
+        let tail = tail_of(&[NAME, "commands::merge::tests::mine"], BIN);
+        let changed = vec!["crates/asf/src/commands/merge.rs".to_string()];
+        assert_eq!(foreign_tests(dir.path(), &tail, &changed), None);
+    }
+
+    #[test]
+    fn an_unmapped_name_or_a_tail_without_failures_is_never_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/asf/src/commands/remind.rs");
+        let changed = vec!["README.md".to_string()];
+        // the file for the second name does not exist: unknown counts as the branch's
+        let tail = tail_of(&[NAME, "ghost::tests::x"], BIN);
+        assert_eq!(foreign_tests(dir.path(), &tail, &changed), None);
+        assert_eq!(
+            foreign_tests(dir.path(), "error: could not compile\n", &changed),
+            None
+        );
+        assert_eq!(foreign_tests(dir.path(), "", &changed), None);
+    }
+}

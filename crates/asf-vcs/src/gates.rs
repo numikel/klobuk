@@ -412,6 +412,175 @@ pub fn stage_specs(gates: &[GateCfg], stage: GateWhen) -> Vec<GateSpec> {
         .collect()
 }
 
+/// The test binary a `cargo test` run printed in its `Running ...` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestBinary {
+    /// `Running unittests <root> (...<exe>)`: `krate` is the directory name under `crates/` (the exe
+    /// name without its hash, `_` read as `-`).
+    Unit { krate: String },
+    /// `Running tests/<file>.rs (...)`: the crate is not in the line, only the file.
+    Integration { file: String },
+    /// `Doc-tests <crate>`: a doc test has no module path to follow.
+    Doc,
+}
+
+/// One failing test of a `cargo test` tail. `binary` is `None` when the tail does not say which
+/// binary it ran in (the `Running` line was cut off).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedTest {
+    pub name: String,
+    pub binary: Option<TestBinary>,
+}
+
+/// A failing test that the branch did not touch, with the file it lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignTest {
+    pub name: String,
+    pub file: String,
+}
+
+/// The binary named by a `Running ...` or `Doc-tests ...` line. `Some(None)` is a line that starts a
+/// run but that this reader cannot make sense of (an older cargo format): the binary is then unknown.
+fn binary_of(line: &str) -> Option<Option<TestBinary>> {
+    let t = line.trim_start();
+    if t.starts_with("Doc-tests ") {
+        return Some(Some(TestBinary::Doc));
+    }
+    let rest = t.strip_prefix("Running ")?;
+    let Some((head, exe)) = rest.split_once(" (") else {
+        return Some(None);
+    };
+    let head = head.replace('\\', "/");
+    if head.starts_with("unittests ") {
+        let exe = exe.trim_end_matches(')').replace('\\', "/");
+        let file = exe.rsplit('/').next().unwrap_or("");
+        let file = file.strip_suffix(".exe").unwrap_or(file);
+        let krate = file.rsplit_once('-').map_or(file, |(name, _hash)| name);
+        return Some(Some(TestBinary::Unit {
+            krate: krate.replace('_', "-"),
+        }));
+    }
+    Some(Some(TestBinary::Integration {
+        file: head.trim().to_string(),
+    }))
+}
+
+/// The tests a `cargo test` tail reports as failed: the `---- <name> stdout ----` headers and the
+/// indented `failures:` list, each name once, in the order first seen.
+///
+/// A name belongs to the nearest `Running` line above it. The gate output is stdout followed by
+/// stderr and cargo prints `Running` on stderr, so a name with none above it takes the last binary
+/// of the tail: without `--no-fail-fast` cargo stops at the first failing binary, which is the last
+/// one that ran.
+pub fn failed_tests(tail: &str) -> Vec<FailedTest> {
+    let mut found: Vec<FailedTest> = Vec::new();
+    let mut current: Option<TestBinary> = None;
+    let mut last: Option<TestBinary> = None;
+    let mut in_list = false;
+    let mut listed = false;
+    fn add(name: &str, binary: &Option<TestBinary>, found: &mut Vec<FailedTest>) {
+        if !name.is_empty() && !found.iter().any(|f| f.name == name) {
+            found.push(FailedTest {
+                name: name.to_string(),
+                binary: binary.clone(),
+            });
+        }
+    }
+    for line in tail.lines() {
+        if let Some(binary) = binary_of(line) {
+            current = binary;
+            last = current.clone();
+            in_list = false;
+            continue;
+        }
+        let t = line.trim();
+        if t == "failures:" {
+            (in_list, listed) = (true, false);
+            continue;
+        }
+        if in_list {
+            if line.starts_with("    ") && !t.is_empty() {
+                add(t, &current, &mut found);
+                listed = true;
+                continue;
+            }
+            if t.is_empty() && !listed {
+                continue;
+            }
+            in_list = false;
+        }
+        if let Some(name) = t
+            .strip_prefix("---- ")
+            .and_then(|r| r.strip_suffix(" stdout ----"))
+        {
+            add(name.trim(), &current, &mut found);
+        }
+    }
+    for f in &mut found {
+        if f.binary.is_none() {
+            f.binary = last.clone();
+        }
+    }
+    found
+}
+
+/// The source file (relative to `repo`, `/` separators) that holds `test`, or `None` when it cannot
+/// be told.
+///
+/// A unit test `a::b::tests::name` is looked up as `crates/<crate>/src/a/b/tests.rs`, then
+/// `.../a/b/tests/mod.rs`, then the same for `a/b`, then `a`: the longest module prefix that is a
+/// file wins, which is how an inline `mod tests` ends up in its parent's file. No such file means
+/// no answer (a module declared in the crate root or through `#[path]` is not guessed at). An
+/// integration test is `crates/*/tests/<file>`, and only when exactly one crate has that file.
+pub fn test_source_file(repo: &Path, test: &FailedTest) -> Option<String> {
+    let is_file = |rel: &str| repo.join(rel).is_file();
+    match test.binary.as_ref()? {
+        TestBinary::Doc => None,
+        TestBinary::Unit { krate } => {
+            let modules: Vec<&str> = test.name.split("::").collect();
+            let modules = &modules[..modules.len() - 1];
+            for len in (1..=modules.len()).rev() {
+                let module = modules[..len].join("/");
+                for candidate in [
+                    format!("crates/{krate}/src/{module}.rs"),
+                    format!("crates/{krate}/src/{module}/mod.rs"),
+                ] {
+                    if is_file(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        }
+        TestBinary::Integration { file } => {
+            let mut hits = std::fs::read_dir(repo.join("crates"))
+                .ok()?
+                .flatten()
+                .filter(|c| c.path().join(file).is_file())
+                .map(|c| format!("crates/{}/{file}", c.file_name().to_string_lossy()));
+            let first = hits.next()?;
+            hits.next().is_none().then_some(first)
+        }
+    }
+}
+
+/// The failing tests of a gate `tail` when every one of them lives in a file outside `changed` (the
+/// branch's own diff, repo-relative with `/`). `None` when the tail names no test, or when any test
+/// maps to a changed file or to no file at all: what cannot be placed counts as the branch's own.
+pub fn foreign_tests(repo: &Path, tail: &str, changed: &[String]) -> Option<Vec<ForeignTest>> {
+    let tests = failed_tests(tail);
+    if tests.is_empty() {
+        return None;
+    }
+    tests
+        .into_iter()
+        .map(|t| {
+            let file = test_source_file(repo, &t).filter(|f| !changed.contains(f))?;
+            Some(ForeignTest { name: t.name, file })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::locked_files;

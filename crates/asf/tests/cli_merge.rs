@@ -1646,3 +1646,194 @@ fn a_reviewer_that_started_resets_the_count_of_failed_starts() {
     );
     assert_eq!(item_state(&f), MergeState::Queued);
 }
+
+// ---- a gate failure on a test outside the branch is rerun once and filed as flaky ------------------
+
+const FLAKY_TEST: &str = "remind::flow_tests::waits";
+const FLAKY_FILE: &str = "crates/foo/src/remind.rs";
+
+/// A queued item whose merge gate `test` prints a `cargo test` failure for one test on its first
+/// `fail_times` runs and passes afterwards. `counter` holds how many times the gate has run.
+struct Flaky {
+    f: F,
+    issue: String,
+    counter: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn flaky_setup(scope: &str, worker_file: &str, test: &str, fail_times: u32) -> Flaky {
+    let f = setup();
+    commit_in(f.repo.path(), "crates/foo/src/main.rs", "fn main() {}\n");
+    commit_in(f.repo.path(), FLAKY_FILE, "// holds the flaky test\n");
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    let lines = [
+        "import sys",
+        "counter, fail_times, test = sys.argv[1], int(sys.argv[2]), sys.argv[3]",
+        "try:",
+        "    n = int(open(counter).read())",
+        "except OSError:",
+        "    n = 0",
+        "open(counter, 'w').write(str(n + 1))",
+        "if n >= fail_times:",
+        "    print('all tests passed')",
+        "    sys.exit(0)",
+        "print('     Running unittests src/main.rs (target/debug/deps/foo-0123456789abcdef.exe)')",
+        "print('running 1 test')",
+        "print('test ' + test + ' ... FAILED')",
+        "print('')",
+        "print('failures:')",
+        "print('')",
+        "print('---- ' + test + ' stdout ----')",
+        "print('thread panicked: the reminder was late')",
+        "print('')",
+        "print('failures:')",
+        "print('    ' + test)",
+        "print('')",
+        "print('test result: FAILED. 0 passed; 1 failed')",
+        "sys.exit(101)",
+    ];
+    std::fs::write(&script, lines.join("\n")).unwrap();
+    let counter = dir.path().join("count");
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"test\"\nwhen = [\"merge\"]\ncmd = ['python', '{}', '{}', '{fail_times}', '{test}']\n",
+        fwd(&script),
+        fwd(&counter)
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "gate"]);
+    let issue = f
+        .repo
+        .create_issue("flaky feature", &["--ready", "--scope", scope]);
+    finished_run_of(&f, &issue, &[(worker_file, "x\n")]);
+    Flaky {
+        f,
+        issue,
+        counter,
+        _dir: dir,
+    }
+}
+
+/// How many times the gate has run.
+fn gate_runs(fl: &Flaky) -> u32 {
+    std::fs::read_to_string(&fl.counter)
+        .map(|s| s.trim().parse().unwrap())
+        .unwrap_or(0)
+}
+
+fn flaky_issues(f: &F) -> Vec<Issue> {
+    store(f)
+        .list_issues(&IssueFilter::default())
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.title.starts_with("Flaky test: "))
+        .collect()
+}
+
+fn foreign_rerun_events(f: &F) -> Vec<Event> {
+    store(f)
+        .events_since(0, 10_000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "merge.gate_rerun_foreign")
+        .collect()
+}
+
+#[test]
+fn a_gate_that_fails_on_a_test_outside_the_branch_is_rerun_once_and_filed_as_flaky() {
+    let fl = flaky_setup("src/**", "src/greet.rs", FLAKY_TEST, 1);
+    let f = &fl.f;
+    let main_before = git_head(f);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(
+        gate_runs(&fl),
+        2,
+        "the gate ran, failed on a foreign test and ran again"
+    );
+    let item = &store(f).merge_queue().unwrap()[0];
+    assert_eq!(item.attempts, 1, "the rerun is not an attempt");
+    assert!(item.gate_results.iter().all(|g| g.ok), "{:?}", item.gate_results);
+
+    let issues = flaky_issues(f);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    let i = &issues[0];
+    assert_eq!(i.title, format!("Flaky test: {FLAKY_TEST}"));
+    assert_eq!((i.kind, i.priority), (IssueType::Task, 2));
+    assert_eq!(i.labels, ["flaky"]);
+    assert_eq!(i.file_scope, [FLAKY_FILE]);
+    assert!(i.body.contains(&format!("feat/{}", fl.issue)), "{}", i.body);
+    assert!(i.body.contains(&main_before), "main sha in the body: {}", i.body);
+    assert!(
+        i.body.contains("the reminder was late"),
+        "gate tail excerpt: {}",
+        i.body
+    );
+
+    let events = foreign_rerun_events(f);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].payload["tests"], serde_json::json!([FLAKY_TEST]));
+    assert_eq!(events[0].payload["gate"], "test");
+}
+
+#[test]
+fn an_open_issue_with_the_same_title_is_not_filed_again_but_a_closed_one_is() {
+    let fl = flaky_setup("src/**", "src/greet.rs", FLAKY_TEST, 1);
+    let f = &fl.f;
+    let title = format!("Flaky test: {FLAKY_TEST}");
+    f.repo.create_issue(&title, &[]);
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(flaky_issues(f).len(), 1, "the open one is enough");
+
+    // a closed issue does not stand in the way: the next flake is a new report
+    let again = flaky_setup("src/**", "src/greet.rs", FLAKY_TEST, 1);
+    let g = &again.f;
+    let closed = g.repo.create_issue(&title, &[]);
+    g.repo.ok(&["issue", "status", &closed, "done"]);
+    g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(flaky_issues(g).len(), 2, "the closed one and the new report");
+}
+
+#[test]
+fn a_rerun_that_fails_again_is_an_ordinary_failure_and_files_nothing() {
+    let fl = flaky_setup("src/**", "src/greet.rs", FLAKY_TEST, 2);
+    let f = &fl.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(gate_runs(&fl), 2, "one rerun, not more");
+    assert_eq!(foreign_rerun_events(f).len(), 1);
+    assert!(flaky_issues(f).is_empty());
+    let item = &store(f).merge_queue().unwrap()[0];
+    assert_eq!(item.attempts, 1);
+    assert!(item.last_error.as_deref().unwrap().contains("gate `test` failed"));
+    let cs = store(f).comments(&fl.issue.parse().unwrap()).unwrap();
+    assert!(cs
+        .iter()
+        .any(|c| c.kind == CommentType::Blocker && c.body.contains("gate `test` failed")));
+}
+
+#[test]
+fn a_failing_test_in_a_file_the_branch_changed_is_not_rerun() {
+    let fl = flaky_setup("crates/**", FLAKY_FILE, FLAKY_TEST, 1);
+    let f = &fl.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(gate_runs(&fl), 1, "the worker's own failure is not rerun");
+    assert!(foreign_rerun_events(f).is_empty());
+    assert!(flaky_issues(f).is_empty());
+}
+
+#[test]
+fn a_failing_test_that_maps_to_no_file_counts_as_the_branchs_own() {
+    let fl = flaky_setup("src/**", "src/greet.rs", "ghost::tests::unknown", 1);
+    let f = &fl.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(gate_runs(&fl), 1);
+    assert!(foreign_rerun_events(f).is_empty());
+    assert!(flaky_issues(f).is_empty());
+}
