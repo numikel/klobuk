@@ -16,6 +16,23 @@ fn fake_repo() -> Repo {
     repo
 }
 
+/// A pulse the way `asf serve` writes it; `stop_reason` makes it a clean stop.
+fn write_pulse(repo: &Repo, last_tick_at: &str, stop_reason: Option<&str>) {
+    let dir = repo.path().join(".factory/runs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pulse = serde_json::json!({
+        "pid": std::process::id(), "started_at": last_tick_at, "last_tick_at": last_tick_at,
+        "mode": "dispatch", "interval_s": 10, "max_ticks": 633, "ticks": 633,
+        "stopped_at": stop_reason.map(|_| last_tick_at), "stop_reason": stop_reason,
+    });
+    std::fs::write(dir.join("serve.json"), pulse.to_string()).unwrap();
+}
+
+/// A loop that ticked a moment ago, so a test about something else sees a healthy header.
+fn live_loop(repo: &Repo) {
+    write_pulse(repo, &now_rfc3339(), None);
+}
+
 #[test]
 fn tui_once_prints_a_frame_with_board_and_running_issue() {
     let repo = fake_repo();
@@ -354,6 +371,7 @@ fn the_verify_and_retry_children_print_the_fields_the_now_view_summarises() {
 #[test]
 fn tui_once_opens_on_the_now_view_and_view_now_shows_the_same_frame() {
     let repo = fake_repo();
+    live_loop(&repo);
     let first =
         String::from_utf8_lossy(&repo.asf().args(["tui", "--once"]).output().unwrap().stdout).to_string();
     let lines: Vec<&str> = first.lines().collect();
@@ -372,8 +390,11 @@ fn tui_once_opens_on_the_now_view_and_view_now_shows_the_same_frame() {
         assert!(first.contains(needle), "{needle:?}:\n{first}");
     }
     assert!(!first.contains("backlog 0"), "not the Board:\n{first}");
-    assert_eq!(first, tui_once_view(&repo, "now"));
-    assert_ne!(first, tui_once_view(&repo, "board"));
+    // the header carries the age of the pulse, which moves between two runs: compare the rest
+    let below_header = |t: &str| t.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(lines[0].contains("loop ok "), "{first}");
+    assert_eq!(below_header(&first), below_header(&tui_once_view(&repo, "now")));
+    assert_ne!(below_header(&first), below_header(&tui_once_view(&repo, "board")));
     // the viewing keys of the footer are the ones of the Now view
     let footer = first.lines().rfind(|l| !l.trim().is_empty()).unwrap();
     assert!(
@@ -425,6 +446,7 @@ fn tui_once_now_lists_what_needs_you_what_runs_what_is_next_and_what_is_done() {
     )
     .unwrap();
     repo.ok(&["issue", "status", &shipped, "done"]);
+    live_loop(&repo);
 
     let text = tui_once_view(&repo, "now");
     assert!(line_with(&text, 0).contains("3 waiting"), "{text}");
@@ -531,4 +553,55 @@ fn tui_once_with_no_color_set_prints_the_same_text_and_still_no_escapes() {
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("NEEDS YOU") && !text.contains("\u{1b}["), "{text}");
+}
+
+#[test]
+fn tui_once_header_says_loop_ok_with_a_fresh_pulse_and_no_banner() {
+    let repo = fake_repo();
+    live_loop(&repo);
+    for view in ["now", "board", "queue"] {
+        let text = tui_once_view(&repo, view);
+        let head = line_with(&text, 0);
+        assert!(
+            head.contains("loop ok ") && !head.contains("LOOP STOPPED"),
+            "{view}: {head}"
+        );
+        assert!(
+            !text.contains("the loop"),
+            "{view}:
+{text}"
+        );
+    }
+}
+
+#[test]
+fn tui_once_without_a_pulse_says_the_loop_is_not_running_everywhere() {
+    let repo = fake_repo();
+    let now = tui_once_view(&repo, "now");
+    assert!(line_with(&now, 0).contains("loop not running"), "{now}");
+    assert!(
+        now.contains("NEEDS YOU (1)") && now.contains("Enter explain"),
+        "{now}"
+    );
+    let board = tui_once_view(&repo, "board");
+    assert!(
+        line_with(&board, 2).contains("the loop is not running — start it: asf serve --dispatch"),
+        "{board}"
+    );
+}
+
+#[test]
+fn tui_once_shows_why_a_stopped_loop_stopped_in_the_header_and_the_banner() {
+    let repo = fake_repo();
+    write_pulse(&repo, "2020-01-01T00:00:00Z", Some("max_ticks"));
+    let board = tui_once_view(&repo, "board");
+    assert!(line_with(&board, 0).contains("LOOP STOPPED"), "{board}");
+    let banner = line_with(&board, 2);
+    assert!(
+        banner.contains("max_ticks (633) — start it again: asf serve --dispatch"),
+        "{board}"
+    );
+    // a pulse that just went silent without a stop is "without a reason"
+    write_pulse(&repo, "2020-01-01T00:00:00Z", None);
+    assert!(line_with(&tui_once_view(&repo, "agents"), 2).contains("without a reason"));
 }
