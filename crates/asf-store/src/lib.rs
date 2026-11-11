@@ -7,6 +7,7 @@
 mod jsonl;
 mod row;
 mod runs;
+pub mod serve_pulse;
 
 use std::io::{BufRead, Write};
 use std::path::Path;
