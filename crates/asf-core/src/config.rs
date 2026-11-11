@@ -339,6 +339,25 @@ impl Default for NotifyCfg {
     }
 }
 
+/// `[serve]`: defaults of the `asf serve` loop; the `--interval` and `--max-ticks` flags override them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServeCfg {
+    /// Seconds between ticks (>= 1).
+    pub interval_s: u64,
+    /// With `--until-done`: stop after this many ticks (>= 1). Absent: no limit.
+    pub max_ticks: Option<u64>,
+}
+
+impl Default for ServeCfg {
+    fn default() -> Self {
+        ServeCfg {
+            interval_s: 10,
+            max_ticks: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -354,6 +373,7 @@ pub struct Config {
     pub planner: PlannerCfg,
     pub methodology: MethodologyCfg,
     pub notify: NotifyCfg,
+    pub serve: ServeCfg,
 }
 
 const TEMPLATE: &str = r#"# auto-software-factory configuration (committed). Unknown sections are ignored.
@@ -432,6 +452,10 @@ after_minutes = 15 # first reminder this long after the notification; 0 switches
 every_minutes = 30 # then again this often while it still waits; 0 reminds only once
 # command = ["pwsh", "-File", "notify.ps1"]  # optional, run once per notification or reminder without a shell (10 s limit) with
 #                                            # ASF_REMIND_ISSUE, ASF_REMIND_KIND, ASF_REMIND_AGE_MINUTES, ASF_REMIND_TEXT set
+
+[serve]                   # defaults of `asf serve`; the --interval and --max-ticks flags override them (restart serve to apply)
+interval_s = 10           # seconds between ticks; >= 1
+# max_ticks = 600         # with --until-done: stop after this many ticks (the pulse and the TUI then say `max_ticks`); absent: no limit
 "#;
 
 impl Config {
@@ -520,6 +544,12 @@ impl Config {
                 self.merge.github.method
             )));
         }
+        if self.serve.interval_s == 0 {
+            return Err(ConfigError::Invalid("serve.interval_s must be >= 1".into()));
+        }
+        if self.serve.max_ticks == Some(0) {
+            return Err(ConfigError::Invalid("serve.max_ticks must be >= 1".into()));
+        }
         if !matches!(self.merge.target.as_str(), "local" | "github") {
             return Err(ConfigError::Invalid(format!(
                 "merge.target `{}` must be local or github",
@@ -562,6 +592,19 @@ mod tests {
     fn default_template_parses_to_default() {
         let c = Config::from_toml(Config::default_toml()).unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn serve_defaults_and_limits() {
+        let c = Config::from_toml("").unwrap();
+        assert_eq!(c.serve.interval_s, 10);
+        assert_eq!(c.serve.max_ticks, None);
+        let c = Config::from_toml("[serve]\ninterval_s = 5\nmax_ticks = 600\n").unwrap();
+        assert_eq!((c.serve.interval_s, c.serve.max_ticks), (5, Some(600)));
+        for bad in ["interval_s = 0", "max_ticks = 0"] {
+            let e = Config::from_toml(&format!("[serve]\n{bad}\n")).unwrap_err();
+            assert!(matches!(e, ConfigError::Invalid(_)), "{bad}: {e}");
+        }
     }
 
     #[test]

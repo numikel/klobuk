@@ -141,7 +141,7 @@ fn unparsable_document_is_a_parse_error() {
 }
 
 #[test]
-fn editable_keys_are_exactly_the_fifteen_named_in_the_briefs() {
+fn editable_keys_are_exactly_the_seventeen_named_in_the_briefs() {
     // In the order of the Config view: models, budgets, flow, notifications.
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
     assert_eq!(
@@ -159,6 +159,8 @@ fn editable_keys_are_exactly_the_fifteen_named_in_the_briefs() {
             "merge.verify_main_after",
             "merge.clean_after",
             "worker.remote_control",
+            "serve.interval_s",
+            "serve.max_ticks",
             "notify.on_new",
             "notify.after_minutes",
             "notify.every_minutes",
@@ -196,6 +198,8 @@ fn fields_carry_the_labels_and_groups_of_the_view() {
         ("merge.verify_main_after", "Gates on main", ConfigGroup::Flow),
         ("merge.clean_after", "Clean up after merge", ConfigGroup::Flow),
         ("worker.remote_control", "Remote control", ConfigGroup::Flow),
+        ("serve.interval_s", "Loop interval (s)", ConfigGroup::Flow),
+        ("serve.max_ticks", "Loop tick limit", ConfigGroup::Flow),
     ] {
         assert_eq!((get(key).label, get(key).group), (label, group), "{key}");
     }
@@ -243,6 +247,8 @@ fn field_kinds_are_choice_bool_number_or_text() {
         "worker.budget_usd",
         "scheduler.max_parallel",
         "review.max_rounds",
+        "serve.interval_s",
+        "serve.max_ticks",
         "notify.after_minutes",
         "notify.every_minutes",
     ] {
@@ -271,8 +277,10 @@ fn field_defaults_are_read_from_config_default() {
         get("worker.remote_control").default_value().as_deref(),
         Some("false")
     );
+    assert_eq!(get("serve.interval_s").default_value().as_deref(), Some("10"));
     // an optional key that is absent by default has no default value to write
     assert_eq!(get("worker.model").default_value(), None);
+    assert_eq!(get("serve.max_ticks").default_value(), None);
 }
 
 #[test]
@@ -524,4 +532,25 @@ fn clean_after_refuses_a_kind_that_does_not_exist_and_a_bare_word() {
         let e = set_key(Config::default_toml(), "merge.clean_after", bad).unwrap_err();
         assert!(matches!(e, ConfigError::Parse(_)), "{bad}: {e}");
     }
+}
+
+#[test]
+fn serve_keys_set_validate_and_the_tick_limit_can_be_unset() {
+    let out = set_key("", "serve.interval_s", "5").unwrap();
+    assert_eq!(Config::from_toml(&out).unwrap().serve.interval_s, 5);
+    assert!(
+        set_key("", "serve.interval_s", "0").is_err(),
+        "an interval of 0 is refused"
+    );
+    let out = set_key("", "serve.max_ticks", "600").unwrap();
+    assert_eq!(Config::from_toml(&out).unwrap().serve.max_ticks, Some(600));
+    assert!(set_key("", "serve.max_ticks", "0").is_err());
+    let back = asf_core::config_edit::unset_key(&out, "serve.max_ticks").unwrap();
+    assert_eq!(Config::from_toml(&back).unwrap().serve.max_ticks, None);
+    assert!(asf_core::config_edit::unset_key(&out, "serve.interval_s").is_err());
+    assert_eq!(
+        asf_core::config_edit::applies("serve.interval_s"),
+        asf_core::config_edit::Applies::Restart,
+        "the loop reads [serve] once, at start"
+    );
 }

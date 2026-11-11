@@ -42,6 +42,14 @@ const EDITABLE: &[(&str, &str)] = &[
         "worker and reviewer sessions join Remote Control (claude.ai/code, mobile app)",
     ),
     (
+        "serve.interval_s",
+        "seconds between ticks of `asf serve` (the --interval flag overrides it)",
+    ),
+    (
+        "serve.max_ticks",
+        "with --until-done: stop `asf serve` after this many ticks (unset: no limit; --max-ticks overrides it)",
+    ),
+    (
         "notify.on_new",
         "notify at once when something new waits for you (false: only reminders)",
     ),
@@ -90,6 +98,9 @@ const APPLIES: &[(&str, Applies)] = &[
     ("merge.verify_main_after", Applies::NextTick),
     ("merge.clean_after", Applies::NextTick),
     ("worker.remote_control", Applies::NextTick),
+    // the loop reads both once when it starts: a flag may override them, so a live re-read would lie
+    ("serve.interval_s", Applies::Restart),
+    ("serve.max_ticks", Applies::Restart),
     ("notify.on_new", Applies::NextTick),
     ("notify.after_minutes", Applies::NextTick),
     ("notify.every_minutes", Applies::NextTick),
@@ -272,6 +283,20 @@ const FIELDS: &[ConfigField] = &[
         help: "sessions show up in claude.ai/code and mobile app",
     },
     ConfigField {
+        key: "serve.interval_s",
+        label: "Loop interval (s)",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Number,
+        help: "seconds between ticks of `asf serve`",
+    },
+    ConfigField {
+        key: "serve.max_ticks",
+        label: "Loop tick limit",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Number,
+        help: "with --until-done the loop stops after this many ticks",
+    },
+    ConfigField {
         key: "notify.on_new",
         label: "Notify at once",
         group: ConfigGroup::Notifications,
@@ -356,7 +381,7 @@ pub fn set_key(toml: &str, key: &str, value: &str) -> Result<String, ConfigError
 
 /// Optional keys: removing one is safe because the loader falls back to a default (`worker.model`
 /// to the Claude Code default, `review.model` to `opus`). Every other key is required.
-const UNSETTABLE: &[&str] = &["worker.model", "review.model"];
+const UNSETTABLE: &[&str] = &["worker.model", "review.model", "serve.max_ticks"];
 
 /// The keys [`unset_key`] accepts.
 pub fn unsettable_keys() -> &'static [&'static str] {
@@ -365,7 +390,7 @@ pub fn unsettable_keys() -> &'static [&'static str] {
 
 /// Removes the dotted `key` from the TOML document `toml` and returns the new text.
 ///
-/// Only optional keys (`worker.model`, `review.model`) can be removed; any other key, known or not,
+/// Only optional keys (`worker.model`, `review.model`, `serve.max_ticks`) can be removed; any other key, known or not,
 /// is refused with [`ConfigError::Invalid`]. Removing a key that is absent returns `toml` unchanged.
 /// Other comments, key order and formatting survive; the comment lines directly above the removed
 /// key go with it. The result is validated with [`Config::from_toml`] before it is returned.
@@ -455,6 +480,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 15);
+        assert_eq!(EDITABLE.len(), 17);
     }
 }
