@@ -1701,7 +1701,7 @@ fn a_loop_that_stops_for_a_reason_leaves_stopped_at_and_the_reason() {
     assert!(p["stopped_at"].is_string(), "{p}");
     assert_eq!(p["ticks"], 1, "{p}");
     assert_eq!(p["mode"], "observe", "{p}");
-    assert_eq!(p["pid"].as_u64().unwrap() > 0, true);
+    assert!(p["pid"].as_u64().unwrap() > 0, "{p}");
 
     // stuck (exit 3 happens after the pulse is written)
     let repo = Repo::initialised();

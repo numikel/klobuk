@@ -19,6 +19,13 @@
 //! without restarting the loop. Tick reports and the summary carry `questions_waiting`: the
 //! unanswered QUESTIONs to the human plus the runs in `blocked`, i.e. what waits for the operator.
 //!
+//! The loop writes a pulse (`.factory/runs/serve.json`, see `asf_store::serve_pulse`) at start and after
+//! every tick, and the reason when it stops on its own (`all_done`, `max_ticks`, `stuck`, `error: ..`).
+//! The TUI header and banner and `asf repo doctor` read it; a killed loop leaves a pulse that goes
+//! stale. A second loop on a repo whose pulse is fresh and whose pid is alive is refused, a stale or
+//! stopped pulse is taken over. `--interval` and `--max-ticks` win over `[serve]`; the config is
+//! re-read every tick. `--once` writes no pulse.
+//!
 //! The loop also tells the human what waits for them (`[notify]`, see `remind`): each tick report
 //! lists the `alerts` sent for things that just started to wait and the `reminders` for things that
 //! waited too long. One-shot commands never notify, only `serve`.
