@@ -1341,3 +1341,33 @@ fn plan_counts_active_worker_runs_not_held_claims_and_shows_both_limits() {
         String::from_utf8_lossy(&f.repo.asf().args(["run", "plan"]).output().unwrap().stdout).to_string();
     assert!(text.contains("workers 0/1 running"), "{text}");
 }
+
+#[test]
+fn a_run_env_alone_pins_the_lane_to_the_run_issue() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    let run = active_run(&f).id;
+    let say = |lane: &str| {
+        let out = f
+            .repo
+            .asf()
+            .env("ASF_RUN", &run)
+            .args([
+                "--lane", lane, "issue", "comment", &f.issue, "--type", "FYI", "--body", "n", "--json",
+            ])
+            .output()
+            .unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+            out.status.code(),
+        )
+    };
+    let (v, code) = say("human");
+    assert_eq!(
+        (code, v["error"]["code"].as_str()),
+        (Some(2), Some("usage")),
+        "{v}"
+    );
+    let (v, code) = say(&f.issue);
+    assert_eq!(code, Some(0), "{v}");
+}

@@ -20,6 +20,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Act as this lane (issue id, `orchestrator` or `human`). Default: env ASF_ISSUE, then worktree cwd.
+    /// Refused (exit 2) inside a worker (ASF_ISSUE / ASF_RUN set) unless it names the worker's own issue.
     #[arg(long, global = true, value_name = "LANE")]
     pub lane: Option<String>,
     /// Machine-readable output: `{"ok":true,"result":…}` or `{"ok":false,"error":{…}}`.

@@ -708,3 +708,88 @@ fn scope_rm_does_not_answer_scope_questions() {
     assert!(v.get("answered").is_none() || v["answered"] == serde_json::json!([]));
     assert!(comments_of(&r, &a).iter().all(|c| c["type"] != "ANSWER"));
 }
+
+// ---- a worker cannot pick its lane ------------------------------------------------------------
+
+/// `asf <args> --json` as a worker pane runs it: `ASF_ISSUE` set to the worker's issue.
+fn as_worker(r: &Repo, issue: &str, args: &[&str]) -> (serde_json::Value, i32) {
+    let out = r
+        .asf()
+        .env("ASF_ISSUE", issue)
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let v = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("not json: {e}\n{}", String::from_utf8_lossy(&out.stderr)));
+    (v, out.status.code().unwrap_or(-1))
+}
+
+fn comment_as_worker(r: &Repo, issue: &str, lane: Option<&str>) -> (serde_json::Value, i32) {
+    let mut args = Vec::new();
+    if let Some(l) = lane {
+        args.extend(["--lane", l]);
+    }
+    args.extend(["issue", "comment", issue, "--type", "FYI", "--body", "note"]);
+    as_worker(r, issue, &args)
+}
+
+#[test]
+fn a_worker_cannot_comment_as_human_orchestrator_or_another_issue() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    let qid = ask(&r, &a, "human", "which crate?");
+    for lane in ["human", "orchestrator", "asf-9"] {
+        let (v, code) = as_worker(
+            &r,
+            &a,
+            &[
+                "--lane",
+                lane,
+                "issue",
+                "comment",
+                &a,
+                "--type",
+                "ANSWER",
+                "--to",
+                &a,
+                "--reply-to",
+                &qid,
+                "--body",
+                "self-service",
+            ],
+        );
+        assert_eq!(code, 2, "--lane {lane}: {v}");
+        assert_eq!(v["error"]["code"], "usage", "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("a worker speaks only as its own lane"), "{msg}");
+        assert!(msg.contains(lane), "{msg}");
+    }
+    assert!(
+        comments_of(&r, &a).iter().all(|c| c["type"] != "ANSWER"),
+        "a refused call writes nothing"
+    );
+}
+
+#[test]
+fn a_worker_keeps_its_own_lane_with_or_without_the_flag() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    for lane in [Some(a.as_str()), None] {
+        let (v, code) = comment_as_worker(&r, &a, lane);
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["result"]["author"], format!("agent:{a}"), "{v}");
+    }
+}
+
+#[test]
+fn the_flag_still_selects_any_lane_outside_a_worker() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &["--ready"]);
+    for (lane, author) in [("human", "human"), ("orchestrator", "orchestrator")] {
+        let v = r.ok(&[
+            "--lane", lane, "issue", "comment", &a, "--type", "FYI", "--body", "n",
+        ]);
+        assert_eq!(v["author"], author, "{v}");
+    }
+}

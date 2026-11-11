@@ -126,6 +126,8 @@ is refused while a QUESTION to human is unanswered, so resolve every one before 
 - Scope too narrow: when you need a file outside your scope, ask for it with \
 `{asf} issue comment {id} --type QUESTION --to human --body \"SCOPE: <path> because <reason>\"`, then continue with other work \
 and check `{asf} issue inbox`; an ANSWER `scope extended: ...` means your scope now covers it.\n\
+- Never answer your own QUESTION or SCOPE request, and never pass `--lane` to speak as `human`, `orchestrator` or another issue \
+(the CLI refuses it). Wait for an ANSWER from `human` or `orchestrator` (`asf issue scope add` posts the scope answer) in your inbox.\n\
 - Deviations: when you depart from the brief or settle a choice it left open, record it with \
 `{asf} issue comment {id} --type DECISION --to human --body \"...\"` (what, why).\n\
 - Hand results to a dependent issue with `{asf} issue handoff <issue> --to <issue> --body \"...\"`.\n\
@@ -342,8 +344,26 @@ pub fn render_settings(s: &SettingsInput<'_>) -> Value {
             allow.push(rule);
         }
     }
+    // A worker never picks its lane (the CLI refuses it too): deny `--lane` before and after the
+    // subcommand and as `--lane=`, for the bare name and for the absolute path allowed above.
+    let mut deny: Vec<String> = s.deny.to_vec();
+    let mut prefixes = vec!["asf"];
+    if bin != "asf" {
+        prefixes.push(bin);
+    }
+    for p in prefixes {
+        for rule in [
+            format!("Bash({p} * --lane *)"),
+            format!("Bash({p} --lane *)"),
+            format!("Bash({p} *--lane=*)"),
+        ] {
+            if !deny.contains(&rule) {
+                deny.push(rule);
+            }
+        }
+    }
     json!({
-        "permissions": { "allow": allow, "deny": s.deny },
+        "permissions": { "allow": allow, "deny": deny },
         "hooks": {
             "PreToolUse": [
                 { "matcher": "Edit|Write|MultiEdit", "hooks": [hook(format!("{bin} hook pre-tool"), s.hook_timeout_s)] }
@@ -487,6 +507,27 @@ mod tests {
     }
 
     #[test]
+    fn brief_forbids_answering_own_questions_and_picking_a_lane() {
+        let me = issue("asf-2", "Add greeting");
+        let b = render_brief(&BriefInput {
+            issue: &me,
+            deps: vec![],
+            comments: &[],
+            blockers: vec![],
+            worktree: ".worktrees/asf-2",
+            branch: "feat/asf-2",
+            report_path: ".factory/runs/asf-2/report.md",
+            budget_usd: 5.0,
+            asf_bin: "D:/bin/asf.exe",
+        });
+        assert!(
+            b.contains("Never answer your own QUESTION or SCOPE request"),
+            "{b}"
+        );
+        assert!(b.contains("`--lane`") && b.contains("asf issue scope add"), "{b}");
+    }
+
+    #[test]
     fn settings_has_edit_rules_hooks_and_statusline() {
         let s = SettingsInput {
             asf_bin: "D:/bin/asf.exe",
@@ -516,7 +557,19 @@ mod tests {
             .iter()
             .map(|x| x.as_str().unwrap())
             .collect();
-        assert_eq!(deny, ["Read(./.env)"]);
+        assert_eq!(deny[0], "Read(./.env)", "configured rules come first");
+        // a worker must not pick its lane: `--lane` anywhere on an asf call is denied, by name
+        // and by the absolute path the allow rule uses, before and after the subcommand
+        for rule in [
+            "Bash(asf * --lane *)",
+            "Bash(asf --lane *)",
+            "Bash(asf *--lane=*)",
+            "Bash(D:/bin/asf.exe * --lane *)",
+            "Bash(D:/bin/asf.exe --lane *)",
+            "Bash(D:/bin/asf.exe *--lane=*)",
+        ] {
+            assert!(deny.contains(&rule), "{rule} missing in {deny:?}");
+        }
 
         let pre = &v["hooks"]["PreToolUse"][0];
         assert_eq!(pre["matcher"], "Edit|Write|MultiEdit");
@@ -557,5 +610,27 @@ mod tests {
             .map(|x| x.as_str().unwrap())
             .collect();
         assert_eq!(allow, ["Edit"]);
+    }
+
+    #[test]
+    fn lane_deny_rules_are_not_duplicated() {
+        let lane = "Bash(asf * --lane *)".to_string();
+        let s = SettingsInput {
+            asf_bin: "asf",
+            allowed_tools: &[],
+            deny: std::slice::from_ref(&lane),
+            scope: &[],
+            hook_timeout_s: 10,
+        };
+        let v = render_settings(&s);
+        let n = v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| *d == &Value::String(lane.clone()))
+            .count();
+        assert_eq!(n, 1, "{v}");
+        // a bare binary name has no path form, so no second set of rules
+        assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 3);
     }
 }

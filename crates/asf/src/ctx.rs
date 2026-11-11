@@ -4,10 +4,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use asf_core::{lane, Config};
+use asf_core::{lane, Config, IssueStore};
 use asf_store::SqliteStore;
 
 use crate::cli::Cli;
+use crate::commands::hook::ENV_RUN;
 use crate::git;
 use crate::output::AppError;
 
@@ -31,6 +32,16 @@ pub fn start_dir(cli: &Cli) -> Result<PathBuf, AppError> {
     }
 }
 
+/// The issue a worker process belongs to: `ASF_ISSUE`, else the issue of the run in `ASF_RUN`.
+/// `None` for the orchestrator and the human, who run with neither variable set.
+fn worker_issue(store: &SqliteStore) -> Option<String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    env(ENV_ISSUE).or_else(|| {
+        let run = store.get_run(env(ENV_RUN)?.trim()).ok()??;
+        Some(run.issue_id.to_string())
+    })
+}
+
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
@@ -52,13 +63,15 @@ impl Ctx {
         let db_path = factory_dir.join(DB_FILE);
         let store = SqliteStore::open(&db_path)?;
         let cwd = std::env::current_dir().map_err(|e| AppError::io(format!("current dir: {e}")))?;
+        let worker_issue = worker_issue(&store);
         let lane = lane::resolve(
             cli.lane.as_deref(),
-            std::env::var(ENV_ISSUE).ok().as_deref(),
+            worker_issue.as_deref(),
             &canonical(&cwd),
             &canonical(&root),
             &config.repo.worktrees_dir,
-        );
+        )
+        .map_err(|e| AppError::usage(e.to_string()))?;
         Ok(Ctx {
             root,
             config,
