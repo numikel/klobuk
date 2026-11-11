@@ -206,7 +206,7 @@ fn clean_all_removes_every_finished_lane_and_reports_each_refusal_with_its_reaso
     let l = lanes();
     let res = l.r.ok(&["lane", "clean", "--all"]);
     assert_eq!(res["dry_run"], false, "{res}");
-    assert_eq!(ids(&res["cleaned"]), [l.done.0.clone()], "{res}");
+    assert_eq!(ids(&res["cleaned"]), std::slice::from_ref(&l.done.0), "{res}");
     assert_eq!(res["cleaned"][0]["removed"], true, "{res}");
     assert!(!l.done.1.exists(), "the finished lane is gone");
     assert!(
@@ -240,7 +240,7 @@ fn clean_all_dry_run_lists_what_it_would_remove_and_removes_nothing() {
     let l = lanes();
     let res = l.r.ok(&["lane", "clean", "--all", "--dry-run"]);
     assert_eq!(res["dry_run"], true, "{res}");
-    assert_eq!(ids(&res["cleaned"]), [l.done.0.clone()], "{res}");
+    assert_eq!(ids(&res["cleaned"]), std::slice::from_ref(&l.done.0), "{res}");
     assert_eq!(res["cleaned"][0]["removed"], false, "{res}");
     assert!(
         ids(&res["refused"]).contains(&l.claimed.0) && ids(&res["refused"]).contains(&l.dirty.0),
