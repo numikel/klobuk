@@ -34,6 +34,10 @@ const EDITABLE: &[(&str, &str)] = &[
         "run the gates in the repo root after each merge",
     ),
     (
+        "merge.clean_after",
+        "what the queue removes after a merge: worktree, branch, review_worktrees (a list; [] keeps all)",
+    ),
+    (
         "worker.remote_control",
         "worker and reviewer sessions join Remote Control (claude.ai/code, mobile app)",
     ),
@@ -84,6 +88,7 @@ const APPLIES: &[(&str, Applies)] = &[
     ("review.max_rounds", Applies::NextTick),
     ("merge.target", Applies::NextTick),
     ("merge.verify_main_after", Applies::NextTick),
+    ("merge.clean_after", Applies::NextTick),
     ("worker.remote_control", Applies::NextTick),
     ("notify.on_new", Applies::NextTick),
     ("notify.after_minutes", Applies::NextTick),
@@ -147,7 +152,7 @@ pub enum FieldKind {
     Bool,
     /// A whole number or an amount in USD (typed with Enter).
     Number,
-    /// Free text (typed with Enter). No editable key is plain text yet.
+    /// Free text or a TOML list (typed with Enter): `merge.clean_after`.
     Text,
 }
 
@@ -251,6 +256,13 @@ const FIELDS: &[ConfigField] = &[
         group: ConfigGroup::Flow,
         kind: FieldKind::Bool,
         help: "run the gates again after each merge",
+    },
+    ConfigField {
+        key: "merge.clean_after",
+        label: "Clean up after merge",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Text,
+        help: "worktree, branch, review_worktrees; [] keeps all",
     },
     ConfigField {
         key: "worker.remote_control",
@@ -443,6 +455,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 14);
+        assert_eq!(EDITABLE.len(), 15);
     }
 }

@@ -1,4 +1,4 @@
-use asf_core::config::GateWhen;
+use asf_core::config::{CleanKind, GateWhen};
 use asf_core::config_edit::{
     applies, apply_note, editable_keys, fields, set_key, unset_key, Applies, ConfigGroup, FieldKind,
 };
@@ -141,7 +141,7 @@ fn unparsable_document_is_a_parse_error() {
 }
 
 #[test]
-fn editable_keys_are_exactly_the_fourteen_named_in_the_briefs() {
+fn editable_keys_are_exactly_the_fifteen_named_in_the_briefs() {
     // In the order of the Config view: models, budgets, flow, notifications.
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
     assert_eq!(
@@ -157,6 +157,7 @@ fn editable_keys_are_exactly_the_fourteen_named_in_the_briefs() {
             "review.max_rounds",
             "merge.target",
             "merge.verify_main_after",
+            "merge.clean_after",
             "worker.remote_control",
             "notify.on_new",
             "notify.after_minutes",
@@ -193,6 +194,7 @@ fn fields_carry_the_labels_and_groups_of_the_view() {
         ("review.max_rounds", "Review rounds", ConfigGroup::Flow),
         ("merge.target", "Merge target", ConfigGroup::Flow),
         ("merge.verify_main_after", "Gates on main", ConfigGroup::Flow),
+        ("merge.clean_after", "Clean up after merge", ConfigGroup::Flow),
         ("worker.remote_control", "Remote control", ConfigGroup::Flow),
     ] {
         assert_eq!((get(key).label, get(key).group), (label, group), "{key}");
@@ -223,6 +225,7 @@ fn field_kinds_are_choice_bool_number_or_text() {
         );
     }
     assert_eq!(get("merge.target").kind, FieldKind::Choice(&["local", "github"]));
+    assert_eq!(get("merge.clean_after").kind, FieldKind::Text, "a list is typed with Enter");
     for key in [
         "review.required",
         "merge.verify_main_after",
@@ -255,6 +258,10 @@ fn field_defaults_are_read_from_config_default() {
     assert_eq!(get("review.required").default_value().as_deref(), Some("false"));
     assert_eq!(get("review.model").default_value().as_deref(), Some("opus"));
     assert_eq!(get("merge.target").default_value().as_deref(), Some("local"));
+    assert_eq!(
+        get("merge.clean_after").default_value().as_deref(),
+        Some("[\"worktree\",\"review_worktrees\"]")
+    );
     assert_eq!(get("notify.on_new").default_value().as_deref(), Some("true"));
     assert_eq!(
         get("worker.remote_control").default_value().as_deref(),
@@ -292,6 +299,7 @@ fn every_editable_key_accepts_its_default_value() {
         ("scheduler.max_parallel", "3"),
         ("merge.target", "local"),
         ("merge.verify_main_after", "false"),
+        ("merge.clean_after", "[\"worktree\", \"review_worktrees\"]"),
         ("worker.remote_control", "false"),
         ("notify.on_new", "true"),
         ("notify.after_minutes", "15"),
@@ -443,6 +451,7 @@ fn a_key_the_serve_loop_reloads_says_it_applies_on_the_next_tick() {
         "scheduler.max_parallel",
         "merge.target",
         "merge.verify_main_after",
+        "merge.clean_after",
         "worker.remote_control",
         "notify.on_new",
         "notify.after_minutes",
@@ -481,5 +490,29 @@ fn a_key_nobody_classified_gets_the_restart_hint() {
 fn every_editable_key_has_a_note() {
     for (key, _) in editable_keys() {
         assert!(!apply_note(key).is_empty(), "{key}");
+    }
+}
+
+#[test]
+fn clean_after_is_set_as_a_list_keeping_the_comment_on_the_line() {
+    let t = Config::default_toml();
+    let out = set_key(t, "merge.clean_after", "[\"worktree\", \"branch\"]").unwrap();
+    let changed: Vec<(&str, &str)> = t.lines().zip(out.lines()).filter(|(b, a)| b != a).collect();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(changed[0].1.starts_with("clean_after = [\"worktree\", \"branch\"]"), "{changed:?}");
+    assert!(changed[0].1.contains('#'), "inline comment lost: {changed:?}");
+    assert_eq!(
+        Config::from_toml(&out).unwrap().merge.clean_after,
+        [CleanKind::Worktree, CleanKind::Branch]
+    );
+    let none = set_key(t, "merge.clean_after", "[]").unwrap();
+    assert!(Config::from_toml(&none).unwrap().merge.clean_after.is_empty());
+}
+
+#[test]
+fn clean_after_refuses_a_kind_that_does_not_exist_and_a_bare_word() {
+    for bad in ["[\"remote_branch\"]", "worktree", "[\"branch\", 3]"] {
+        let e = set_key(Config::default_toml(), "merge.clean_after", bad).unwrap_err();
+        assert!(matches!(e, ConfigError::Parse(_)), "{bad}: {e}");
     }
 }

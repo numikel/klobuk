@@ -220,6 +220,9 @@ pub struct MergeCfg {
     pub require_clean_main: bool,
     /// Run the `[[gate]]`s in the repository root right after every merge to detect a red default branch.
     pub verify_main_after: bool,
+    /// What the queue removes after a successful merge (and, with `verify_main_after`, a green main).
+    /// Empty keeps everything.
+    pub clean_after: Vec<CleanKind>,
     pub github: GitHubCfg,
 }
 
@@ -229,9 +232,22 @@ impl Default for MergeCfg {
             target: "local".into(),
             require_clean_main: true,
             verify_main_after: false,
+            clean_after: vec![CleanKind::Worktree, CleanKind::ReviewWorktrees],
             github: GitHubCfg::default(),
         }
     }
+}
+
+/// One kind of clean-up the merge queue runs after a merge (`[merge] clean_after`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanKind {
+    /// `.worktrees/<id>` of the merged issue, with the refusals of `asf lane clean <id>`.
+    Worktree,
+    /// `git branch -d feat/<id>`, after the worktree is gone (lowercase `-d`: refuses an unmerged branch).
+    Branch,
+    /// The detached `.worktrees/<review-id>` checkouts of the issue's review runs.
+    ReviewWorktrees,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -389,6 +405,7 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
 require_clean_main = true
 verify_main_after = false # run the gates in the repo root after each merge; a red main keeps the item `merged`, posts a BLOCKER and halts the tick
+clean_after = ["worktree", "review_worktrees"] # removed after a merge (and a green main when verify_main_after is on): worktree | branch (git branch -d) | review_worktrees; [] keeps everything; a refusal (claimed, dirty or unmerged lane) is reported, never fails the merge
 # [merge.github]          # used when target = "github"
 # remote = "origin"
 # base = "main"            # default: [repo] default_branch

@@ -1,3 +1,4 @@
+use asf_core::config::CleanKind;
 use asf_core::{Config, ConfigError};
 
 #[test]
@@ -81,4 +82,50 @@ fn the_template_documents_notify_and_still_parses_to_the_defaults() {
         assert!(t.contains(var), "{var} not documented");
     }
     assert_eq!(Config::from_toml(t).unwrap(), Config::default());
+}
+
+#[test]
+fn clean_after_defaults_to_the_worktree_and_the_review_worktrees() {
+    let want = [CleanKind::Worktree, CleanKind::ReviewWorktrees];
+    assert_eq!(Config::default().merge.clean_after, want);
+    assert_eq!(Config::from_toml("").unwrap().merge.clean_after, want);
+    let c = Config::from_toml("[merge]\nverify_main_after = true\n").unwrap();
+    assert_eq!(c.merge.clean_after, want, "another [merge] key keeps the default");
+}
+
+#[test]
+fn clean_after_takes_any_subset_and_an_empty_list_keeps_everything() {
+    let c = Config::from_toml("[merge]\nclean_after = [\"worktree\", \"branch\", \"review_worktrees\"]\n").unwrap();
+    assert_eq!(
+        c.merge.clean_after,
+        [CleanKind::Worktree, CleanKind::Branch, CleanKind::ReviewWorktrees]
+    );
+    let c = Config::from_toml("[merge]\nclean_after = [\"branch\"]\n").unwrap();
+    assert_eq!(c.merge.clean_after, [CleanKind::Branch]);
+    let c = Config::from_toml("[merge]\nclean_after = []\n").unwrap();
+    assert!(c.merge.clean_after.is_empty(), "empty list: today's behaviour");
+}
+
+#[test]
+fn clean_after_refuses_an_unknown_kind() {
+    for bad in ["[\"remote_branch\"]", "[\"Worktree\"]", "\"worktree\"", "[1]"] {
+        let e = Config::from_toml(&format!("[merge]\nclean_after = {bad}\n")).unwrap_err();
+        assert!(matches!(e, ConfigError::Parse(_)), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn the_template_documents_clean_after_and_still_parses_to_the_defaults() {
+    let t = Config::default_toml();
+    assert!(
+        t.contains("clean_after = [\"worktree\", \"review_worktrees\"]"),
+        "the default is spelled out: {t}"
+    );
+    for kind in ["worktree", "branch", "review_worktrees"] {
+        assert!(t.contains(kind), "{kind} not documented");
+    }
+    assert_eq!(
+        Config::from_toml(t).unwrap().merge.clean_after,
+        Config::default().merge.clean_after
+    );
 }
