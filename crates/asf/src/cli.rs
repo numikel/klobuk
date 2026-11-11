@@ -131,9 +131,9 @@ pub struct TuiArgs {
 
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// Seconds between ticks (>= 1).
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
-    pub interval: u64,
+    /// Seconds between ticks (>= 1); default `[serve] interval_s` (10).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub interval: Option<u64>,
     /// Run a single tick and exit.
     #[arg(long)]
     pub once: bool,
@@ -144,7 +144,7 @@ pub struct ServeArgs {
     /// (reasons: all_done, max_ticks, stuck; stuck exits 3).
     #[arg(long, conflicts_with = "once")]
     pub until_done: bool,
-    /// With --until-done: stop after this many ticks (>= 1).
+    /// With --until-done: stop after this many ticks (>= 1); default `[serve] max_ticks` (none).
     #[arg(long, requires = "until_done", value_parser = clap::value_parser!(u64).range(1..))]
     pub max_ticks: Option<u64>,
 }

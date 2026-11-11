@@ -1663,3 +1663,170 @@ fn a_check_of_main_left_pending_by_a_stopped_serve_is_run_again_and_a_red_one_is
         .count();
     assert_eq!(reds, 1);
 }
+
+// --- the pulse (`.factory/runs/serve.json`) ---
+
+fn pulse_of(repo: &Repo) -> serde_json::Value {
+    let raw = std::fs::read_to_string(repo.path().join(".factory/runs/serve.json")).expect("a pulse file");
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn write_pulse(repo: &Repo, pid: u32, last_tick_at: &str, stopped: Option<&str>) {
+    let dir = repo.path().join(".factory/runs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pulse = serde_json::json!({
+        "pid": pid, "started_at": last_tick_at, "last_tick_at": last_tick_at,
+        "mode": "dispatch", "interval_s": 10, "max_ticks": null, "ticks": 4,
+        "stopped_at": stopped.map(|_| last_tick_at), "stop_reason": stopped,
+    });
+    std::fs::write(dir.join("serve.json"), pulse.to_string()).unwrap();
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+#[test]
+fn a_loop_that_stops_for_a_reason_leaves_stopped_at_and_the_reason() {
+    // all_done
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
+    repo.ok(&["issue", "status", &a, "done"]);
+    repo.ok(&["serve", "--until-done"]);
+    let p = pulse_of(&repo);
+    assert_eq!(p["stop_reason"], "all_done", "{p}");
+    assert!(p["stopped_at"].is_string(), "{p}");
+    assert_eq!(p["ticks"], 1, "{p}");
+    assert_eq!(p["mode"], "observe", "{p}");
+    assert_eq!(p["pid"].as_u64().unwrap() > 0, true);
+
+    // stuck (exit 3 happens after the pulse is written)
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    repo.create_issue("no scope", &["--ready"]);
+    let (_, code) = repo.json(&["serve", "--until-done"]);
+    assert_eq!(code, 3);
+    assert_eq!(pulse_of(&repo)["stop_reason"], "stuck");
+
+    // max_ticks, with the pulse carrying mode, interval and limit
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    repo.create_issue("work", &["--ready", "--scope", "src/a.rs"]);
+    repo.asf()
+        .args([
+            "serve",
+            "--until-done",
+            "--dispatch",
+            "--max-ticks",
+            "2",
+            "--interval",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    let p = pulse_of(&repo);
+    assert_eq!(p["stop_reason"], "max_ticks", "{p}");
+    assert_eq!(
+        (p["ticks"].clone(), p["max_ticks"].clone()),
+        (2.into(), 2.into()),
+        "{p}"
+    );
+    assert_eq!(
+        (p["mode"].clone(), p["interval_s"].clone()),
+        ("dispatch".into(), 1.into()),
+        "{p}"
+    );
+}
+
+#[test]
+fn serve_once_leaves_no_pulse_and_does_not_touch_a_running_loops() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    repo.ok(&["serve", "--once"]);
+    assert!(!repo.path().join(".factory/runs/serve.json").exists());
+    write_pulse(&repo, std::process::id(), &now_rfc3339(), None);
+    repo.ok(&["serve", "--once"]);
+    assert_eq!(
+        pulse_of(&repo)["ticks"],
+        4,
+        "--once must not overwrite the loop's pulse"
+    );
+}
+
+#[test]
+fn a_second_loop_is_refused_while_a_live_one_has_a_fresh_pulse() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    write_pulse(&repo, std::process::id(), &now_rfc3339(), None); // this test process is alive
+    let out = repo.asf().args(["serve", "--until-done"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("another `asf serve` loop") && err.contains(&std::process::id().to_string()),
+        "{err}"
+    );
+    assert_eq!(pulse_of(&repo)["ticks"], 4, "the refused loop wrote nothing");
+}
+
+#[test]
+fn a_stale_or_stopped_pulse_is_taken_over() {
+    for (last_tick, stopped) in [
+        ("2020-01-01T00:00:00Z", None),
+        ("2020-01-01T00:00:00Z", Some("max_ticks")),
+    ] {
+        let repo = Repo::initialised();
+        use_fake_runtime(&repo);
+        write_pulse(&repo, std::process::id(), last_tick, stopped);
+        let out = repo.asf().args(["serve", "--until-done"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{stopped:?}: {out:?}");
+        let p = pulse_of(&repo);
+        assert_eq!(p["stop_reason"], "all_done", "{p}");
+        assert_ne!(
+            p["started_at"], last_tick,
+            "a new pulse replaced the old one: {p}"
+        );
+    }
+}
+
+#[test]
+fn config_sets_the_interval_and_the_tick_limit_and_flags_override_it() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("interval_s = 10", "interval_s = 1")
+        .replace("# max_ticks = 600", "max_ticks = 1");
+    assert!(
+        s.contains("interval_s = 1 ") && s.contains("\nmax_ticks = 1 "),
+        "template changed"
+    );
+    std::fs::write(&cfg, s).unwrap();
+    repo.create_issue("work", &["--ready", "--scope", "src/a.rs"]);
+    repo.asf()
+        .args(["serve", "--until-done", "--dispatch"])
+        .output()
+        .unwrap();
+    let p = pulse_of(&repo);
+    assert_eq!(
+        (p["max_ticks"].clone(), p["interval_s"].clone()),
+        (1.into(), 1.into()),
+        "{p}"
+    );
+    assert_eq!(p["stop_reason"], "max_ticks", "{p}");
+    assert_eq!(p["ticks"], 1, "{p}");
+
+    repo.asf()
+        .args(["serve", "--until-done", "--dispatch", "--max-ticks", "2"])
+        .output()
+        .unwrap();
+    let p = pulse_of(&repo);
+    assert_eq!(
+        (p["max_ticks"].clone(), p["ticks"].clone()),
+        (2.into(), 2.into()),
+        "the flag wins: {p}"
+    );
+}

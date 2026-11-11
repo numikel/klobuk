@@ -27,6 +27,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use asf_core::{IssueFilter, IssueId, IssueStore, IssueType, MergeState, RunState};
+use asf_store::serve_pulse::{self, LoopState, Pulse, ServeMode};
 use serde::Serialize;
 use serde_json::json;
 
@@ -452,6 +453,76 @@ fn finish(cli: &Cli, ticks: u64, reason: StopReason, a: Assessment) -> Result<Re
     Ok(rendered)
 }
 
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// Whether a new loop may start next to what the pulse on disk says. A fresh pulse of a live process
+/// refuses (the message names the pid and the age); a clean stop, a stale pulse or a dead pid is taken
+/// over. `alive` is the answer of the process lookup, `None` when it could not be made.
+fn takeover_check(
+    pulse: Option<&Pulse>,
+    now: time::OffsetDateTime,
+    alive: Option<bool>,
+) -> Result<(), String> {
+    match (pulse, serve_pulse::judge(pulse, now, alive)) {
+        (Some(p), LoopState::Running { age_s, .. }) => Err(format!(
+            "another `asf serve` loop is running on this repo (pid {}, last tick {} ago, started {}); \
+             stop it first, or wait until it has been silent for {} s and this one takes over",
+            p.pid,
+            serve_pulse::fmt_age(age_s),
+            p.started_at,
+            (p.interval_s * serve_pulse::STALE_AFTER_INTERVALS).max(serve_pulse::MIN_STALE_SECS)
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Writes the pulse every tick and the reason of a clean stop. A failed write only warns (once): the
+/// loop's work matters more than its signal.
+struct Heartbeat {
+    root: std::path::PathBuf,
+    pulse: Pulse,
+    warned: bool,
+}
+
+impl Heartbeat {
+    /// Starts the pulse and writes it at once, so the TUI sees the loop before its first tick ends.
+    fn start(root: &std::path::Path, mode: ServeMode, interval_s: u64, max_ticks: Option<u64>) -> Heartbeat {
+        let mut hb = Heartbeat {
+            root: root.to_path_buf(),
+            pulse: Pulse::start(mode, interval_s, max_ticks, &now_rfc3339()),
+            warned: false,
+        };
+        hb.save();
+        hb
+    }
+
+    fn beat(&mut self, ticks: u64) {
+        self.pulse.tick(ticks, &now_rfc3339());
+        self.save();
+    }
+
+    fn stop(&mut self, reason: impl Into<String>) {
+        self.pulse.stop(reason, &now_rfc3339());
+        self.save();
+    }
+
+    fn save(&mut self) {
+        if let Err(e) = serve_pulse::write(&self.root, &self.pulse) {
+            if !self.warned {
+                self.warned = true;
+                eprintln!(
+                    "asf serve: cannot write the pulse {}: {e}",
+                    serve_pulse::pulse_path(&self.root).display()
+                );
+            }
+        }
+    }
+}
+
 pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
     let mut ctx = Ctx::load(cli)?;
     let mut reminders = RemindState::new();
@@ -459,9 +530,27 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         let t = tick(&ctx, a.dispatch, &mut reminders, None)?;
         return Rendered::new(&t, text(&t));
     }
+    // flags win over `[serve]`; the loop reads both once, here
+    let interval = a.interval.unwrap_or(ctx.config.serve.interval_s);
+    let max_ticks = a.max_ticks.or(ctx.config.serve.max_ticks);
+    let on_disk = serve_pulse::read(&ctx.root).ok().flatten();
+    let alive = on_disk
+        .as_ref()
+        .filter(|p| p.stopped_at.is_none())
+        .and_then(|p| serve_pulse::pid_alive(p.pid));
+    takeover_check(on_disk.as_ref(), time::OffsetDateTime::now_utc(), alive).map_err(AppError::conflict)?;
+    if on_disk.as_ref().is_some_and(|p| p.stopped_at.is_none()) {
+        eprintln!(
+            "asf serve: the previous loop left no stop reason (killed, crashed or restarted); taking over"
+        );
+    }
+    let mode = if a.dispatch {
+        ServeMode::Dispatch
+    } else {
+        ServeMode::Observe
+    };
     eprintln!(
-        "asf serve: every {}s{} (Ctrl+C to stop)",
-        a.interval,
+        "asf serve: every {interval}s{} (Ctrl+C to stop)",
         if a.dispatch { " with dispatch" } else { "" }
     );
     // What a stopped serve left mid-way would never be touched again: no gate run is behind it now.
@@ -475,7 +564,13 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         );
     }
     let mut gate = GateSlot::new();
-    let result = serve_loop(cli, a, &mut ctx, &mut reminders, &mut gate);
+    let mut hb = Heartbeat::start(&ctx.root, mode, interval, max_ticks);
+    let result = serve_loop(cli, a, &mut ctx, &mut reminders, &mut gate, &mut hb);
+    if let Err(e) = &result {
+        if hb.pulse.stopped_at.is_none() {
+            hb.stop(format!("error: {}", e.message));
+        }
+    }
     // Whatever ended the loop (an error included), a gate command still running is a child of this
     // process: wait for it so that it does not outlive asf. Its result is not concluded here; the item
     // is still `gating`/`verifying` in the store and the next start deals with it like with any other.
@@ -492,6 +587,7 @@ fn serve_loop(
     ctx: &mut Ctx,
     reminders: &mut RemindState,
     gate: &mut GateSlot,
+    hb: &mut Heartbeat,
 ) -> Result<Rendered, AppError> {
     let mut watch = ConfigWatch::new(ctx);
     let mut ticks: u64 = 0;
@@ -521,13 +617,16 @@ fn serve_loop(
                 false
             }
         };
+        hb.beat(ticks);
         if a.until_done {
             let assessment = assess(ctx, a.dispatch, gate)?;
-            if let Some(reason) = decide(&assessment, ticks, a.max_ticks, tick_ok) {
+            if let Some(reason) = decide(&assessment, ticks, hb.pulse.max_ticks, tick_ok) {
+                // before `finish`, which exits the process for `stuck`
+                hb.stop(reason.as_str());
                 return finish(cli, ticks, reason, assessment);
             }
         }
-        std::thread::sleep(Duration::from_secs(a.interval));
+        std::thread::sleep(Duration::from_secs(hb.pulse.interval_s));
     }
 }
 
@@ -548,6 +647,42 @@ mod tests {
             can_start,
             questions_waiting: 0,
         }
+    }
+
+    fn pulse_at(last_tick: &str, interval: u64) -> Pulse {
+        Pulse::start(ServeMode::Dispatch, interval, None, last_tick)
+    }
+
+    #[test]
+    fn a_second_loop_is_refused_only_while_the_first_one_is_fresh_and_alive() {
+        use time::format_description::well_known::Rfc3339;
+        let now = time::OffsetDateTime::parse("2026-11-11T20:00:00Z", &Rfc3339).unwrap();
+        let fresh = pulse_at("2026-11-11T19:59:55Z", 10);
+        let stale = pulse_at("2026-11-11T19:00:00Z", 10);
+        let msg = takeover_check(Some(&fresh), now, Some(true)).unwrap_err();
+        assert!(
+            msg.contains("another `asf serve` loop") && msg.contains("5 s"),
+            "{msg}"
+        );
+        assert!(
+            takeover_check(Some(&fresh), now, None).is_err(),
+            "unknown liveness: age decides"
+        );
+        assert!(
+            takeover_check(Some(&fresh), now, Some(false)).is_ok(),
+            "dead pid is taken over"
+        );
+        assert!(
+            takeover_check(Some(&stale), now, Some(true)).is_ok(),
+            "a stale pulse is taken over"
+        );
+        assert!(takeover_check(None, now, None).is_ok());
+        let mut stopped = fresh.clone();
+        stopped.stop("all_done", "2026-11-11T19:59:59Z");
+        assert!(
+            takeover_check(Some(&stopped), now, Some(true)).is_ok(),
+            "a clean stop is free"
+        );
     }
 
     #[test]
