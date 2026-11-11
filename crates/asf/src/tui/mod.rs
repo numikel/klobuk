@@ -41,7 +41,7 @@ use crate::ctx::{Ctx, CONFIG_FILE, FACTORY_DIR};
 use crate::output::AppError;
 use crate::worker::Worker;
 use app::{Action, App, View};
-use snapshot::{config_rows, load_detail, load_snapshot, read_config_text};
+use snapshot::{config_rows, load_detail, load_snapshot, read_config_text, RuntimeState};
 use theme::Theme;
 
 const KEY_POLL: Duration = Duration::from_millis(200);
@@ -419,7 +419,7 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
 /// One frame as text (for `asf tui --once` and debugging).
 pub fn run_once(ctx: &Ctx, view: Option<View>) -> Result<String, AppError> {
     let rt = asf_runtime::from_config(&ctx.config.worker.runtime, &ctx.root).ok();
-    let snap = load_snapshot(ctx, rt.as_deref(), &BTreeMap::new())?;
+    let snap = load_snapshot(ctx, rt.as_deref(), &BTreeMap::new(), &RuntimeState::default())?;
     let mut app = App::new(snap);
     app.theme = Theme::from_env();
     if let Some(v) = view {
@@ -430,7 +430,12 @@ pub fn run_once(ctx: &Ctx, view: Option<View>) -> Result<String, AppError> {
 
 pub fn run_interactive(ctx: &Ctx, view: Option<View>) -> Result<(), AppError> {
     let worker = Worker::new(ctx)?;
-    let mut app = App::new(load_snapshot(ctx, Some(worker.rt.as_ref()), &BTreeMap::new())?);
+    let mut app = App::new(load_snapshot(
+        ctx,
+        Some(worker.rt.as_ref()),
+        &BTreeMap::new(),
+        &RuntimeState::default(),
+    )?);
     app.theme = Theme::from_env();
     if let Some(v) = view {
         app.view = v;
@@ -529,7 +534,7 @@ fn event_loop(
             } else {
                 None
             };
-            match load_snapshot(ctx, rt, &app.snap.agents) {
+            match load_snapshot(ctx, rt, &app.snap.agents, &app.snap.runtime_state()) {
                 Ok(snap) => app.replace(snap),
                 Err(e) => app.status = Some(format!("refresh failed: {}", e.message)),
             }

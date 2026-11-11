@@ -40,6 +40,7 @@ pub fn rule(width: u16, theme: &Theme) -> Paragraph<'static> {
 /// background action that runs (with a spinner).
 fn header_line(app: &App) -> Line<'static> {
     let (s, t) = (&app.snap, &app.theme);
+    let counts = s.run_counts();
     let runtime = match s.runtime_ok {
         Some(true) => Span::styled("runtime ok", t.ok()),
         Some(false) => Span::styled("runtime DOWN", t.danger()),
@@ -50,13 +51,14 @@ fn header_line(app: &App) -> Line<'static> {
         Span::styled(s.repo_name.clone(), t.bold()),
         Span::raw(format!(" · {} · ", s.branch)),
         runtime,
-        Span::raw(format!(
-            " · workers {}/{} · queue {}",
-            s.runs.len(),
-            s.max_parallel,
-            s.queue.len()
-        )),
+        Span::raw(format!(" · workers {}/{}", counts.workers, s.max_parallel)),
     ];
+    // Reviewers have their own limit; they are named only when one runs, so a RUNNING list of
+    // `workers + reviewers` rows can be read off the header.
+    if counts.reviewers > 0 {
+        spans.push(Span::raw(format!(" · reviewers {}", counts.reviewers)));
+    }
+    spans.push(Span::raw(format!(" · queue {}", s.queue.len())));
     let waiting = s.needs_you.len();
     if waiting > 0 {
         spans.push(Span::raw(" · "));

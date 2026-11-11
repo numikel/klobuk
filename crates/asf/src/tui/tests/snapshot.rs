@@ -3,7 +3,8 @@
 use super::*;
 use crate::ctx::Ctx;
 use crate::tui::snapshot::{
-    fit, load_detail, load_snapshot, move_selection, text_width, trunc, ReviewLink, REVIEW_STARTED,
+    fit, load_detail, load_snapshot, move_selection, text_width, trunc, ReviewLink, RuntimeState,
+    REVIEW_STARTED, RUNTIME_DOWN_AFTER,
 };
 
 fn new_issue(title: &str, kind: IssueType, parent: Option<&IssueId>, deps: &[&IssueId]) -> NewIssue {
@@ -144,7 +145,7 @@ fn the_loader_carries_every_run_not_only_the_latest_one_per_issue() {
             },
         )
         .unwrap();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert!(s.runs.is_empty(), "no run is active");
     assert_eq!(s.all_runs.len(), 3);
     let of = |id: &IssueId| s.all_runs.iter().filter(|r| &r.issue_id == id).count();
@@ -157,7 +158,7 @@ fn the_loader_carries_every_run_not_only_the_latest_one_per_issue() {
 #[test]
 fn the_loader_carries_deps_the_latest_run_per_issue_merged_today_review_links_and_needs_you() {
     let (ctx, [a, b, c, r]) = story();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
 
     assert_eq!(
         s.deps,
@@ -222,14 +223,14 @@ fn the_loader_carries_deps_the_latest_run_per_issue_merged_today_review_links_an
 #[test]
 fn the_loader_carries_whether_a_review_is_required_and_the_labels_that_ask_for_one() {
     let (mut ctx, _) = story();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert!(
         !s.review_required && s.review_on_labels.is_empty(),
         "off by default"
     );
     ctx.config.review.required = true;
     ctx.config.review.on_labels = vec!["risky".into()];
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert!(s.review_required);
     assert_eq!(s.review_on_labels, ["risky"]);
 }
@@ -237,10 +238,10 @@ fn the_loader_carries_whether_a_review_is_required_and_the_labels_that_ask_for_o
 #[test]
 fn the_loader_carries_whether_the_gates_run_on_main_after_a_merge() {
     let (mut ctx, _) = story();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert!(!s.verify_main_after, "off by default");
     ctx.config.merge.verify_main_after = true;
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert!(s.verify_main_after);
 }
 
@@ -255,7 +256,7 @@ fn a_value_changed_in_config_toml_shows_up_in_the_next_snapshot_without_a_restar
         "[scheduler]\nmax_parallel = 7\n[review]\nrequired = true\nmodel = \"sonnet\"\non_labels = [\"risky\"]\n[merge]\nverify_main_after = true\n[repo]\ndefault_branch = \"trunk\"\n",
     )
     .unwrap();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert_eq!(s.max_parallel, 7, "the header's workers n/m");
     assert!(s.review_required && s.verify_main_after);
     assert_eq!((s.review_model.as_str(), s.branch.as_str()), ("sonnet", "trunk"));
@@ -265,14 +266,14 @@ fn a_value_changed_in_config_toml_shows_up_in_the_next_snapshot_without_a_restar
 
     // an edit made while the TUI runs (`asf config set`, an editor) is picked up by the next refresh
     std::fs::write(&path, "[scheduler]\nmax_parallel = 2\n").unwrap();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert_eq!(s.max_parallel, 2);
     assert!(!s.review_required && !s.verify_main_after);
     assert_eq!(row(&s, "scheduler.max_parallel"), "2");
 
     // a file that does not parse keeps the settings the TUI started with and says so in the rows
     std::fs::write(&path, "[scheduler\nmax_parallel = 9\n").unwrap();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert_eq!(s.max_parallel, ctx.config.scheduler.max_parallel);
     assert_eq!(s.config[0].value, "(unreadable)");
 }
@@ -288,7 +289,7 @@ fn the_model_of_a_run_follows_the_config_file_too() {
         "[worker]\nmodel = \"haiku\"\n[review]\nmodel = \"sonnet\"\n",
     )
     .unwrap();
-    let s = load_snapshot(&ctx, None, &BTreeMap::new()).unwrap();
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
     assert_eq!(s.last_run(&a).unwrap().model.as_deref(), Some("haiku"));
     assert_eq!(
         s.last_run(&r).and_then(|l| l.model.clone()).as_deref(),
@@ -310,10 +311,10 @@ fn the_detail_of_an_issue_is_loaded_on_demand_with_comments_and_dependency_statu
 #[test]
 fn what_was_loaded_on_demand_survives_a_refresh() {
     let (ctx, [a, ..]) = story();
-    let mut app = App::new(load_snapshot(&ctx, None, &BTreeMap::new()).unwrap());
+    let mut app = App::new(load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap());
     app.snap.detail = Some(load_detail(&ctx, &a).unwrap());
     app.set_pane_preview(a.clone(), "last lines".into());
-    app.replace(load_snapshot(&ctx, None, &BTreeMap::new()).unwrap());
+    app.replace(load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap());
     assert_eq!(app.snap.detail_of(&a).map(|d| d.issue.clone()), Some(a.clone()));
     assert_eq!(app.snap.preview_of(&a), Some("last lines"));
 }
@@ -414,4 +415,140 @@ fn list_navigation_clamps_and_survives_an_empty_list() {
     );
     assert_eq!(nav(key('j'), 0, 0), Some(0));
     assert_eq!(nav(key('x'), 0, 3), None, "not a navigation key");
+}
+
+/// A runtime whose `health` answers after `delay`, failing when the script says so (an empty script
+/// answers). Nothing else is used by the loader's probe, so the rest refuses.
+struct ProbeRuntime {
+    delay: Duration,
+    answers: std::sync::Mutex<std::collections::VecDeque<bool>>,
+}
+
+impl ProbeRuntime {
+    fn new(delay: Duration, answers: &[bool]) -> Self {
+        ProbeRuntime {
+            delay,
+            answers: std::sync::Mutex::new(answers.iter().copied().collect()),
+        }
+    }
+}
+
+fn unused<T>() -> Result<T, RuntimeError> {
+    Err(RuntimeError::Io("unused".into()))
+}
+
+impl AgentRuntime for ProbeRuntime {
+    fn health(&self) -> Result<RuntimeInfo, RuntimeError> {
+        std::thread::sleep(self.delay);
+        if self.answers.lock().unwrap().pop_front().unwrap_or(true) {
+            Ok(RuntimeInfo {
+                name: "probe".into(),
+                version: "0".into(),
+                protocol: None,
+            })
+        } else {
+            Err(RuntimeError::Io("herdr status exited 1: socket busy".into()))
+        }
+    }
+    fn open_workspace(&self, _: &OpenWorkspace) -> Result<WorkspaceRef, RuntimeError> {
+        unused()
+    }
+    fn start_agent(&self, _: &StartAgent) -> Result<AgentInfo, RuntimeError> {
+        unused()
+    }
+    fn prompt(&self, _: &AgentHandle, _: &str, _: &[AgentState], _: u64) -> Result<AgentInfo, RuntimeError> {
+        unused()
+    }
+    fn wait(&self, _: &AgentHandle, _: &[AgentState], _: u64) -> Result<AgentInfo, RuntimeError> {
+        unused()
+    }
+    fn info(&self, _: &AgentHandle) -> Result<AgentInfo, RuntimeError> {
+        unused()
+    }
+    fn read(&self, _: &AgentHandle, _: u32) -> Result<String, RuntimeError> {
+        unused()
+    }
+    fn send_keys(&self, _: &AgentHandle, _: &[&str]) -> Result<(), RuntimeError> {
+        unused()
+    }
+    fn focus(&self, _: &AgentHandle) -> Result<(), RuntimeError> {
+        unused()
+    }
+    fn report(&self, _: &str, _: Option<&str>, _: &[(String, String)]) -> Result<(), RuntimeError> {
+        unused()
+    }
+    fn close_workspace(&self, _: &str) -> Result<(), RuntimeError> {
+        unused()
+    }
+    fn notify(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), RuntimeError> {
+        unused()
+    }
+}
+
+fn header_text(s: &Snapshot) -> String {
+    render_to_text(&App::new(s.clone()), 120, 30)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn a_slow_runtime_that_answers_is_shown_as_ok() {
+    let (ctx, _) = story();
+    let rt = ProbeRuntime::new(Duration::from_millis(300), &[]);
+    let s = load_snapshot(&ctx, Some(&rt), &BTreeMap::new(), &RuntimeState::default()).unwrap();
+    assert_eq!(s.runtime_ok, Some(true));
+    assert!(header_text(&s).contains("runtime ok"), "{}", header_text(&s));
+}
+
+#[test]
+fn a_refresh_that_skips_the_probe_keeps_the_last_known_state() {
+    // the event loop reads the store every second but probes the runtime every two
+    let (ctx, _) = story();
+    let up = RuntimeState {
+        ok: Some(true),
+        ..RuntimeState::default()
+    };
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &up).unwrap();
+    assert_eq!(s.runtime_ok, Some(true));
+    assert!(header_text(&s).contains("runtime ok"));
+    // nothing probed yet: still unknown
+    let s = load_snapshot(&ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
+    assert_eq!(s.runtime_ok, None);
+    assert!(header_text(&s).contains("runtime ?"));
+}
+
+#[test]
+fn the_runtime_is_down_only_after_several_failed_probes_in_a_row_and_the_reason_is_kept() {
+    let (ctx, _) = story();
+    let mut script = vec![true];
+    script.extend(std::iter::repeat_n(false, RUNTIME_DOWN_AFTER as usize));
+    script.push(true);
+    let rt = ProbeRuntime::new(Duration::ZERO, &script);
+    let mut state = RuntimeState::default();
+    let mut shown = Vec::new();
+    for _ in 0..script.len() {
+        let s = load_snapshot(&ctx, Some(&rt), &BTreeMap::new(), &state).unwrap();
+        shown.push((s.runtime_ok, s.runtime_failures, s.runtime_reason.clone()));
+        state = s.runtime_state();
+    }
+    let reason = Some("io: herdr status exited 1: socket busy".to_string());
+    let mut want = vec![(Some(true), 0, None)];
+    for n in 1..RUNTIME_DOWN_AFTER {
+        want.push((Some(true), n, reason.clone())); // a miss keeps the last known state
+    }
+    want.push((Some(false), RUNTIME_DOWN_AFTER, reason));
+    want.push((Some(true), 0, None)); // an answer ends the outage
+    assert_eq!(shown, want);
+}
+
+#[test]
+fn a_runtime_that_never_answered_stays_unknown_until_it_has_failed_enough() {
+    let s = RuntimeState::default();
+    let once = s.observe(Some(Err("x".into())));
+    assert_eq!((once.ok, once.failures), (None, 1));
+    let down = (1..RUNTIME_DOWN_AFTER).fold(once, |st, _| st.observe(Some(Err("x".into()))));
+    assert_eq!(down.ok, Some(false));
+    assert_eq!(down.observe(None), down, "a skipped probe changes nothing");
 }

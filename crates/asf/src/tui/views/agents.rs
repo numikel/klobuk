@@ -409,10 +409,18 @@ fn preview(frame: &mut Frame, area: Rect, snap: &Snapshot, entry: &Entry, theme:
     let block = Block::bordered().title(Span::styled(title, theme.bold()));
     let inner = block.inner(area);
     let body: Vec<Line> = if snap.runtime_ok == Some(false) {
-        vec![Line::styled(
+        let mut lines = vec![Line::styled(
             "The runtime is down, so the pane cannot be read.",
             theme.dim(),
-        )]
+        )];
+        if let Some(reason) = &snap.runtime_reason {
+            let room = inner.width.saturating_sub(12) as usize;
+            lines.push(Line::styled(
+                format!("Last error: {}", trunc(reason, room)),
+                theme.dim(),
+            ));
+        }
+        lines
     } else if entry.run.pane_id.is_none() {
         vec![Line::styled("This run has no pane.", theme.dim())]
     } else {

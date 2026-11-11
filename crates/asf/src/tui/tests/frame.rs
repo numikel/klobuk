@@ -238,6 +238,136 @@ fn every_view_renders_without_data_at_every_size_and_four_of_them_say_what_to_do
 }
 
 #[test]
+fn the_agents_view_says_why_the_runtime_is_down() {
+    let mut s = desk(live(&["asf-1"]));
+    s.runs = vec![run_at("asf-1", RunState::Working, "2026-11-06T11:00:00Z")];
+    s.runtime_ok = Some(false);
+    s.runtime_failures = 3;
+    s.runtime_reason = Some("io: herdr status exited 1: socket busy".into());
+    let mut a = App::new(s);
+    a.view = View::Agents;
+    let t = render_to_text(&a, 120, 30);
+    assert!(t.contains("runtime DOWN"), "{t}");
+    assert!(
+        t.contains("The runtime is down, so the pane cannot be read."),
+        "{t}"
+    );
+    assert!(
+        t.contains("Last error: io: herdr status exited 1: socket busy"),
+        "{t}"
+    );
+}
+
+fn review_issue(i: &str) -> Issue {
+    let mut r = issue(i, "Review it", Status::InProgress);
+    r.kind = IssueType::Review;
+    r
+}
+
+/// The header line of `snap` at width 120.
+fn header_of(snap: Snapshot) -> String {
+    render_to_text(&App::new(snap), 120, 30)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn the_header_counts_workers_like_the_scheduler_not_every_open_run() {
+    // The owner's screenshot: slot limit 1, one worker, two reviewers and a stalled run, and the header
+    // said `workers 4/1`. Reviewers have their own limit and a stalled run holds no slot.
+    let mut s = desk(vec![
+        issue("asf-1", "Worker", Status::InProgress),
+        issue("asf-2", "Stalled", Status::InProgress),
+        review_issue("asf-3"),
+        review_issue("asf-4"),
+    ]);
+    s.max_parallel = 1;
+    s.runs = vec![
+        run_at("asf-1", RunState::Working, "2026-11-06T11:00:00Z"),
+        run_at("asf-2", RunState::Stalled, "2026-11-06T11:01:00Z"),
+        run_at("asf-3", RunState::Working, "2026-11-06T11:02:00Z"),
+        run_at("asf-4", RunState::Starting, "2026-11-06T11:03:00Z"),
+    ];
+    let header = header_of(s.clone());
+    assert!(header.contains("workers 1/1"), "{header}");
+    assert!(header.contains("reviewers 2"), "{header}");
+    assert!(!header.contains("workers 4"), "{header}");
+    // the same number the scheduler reads for `asf run plan`
+    let c = scheduler::count_active_runs(&s.issues, &s.runs);
+    assert_eq!((c.workers, c.reviewers), (1, 2));
+}
+
+#[test]
+fn the_header_counts_each_state_the_scheduler_counts_and_no_other() {
+    for (state, counted) in [
+        (RunState::Starting, true),
+        (RunState::Working, true),
+        (RunState::Blocked, true),
+        (RunState::Finishing, true),
+        (RunState::Verifying, true),
+        (RunState::Stalled, false),
+        (RunState::OverBudget, false),
+    ] {
+        let mut s = desk(live(&["asf-1"]));
+        s.runs = vec![run_at("asf-1", state, "2026-11-06T11:00:00Z")];
+        let header = header_of(s);
+        let want = format!("workers {}/2", u8::from(counted));
+        assert!(header.contains(&want), "{state}: {header}");
+        assert!(!header.contains("reviewers"), "{state}: {header}");
+    }
+}
+
+#[test]
+fn a_reopened_run_is_one_worker_and_the_header_agrees_with_the_running_section() {
+    // asf-1 came back from a review (`fixing after review`): its first run is over, the second works.
+    // One worker, one slot, one RUNNING row; the two reviewers are RUNNING rows too, so the rows are
+    // `workers + reviewers` while nobody is blocked.
+    let mut s = desk(vec![
+        issue("asf-1", "Reopened", Status::InProgress),
+        issue("asf-2", "Plain", Status::InProgress),
+        review_issue("asf-3"),
+        review_issue("asf-4"),
+    ]);
+    let mut again = run_at("asf-1", RunState::Working, "2026-11-06T11:10:00Z");
+    again.attempt = 2;
+    s.runs = vec![
+        run_at("asf-2", RunState::Working, "2026-11-06T11:00:00Z"),
+        again,
+        run_at("asf-3", RunState::Working, "2026-11-06T11:02:00Z"),
+        run_at("asf-4", RunState::Verifying, "2026-11-06T11:03:00Z"),
+    ];
+    s.queue = vec![merge_item(
+        1,
+        "asf-1",
+        MergeState::Failed,
+        Some("review asks for changes"),
+        "2026-11-06T11:09:00Z",
+    )];
+    let rows = now::running(&s).len();
+    let header = header_of(s);
+    assert!(header.contains("workers 2/2"), "{header}");
+    assert!(header.contains("reviewers 2"), "{header}");
+    assert_eq!(rows, 4, "RUNNING lists 2 workers + 2 reviewers");
+}
+
+#[test]
+fn a_blocked_worker_holds_a_slot_but_is_listed_under_needs_you_not_running() {
+    let mut s = desk(live(&["asf-1", "asf-2"]));
+    s.runs = vec![
+        run_at("asf-1", RunState::Blocked, "2026-11-06T11:00:00Z"),
+        run_at("asf-2", RunState::Working, "2026-11-06T11:01:00Z"),
+    ];
+    assert_eq!(now::running(&s).len(), 1, "the blocked run is a NEEDS YOU row");
+    let header = header_of(s);
+    assert!(
+        header.contains("workers 2/2"),
+        "the scheduler counts it: {header}"
+    );
+}
+
+#[test]
 fn a_peek_keeps_the_pane_in_the_snapshot_for_the_views() {
     let mut a = open_overlay();
     a.set_pane_preview(id("asf-2"), "line 1\nline 2".into());

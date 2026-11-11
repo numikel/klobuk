@@ -26,13 +26,59 @@ pub const REVIEW_STARTED: &str = "merge.review_started";
 /// How many events the Log view keeps (the newest).
 const LOG_LIMIT: usize = 200;
 
+/// Failed runtime probes in a row before the header says the runtime is down. The probe runs every
+/// couple of seconds on a machine that may be loaded; one miss is not an outage.
+pub const RUNTIME_DOWN_AFTER: u32 = 3;
+
+/// What the header knows about the runtime, carried from one snapshot to the next.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeState {
+    pub ok: Option<bool>,
+    pub failures: u32,
+    pub reason: Option<String>,
+}
+
+impl RuntimeState {
+    /// The state after one refresh. `probe` is `None` when this refresh did not ask the runtime (the
+    /// store is read more often than the runtime is probed): nothing is learned, the state stays.
+    /// A failed probe keeps the last known state until [`RUNTIME_DOWN_AFTER`] of them follow each other;
+    /// an answer resets the count.
+    pub fn observe(&self, probe: Option<Result<(), String>>) -> RuntimeState {
+        match probe {
+            None => self.clone(),
+            Some(Ok(())) => RuntimeState {
+                ok: Some(true),
+                failures: 0,
+                reason: None,
+            },
+            Some(Err(reason)) => {
+                let failures = self.failures.saturating_add(1);
+                RuntimeState {
+                    ok: if failures >= RUNTIME_DOWN_AFTER {
+                        Some(false)
+                    } else {
+                        self.ok
+                    },
+                    failures,
+                    reason: Some(reason),
+                }
+            }
+        }
+    }
+}
+
 /// Everything the TUI shows, loaded in one pass ([`load_snapshot`]).
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub repo_name: String,
     pub branch: String,
-    /// `None` = runtime not probed, `Some(false)` = unhealthy.
+    /// `None` = no probe has answered yet, `Some(true)` = up, `Some(false)` = [`RUNTIME_DOWN_AFTER`]
+    /// probes in a row failed. One slow or failed probe does not change it ([`RuntimeState::observe`]).
     pub runtime_ok: Option<bool>,
+    /// Probes that failed in a row, ending with the latest one.
+    pub runtime_failures: u32,
+    /// The error of the latest failed probe; `None` while the runtime answers.
+    pub runtime_reason: Option<String>,
     pub max_parallel: usize,
     pub issues: Vec<Issue>,
     pub claims: Vec<Claim>,
@@ -120,6 +166,22 @@ impl Snapshot {
 
     pub fn issue(&self, id: &IssueId) -> Option<&Issue> {
         self.issues.iter().find(|i| &i.id == id)
+    }
+
+    /// The runtime health to hand to the next [`load_snapshot`].
+    pub fn runtime_state(&self) -> RuntimeState {
+        RuntimeState {
+            ok: self.runtime_ok,
+            failures: self.runtime_failures,
+            reason: self.runtime_reason.clone(),
+        }
+    }
+
+    /// Worker and reviewer runs that hold a slot, counted by the scheduler's own function, so the
+    /// header can never disagree with `asf run plan`. `runs` is every run that has not ended, which
+    /// is more than that: stalled and over-budget runs hold no slot.
+    pub fn run_counts(&self) -> scheduler::RunCounts {
+        scheduler::count_active_runs(&self.issues, &self.runs)
     }
 
     /// The active run of `id`.
@@ -686,7 +748,9 @@ pub fn read_config_text(root: &Path) -> std::io::Result<String> {
     Ok(raw.trim_start_matches('\u{feff}').replace("\r\n", "\n"))
 }
 
-/// Loads everything the TUI shows. `rt` adds live agent states (skipped when `None`).
+/// Loads everything the TUI shows. `rt` adds live agent states and one health probe (both skipped when
+/// `None`); `prev_runtime` is the health the last snapshot ended with, which a skipped or failed probe
+/// leaves in place (see [`RuntimeState::observe`]).
 ///
 /// The settings it carries (`max_parallel`, the review and merge switches, the models of the runs)
 /// come from `.factory/config.toml` as it is now, not from the `Ctx` loaded when the TUI started, so an
@@ -696,6 +760,7 @@ pub fn load_snapshot(
     ctx: &Ctx,
     rt: Option<&dyn AgentRuntime>,
     prev_agents: &BTreeMap<IssueId, AgentInfo>,
+    prev_runtime: &RuntimeState,
 ) -> Result<Snapshot, AppError> {
     let store = &ctx.store;
     let config_text = read_config_text(&ctx.root).ok();
@@ -705,9 +770,9 @@ pub fn load_snapshot(
     let cfg = live_config.as_ref().unwrap_or(&ctx.config);
     let runs = store.runs(None, true)?;
     let mut agents = prev_agents.clone();
-    let mut runtime_ok = None;
+    let mut runtime = prev_runtime.observe(None);
     if let Some(rt) = rt {
-        runtime_ok = Some(rt.health().is_ok());
+        runtime = prev_runtime.observe(Some(rt.health().map(|_| ()).map_err(|e| e.to_string())));
         for r in &runs {
             if let (Some(pane), Some(name)) = (&r.pane_id, &r.agent_name) {
                 let h = AgentHandle {
@@ -816,7 +881,9 @@ pub fn load_snapshot(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
         branch: cfg.repo.default_branch.clone(),
-        runtime_ok,
+        runtime_ok: runtime.ok,
+        runtime_failures: runtime.failures,
+        runtime_reason: runtime.reason,
         max_parallel: cfg.scheduler.max_parallel,
         issues,
         claims: store.active_claims()?,
