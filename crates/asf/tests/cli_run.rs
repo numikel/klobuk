@@ -577,6 +577,51 @@ fn answering_a_scope_dialog_with_the_grant_extends_the_scope_and_resolves_the_qu
     assert_eq!(active_run(&f).state, RunState::Working);
 }
 
+/// The same dialog with the cursor on the refusal (the human pressed Down in the overlay).
+const SCOPE_DIALOG_CURSOR_ON_REFUSAL: &str =
+    "SCOPE: Cargo.toml because the greeting needs a new dependency\n \
+     \x20 1. Grant Cargo.toml\n ❯ 2. Refuse";
+
+#[test]
+fn confirming_a_scope_dialog_with_enter_on_the_grant_extends_the_scope() {
+    let f = setup();
+    let q = scope_dialog_posted(&f, SCOPE_DIALOG);
+
+    f.repo.ok(&["run", "keys", &f.issue, "enter"]);
+
+    assert_eq!(file_scope(&f), serde_json::json!(["src/**", "Cargo.toml"]));
+    assert_eq!(answers_to(&f, q).len(), 1, "the QUESTION is answered once");
+    assert_eq!(keys_sent(&f), vec![serde_json::json!(["enter"])]);
+    assert_eq!(active_run(&f).state, RunState::Working);
+}
+
+#[test]
+fn enter_with_the_cursor_on_the_refusal_only_sends_the_keys() {
+    let f = setup();
+    // the BLOCKER quoted the dialog with the cursor on option 1; the human then moved it down
+    let q = scope_dialog_posted(&f, SCOPE_DIALOG);
+    fake(&f)
+        .script(serde_json::json!({ "screen": SCOPE_DIALOG_CURSOR_ON_REFUSAL }))
+        .unwrap();
+
+    f.repo.ok(&["run", "keys", &f.issue, "enter"]);
+
+    assert_eq!(file_scope(&f), serde_json::json!(["src/**"]), "scope unchanged");
+    assert!(answers_to(&f, q).is_empty(), "the QUESTION stays open");
+    assert_eq!(keys_sent(&f), vec![serde_json::json!(["enter"])]);
+}
+
+#[test]
+fn enter_on_a_dialog_that_was_never_a_grant_only_sends_the_keys() {
+    let f = setup();
+    scope_dialog_posted(&f, SCOPE_DIALOG_CURSOR_ON_REFUSAL);
+
+    f.repo.ok(&["run", "keys", &f.issue, "enter"]);
+
+    assert_eq!(file_scope(&f), serde_json::json!(["src/**"]));
+    assert_eq!(keys_sent(&f), vec![serde_json::json!(["enter"])]);
+}
+
 #[test]
 fn refusing_a_scope_dialog_only_sends_the_keys() {
     let f = setup();

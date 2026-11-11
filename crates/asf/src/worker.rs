@@ -485,6 +485,18 @@ fn tail(s: &str, n: usize) -> String {
 /// Lines of wrapped question text read after the `SCOPE:` line while looking for `because`.
 const SCOPE_WRAP_LINES: usize = 3;
 
+/// Lines of the live pane read to see where the cursor of a `SCOPE:` dialog is when Enter is pressed.
+const SCOPE_LIVE_LINES: u32 = 40;
+
+/// True when the option-1 line of the screen carries the selection cursor (`❯` or `>`), i.e. Enter
+/// would pick it.
+fn first_option_has_cursor(screen: &str) -> bool {
+    screen.lines().any(|l| {
+        let option = l.trim_start_matches(|c: char| !c.is_alphanumeric());
+        option.starts_with("1.") && l[..l.len() - option.len()].contains(['❯', '>'])
+    })
+}
+
 /// Splits a path list (`a, b` or `a b`) and strips the quotes a worker may put around each path.
 fn split_globs(list: &str) -> Vec<String> {
     list.split(|c: char| c.is_whitespace() || c == ',')
@@ -1382,13 +1394,14 @@ impl<'a> Worker<'a> {
     }
 
     /// Sends keys to the worker's pane. When the run waits on a `SCOPE:` dialog and the key picks its
-    /// first option (`Grant <path>`), the scope is extended first with the code of `asf issue scope add`
-    /// (which also answers the `SCOPE:` QUESTION), so the worker's hook lets the file through the moment
-    /// the dialog closes. Any other key, or a dialog that is not a scope request, only sends the keys.
+    /// first option (`Grant <path>`: the key `1`, or Enter while the cursor is on that option), the scope
+    /// is extended first with the code of `asf issue scope add` (which also answers the `SCOPE:`
+    /// QUESTION), so the worker's hook lets the file through the moment the dialog closes. Any other
+    /// key, or a dialog that is not a scope request, only sends the keys.
     pub fn keys(&self, id: &IssueId, keys: &[String]) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
         let h = Self::handle(&run)?;
-        if let Some(globs) = self.granted_scope(&run, keys)? {
+        if let Some(globs) = self.granted_scope(&run, &h, keys)? {
             crate::commands::issue::scope(
                 self.ctx,
                 &crate::cli::ScopeCmd::Add {
@@ -1402,20 +1415,40 @@ impl<'a> Worker<'a> {
         self.unblock(&run)
     }
 
-    /// The paths a `SCOPE:` dialog asks for when `keys` is the answer "1" and the run is blocked on that
-    /// dialog. The dialog is read from the newest BLOCKER the orchestrator posted for the run: a comment
-    /// by anyone else could be a worker faking a dialog to get a grant for the human's next "1".
-    fn granted_scope(&self, run: &Run, keys: &[String]) -> Result<Option<Vec<String>>, AppError> {
-        if run.state != RunState::Blocked || keys != ["1"] {
+    /// The paths a `SCOPE:` dialog asks for when `keys` answers it with the grant and the run is blocked
+    /// on that dialog. The dialog is read from the newest BLOCKER the orchestrator posted for the run: a
+    /// comment by anyone else could be a worker faking a dialog to get a grant for the human's next key.
+    /// "1" picks the grant by itself. Enter picks whatever is highlighted, and the BLOCKER is only a
+    /// snapshot (the human may have moved the cursor with Down since), so the live pane must show the
+    /// same dialog with the cursor on option 1; a pane that cannot be read or shows anything else is
+    /// "not a grant".
+    fn granted_scope(
+        &self,
+        run: &Run,
+        h: &AgentHandle,
+        keys: &[String],
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let enter = keys == ["enter"];
+        if run.state != RunState::Blocked || !(enter || keys == ["1"]) {
             return Ok(None);
         }
         let comments = self.ctx.store.comments(&run.issue_id)?;
-        Ok(comments
+        let Some(globs) = comments
             .iter()
             .rev()
             .find(|c| c.kind == CommentType::Blocker)
             .filter(|c| c.author == LANE_ORCHESTRATOR)
-            .and_then(|c| scope_dialog_grant(&c.body)))
+            .and_then(|c| scope_dialog_grant(&c.body))
+        else {
+            return Ok(None);
+        };
+        if enter {
+            let live = self.rt.read(h, SCOPE_LIVE_LINES).unwrap_or_default();
+            if scope_dialog_grant(&live).as_ref() != Some(&globs) || !first_option_has_cursor(&live) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(globs))
     }
 
     pub fn nudge(&self, id: &IssueId) -> Result<Run, AppError> {
@@ -1970,6 +2003,18 @@ mod tests {
         assert_eq!(
             scope_dialog_grant(&blocker_with("SCOPE: because x\n 1. Grant\n 2. Refuse")),
             None
+        );
+    }
+
+    #[test]
+    fn first_option_has_cursor_sees_the_marker_only_on_option_one() {
+        assert!(first_option_has_cursor(" ❯ 1. Grant a.rs\n   2. Refuse"));
+        assert!(first_option_has_cursor("> 1. Grant a.rs\n  2. Refuse"));
+        assert!(!first_option_has_cursor("   1. Grant a.rs\n ❯ 2. Refuse"));
+        assert!(!first_option_has_cursor("   1. Grant a.rs\n   2. Refuse"));
+        assert!(
+            !first_option_has_cursor("a > b\n 11. Grant a.rs"),
+            "a > elsewhere is no cursor"
         );
     }
 
