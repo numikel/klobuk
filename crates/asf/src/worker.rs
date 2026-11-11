@@ -485,24 +485,48 @@ fn tail(s: &str, n: usize) -> String {
 /// Lines of wrapped question text read after the `SCOPE:` line while looking for `because`.
 const SCOPE_WRAP_LINES: usize = 3;
 
+/// Splits a path list (`a, b` or `a b`) and strips the quotes a worker may put around each path.
+fn split_globs(list: &str) -> Vec<String> {
+    list.split(|c: char| c.is_whitespace() || c == ',')
+        .map(|p| p.trim_matches(['`', '"', '\'']))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A glob a one-key grant may add: inside the repo (no `..`, no absolute path or drive) and not a
+/// wildcard that covers everything. Anything wider is the operator's call through `asf issue scope add`.
+fn grantable_glob(g: &str) -> bool {
+    let absolute = g.starts_with(['/', '\\']) || g.as_bytes().get(1) == Some(&b':');
+    let climbs = g.split(['/', '\\']).any(|part| part == "..");
+    let everything = g.chars().all(|c| matches!(c, '*' | '/'));
+    !absolute && !climbs && !everything
+}
+
 /// The paths of a scope request in a BLOCKER body that quotes a worker's AskUserQuestion screen: the
 /// question starts with `SCOPE: <path> because <reason>` (it may wrap onto the next lines) and option 1
-/// reads `Grant <path>`. `None` when the screen is anything else, including a scope dialog whose first
-/// option is not the grant, so that "1" never extends a scope by accident.
+/// reads `Grant <path>`. The dialog is worker-written text, so it must agree with itself: one `SCOPE:`
+/// line, one option 1, the same paths in both, each of them grantable. `None` otherwise (including a
+/// scope dialog whose first option is not the grant), so "1" never extends a scope by accident.
 fn scope_dialog_grant(body: &str) -> Option<Vec<String>> {
     const MARK: &str = "SCOPE:";
     let lines: Vec<&str> = body.lines().collect();
     // the cursor / box characters before the option number are not part of the option
-    let grant_first = lines.iter().any(|l| {
+    let mut options = lines.iter().filter_map(|l| {
         l.trim_start_matches(|c: char| !c.is_alphanumeric())
             .strip_prefix("1.")
-            .is_some_and(|rest| rest.trim_start().starts_with("Grant"))
     });
-    if !grant_first {
+    let option = options.next()?.trim_start();
+    if options.next().is_some() {
         return None;
     }
-    let at = lines.iter().position(|l| l.contains(MARK))?;
-    let mut text = lines[at][lines[at].find(MARK)? + MARK.len()..].trim().to_string();
+    let granted = split_globs(option.strip_prefix("Grant")?);
+    let mut marks = lines.iter().enumerate().filter(|(_, l)| l.contains(MARK));
+    let (at, line) = marks.next()?;
+    if marks.next().is_some() {
+        return None;
+    }
+    let mut text = line[line.find(MARK)? + MARK.len()..].trim().to_string();
     for next in lines[at + 1..].iter().take(SCOPE_WRAP_LINES) {
         let next = next.trim();
         if text.contains("because") || next.is_empty() || next.starts_with(|c: char| c.is_ascii_digit()) {
@@ -512,13 +536,8 @@ fn scope_dialog_grant(body: &str) -> Option<Vec<String>> {
         text.push_str(next);
     }
     let (paths, _reason) = text.split_once("because")?;
-    let globs: Vec<String> = paths
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .map(|p| p.trim_matches(['`', '"', '\'']))
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect();
-    (!globs.is_empty()).then_some(globs)
+    let globs = split_globs(paths);
+    (!globs.is_empty() && globs == granted && globs.iter().all(|g| grantable_glob(g))).then_some(globs)
 }
 
 impl<'a> Worker<'a> {
@@ -1951,6 +1970,51 @@ mod tests {
         assert_eq!(
             scope_dialog_grant(&blocker_with("SCOPE: because x\n 1. Grant\n 2. Refuse")),
             None
+        );
+    }
+
+    #[test]
+    fn scope_dialog_grant_refuses_a_dialog_that_disagrees_with_itself_or_asks_too_much() {
+        // the question says one thing, option 1 (what the human reads) another
+        assert_eq!(
+            scope_dialog_grant(&blocker_with(
+                "SCOPE: ** because x\n 1. Grant Cargo.toml\n 2. Refuse"
+            )),
+            None
+        );
+        // two questions or two first options on one screen
+        assert_eq!(
+            scope_dialog_grant(&blocker_with(
+                "SCOPE: a.rs because x\nSCOPE: ** because y\n 1. Grant a.rs\n 2. Refuse"
+            )),
+            None
+        );
+        assert_eq!(
+            scope_dialog_grant(&blocker_with(
+                "SCOPE: a.rs because x\n 1. Grant a.rs\n 1. Grant a.rs"
+            )),
+            None
+        );
+        // paths that leave the repo or cover all of it are for `asf issue scope add`
+        for wide in [
+            "**",
+            "*",
+            "**/*",
+            "../x.rs",
+            "src/../../x",
+            "/etc/passwd",
+            "C:/x",
+            "\\\\srv\\x",
+        ] {
+            let screen = format!("SCOPE: {wide} because x\n 1. Grant {wide}\n 2. Refuse");
+            assert_eq!(scope_dialog_grant(&blocker_with(&screen)), None, "{wide}");
+        }
+        // a narrow glob is fine
+        assert_eq!(
+            scope_dialog_grant(&blocker_with(
+                "SCOPE: src/**/*.rs because x\n 1. Grant src/**/*.rs"
+            )),
+            Some(vec!["src/**/*.rs".to_string()])
         );
     }
 
