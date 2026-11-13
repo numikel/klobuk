@@ -485,15 +485,31 @@ fn tail(s: &str, n: usize) -> String {
 /// Lines of wrapped question text read after the `SCOPE:` line while looking for `because`.
 const SCOPE_WRAP_LINES: usize = 3;
 
-/// Lines of the live pane read to see where the cursor of a `SCOPE:` dialog is when Enter is pressed.
+/// Lines of the pane a BLOCKER quotes (its tail). Enter is judged on the same window, so a dialog that
+/// key `1` accepts is accepted by Enter too.
+const BLOCKER_SCREEN_LINES: usize = 20;
+
+/// Lines read from the live pane before it is cut to `BLOCKER_SCREEN_LINES`.
 const SCOPE_LIVE_LINES: u32 = 40;
 
-/// True when the option-1 line of the screen carries the selection cursor (`❯` or `>`), i.e. Enter
+/// A dialog line without the cursor / box characters in front of its text.
+fn after_marker(line: &str) -> &str {
+    line.trim_start_matches(|c: char| !c.is_alphanumeric())
+}
+
+/// The option-1 line of the dialog: the last `1.` line of the screen. The dialog is the newest thing
+/// in the pane, so numbered prose or older dialogs above it do not count.
+fn option_one(lines: &[&str]) -> Option<usize> {
+    lines.iter().rposition(|l| after_marker(l).starts_with("1."))
+}
+
+/// True when the option-1 line of the dialog carries the selection cursor (`❯` or `>`), i.e. Enter
 /// would pick it.
 fn first_option_has_cursor(screen: &str) -> bool {
-    screen.lines().any(|l| {
-        let option = l.trim_start_matches(|c: char| !c.is_alphanumeric());
-        option.starts_with("1.") && l[..l.len() - option.len()].contains(['❯', '>'])
+    let lines: Vec<&str> = screen.lines().collect();
+    option_one(&lines).is_some_and(|i| {
+        let l = lines[i];
+        l[..l.len() - after_marker(l).len()].contains(['❯', '>'])
     })
 }
 
@@ -517,29 +533,22 @@ fn grantable_glob(g: &str) -> bool {
 
 /// The paths of a scope request in a BLOCKER body that quotes a worker's AskUserQuestion screen: the
 /// question starts with `SCOPE: <path> because <reason>` (it may wrap onto the next lines) and option 1
-/// reads `Grant <path>`. The dialog is worker-written text, so it must agree with itself: one `SCOPE:`
-/// line, one option 1, the same paths in both, each of them grantable. `None` otherwise (including a
-/// scope dialog whose first option is not the grant), so "1" never extends a scope by accident.
+/// reads `Grant <path>`. Only the dialog block counts: option 1 is the last `1.` line of the screen and
+/// the question is the nearest `SCOPE:` line above it, so the worker's own record of the QUESTION (a
+/// Bash call) or numbered prose higher up cannot confuse it. The dialog is worker-written text, so it
+/// must agree with itself: the same paths in the question and in option 1, each of them grantable.
+/// `None` otherwise (including a scope dialog whose first option is not the grant), so "1" never
+/// extends a scope by accident.
 fn scope_dialog_grant(body: &str) -> Option<Vec<String>> {
     const MARK: &str = "SCOPE:";
     let lines: Vec<&str> = body.lines().collect();
-    // the cursor / box characters before the option number are not part of the option
-    let mut options = lines.iter().filter_map(|l| {
-        l.trim_start_matches(|c: char| !c.is_alphanumeric())
-            .strip_prefix("1.")
-    });
-    let option = options.next()?.trim_start();
-    if options.next().is_some() {
-        return None;
-    }
+    let option_at = option_one(&lines)?;
+    let option = after_marker(lines[option_at]).strip_prefix("1.")?.trim_start();
     let granted = split_globs(option.strip_prefix("Grant")?);
-    let mut marks = lines.iter().enumerate().filter(|(_, l)| l.contains(MARK));
-    let (at, line) = marks.next()?;
-    if marks.next().is_some() {
-        return None;
-    }
+    let at = lines[..option_at].iter().rposition(|l| l.contains(MARK))?;
+    let line = lines[at];
     let mut text = line[line.find(MARK)? + MARK.len()..].trim().to_string();
-    for next in lines[at + 1..].iter().take(SCOPE_WRAP_LINES) {
+    for next in lines[at + 1..option_at].iter().take(SCOPE_WRAP_LINES) {
         let next = next.trim();
         if text.contains("because") || next.is_empty() || next.starts_with(|c: char| c.is_ascii_digit()) {
             break;
@@ -1302,7 +1311,7 @@ impl<'a> Worker<'a> {
                 "Worker for {} could not start: {e}\n\nScreen:\n```\n{}\n```\nInspect the pane (`asf run show {}`), answer with \
                  `asf run keys {} <key>` / `asf run reply {} <text>`, or `asf run abort {}`.",
                 run.issue_id,
-                tail(&screen, 20),
+                tail(&screen, BLOCKER_SCREEN_LINES),
                 run.issue_id,
                 run.issue_id,
                 run.issue_id,
@@ -1443,7 +1452,10 @@ impl<'a> Worker<'a> {
             return Ok(None);
         };
         if enter {
-            let live = self.rt.read(h, SCOPE_LIVE_LINES).unwrap_or_default();
+            let live = tail(
+                &self.rt.read(h, SCOPE_LIVE_LINES).unwrap_or_default(),
+                BLOCKER_SCREEN_LINES,
+            );
             if scope_dialog_grant(&live).as_ref() != Some(&globs) || !first_option_has_cursor(&live) {
                 return Ok(None);
             }
@@ -1529,7 +1541,7 @@ impl<'a> Worker<'a> {
                             "Worker for {} is waiting for input.\n\nScreen:\n```\n{}\n```\nAnswer with `asf run keys {} y` / \
                              `asf run reply {} <text>` (or open the pane).",
                             run.issue_id,
-                            tail(&screen, 20),
+                            tail(&screen, BLOCKER_SCREEN_LINES),
                             run.issue_id,
                             run.issue_id
                         ),
@@ -2007,6 +2019,33 @@ mod tests {
     }
 
     #[test]
+    fn scope_dialog_grant_reads_the_dialog_block_below_the_workers_own_scope_text() {
+        // the worker's QUESTION record (a Bash call) and a numbered line of its prose sit above the dialog
+        let screen = "● Bash(asf issue comment asf-1 --body \"SCOPE: Cargo.toml because x\")\n  1. Ask for it\n  2. Wait\n \
+                      ☐ Scope\nSCOPE: Cargo.toml because x\n ❯ 1. Grant Cargo.toml\n   2. Refuse";
+        assert_eq!(
+            scope_dialog_grant(&blocker_with(screen)),
+            Some(vec!["Cargo.toml".to_string()])
+        );
+        // the paths of the dialog still have to match its own option, not the record above it
+        let disagree =
+            "SCOPE: a.rs because x\n ☐ Scope\nSCOPE: b.rs because x\n ❯ 1. Grant a.rs\n   2. Refuse";
+        assert_eq!(scope_dialog_grant(&blocker_with(disagree)), None);
+        // an older dialog above a screen whose newest option 1 is no grant
+        let newer = "SCOPE: a.rs because x\n 1. Grant a.rs\n 2. Refuse\nAllow Bash(ls)?\n ❯ 1. Yes\n   2. No";
+        assert_eq!(scope_dialog_grant(&blocker_with(newer)), None);
+    }
+
+    #[test]
+    fn first_option_has_cursor_judges_the_last_option_one_only() {
+        let older_marked =
+            "> 1. an older list\n  2. x\nSCOPE: a.rs because x\n   1. Grant a.rs\n ❯ 2. Refuse";
+        assert!(!first_option_has_cursor(older_marked));
+        let newer_marked = "  1. an older list\nSCOPE: a.rs because x\n ❯ 1. Grant a.rs\n   2. Refuse";
+        assert!(first_option_has_cursor(newer_marked));
+    }
+
+    #[test]
     fn first_option_has_cursor_sees_the_marker_only_on_option_one() {
         assert!(first_option_has_cursor(" ❯ 1. Grant a.rs\n   2. Refuse"));
         assert!(first_option_has_cursor("> 1. Grant a.rs\n  2. Refuse"));
@@ -2027,16 +2066,17 @@ mod tests {
             )),
             None
         );
-        // two questions or two first options on one screen
+        // the nearest question above option 1 is the one that counts
         assert_eq!(
             scope_dialog_grant(&blocker_with(
                 "SCOPE: a.rs because x\nSCOPE: ** because y\n 1. Grant a.rs\n 2. Refuse"
             )),
             None
         );
+        // the newest option 1 is the dialog's, an older one with other paths does not help
         assert_eq!(
             scope_dialog_grant(&blocker_with(
-                "SCOPE: a.rs because x\n 1. Grant a.rs\n 1. Grant a.rs"
+                "SCOPE: a.rs because x\n 1. Grant a.rs\n 1. Grant b.rs"
             )),
             None
         );

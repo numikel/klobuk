@@ -595,6 +595,49 @@ fn confirming_a_scope_dialog_with_enter_on_the_grant_extends_the_scope() {
     assert_eq!(active_run(&f).state, RunState::Working);
 }
 
+/// The brief has the worker post the QUESTION first, so its Bash call (with the `SCOPE:` text) and a
+/// numbered line of its own prose sit in the pane right above the dialog.
+const SCOPE_DIALOG_BELOW_THE_RECORD: &str = "● Bash(asf issue comment asf-x --type QUESTION --body \"SCOPE: Cargo.toml because the greeting needs a new dependency\")\n  \
+     Plan:\n  1. Ask for Cargo.toml\n  2. Wait for the answer\n \
+     ☐ Scope\nSCOPE: Cargo.toml because the greeting needs a new dependency\n \
+     ❯ 1. Grant Cargo.toml\n   2. Refuse";
+
+#[test]
+fn a_dialog_below_the_workers_own_record_of_the_question_still_grants() {
+    let f = setup();
+    let q = scope_dialog_posted(&f, SCOPE_DIALOG_BELOW_THE_RECORD);
+
+    f.repo.ok(&["run", "keys", &f.issue, "1"]);
+
+    assert_eq!(file_scope(&f), serde_json::json!(["src/**", "Cargo.toml"]));
+    assert_eq!(answers_to(&f, q).len(), 1, "the QUESTION is answered once");
+}
+
+#[test]
+fn enter_on_a_dialog_below_the_workers_own_record_of_the_question_grants_too() {
+    let f = setup();
+    let q = scope_dialog_posted(&f, SCOPE_DIALOG_BELOW_THE_RECORD);
+
+    f.repo.ok(&["run", "keys", &f.issue, "enter"]);
+
+    assert_eq!(file_scope(&f), serde_json::json!(["src/**", "Cargo.toml"]));
+    assert_eq!(answers_to(&f, q).len(), 1);
+}
+
+#[test]
+fn enter_is_judged_on_the_same_window_as_the_blocker_not_on_older_scrollback() {
+    let f = setup();
+    // 25 lines of older output above the dialog: an old SCOPE line and a numbered item of prose
+    let old =
+        "SCOPE: old.rs because earlier\n1. an older numbered item\n".to_string() + &"output\n".repeat(23);
+    let q = scope_dialog_posted(&f, &format!("{old}{SCOPE_DIALOG}"));
+
+    f.repo.ok(&["run", "keys", &f.issue, "enter"]);
+
+    assert_eq!(file_scope(&f), serde_json::json!(["src/**", "Cargo.toml"]));
+    assert_eq!(answers_to(&f, q).len(), 1);
+}
+
 #[test]
 fn enter_with_the_cursor_on_the_refusal_only_sends_the_keys() {
     let f = setup();

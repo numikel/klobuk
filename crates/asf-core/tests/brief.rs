@@ -112,6 +112,11 @@ fn worker_brief_asks_scope_requests_in_the_dialog_with_a_grant_option_first() {
         p.contains("asf extends your scope and answers the QUESTION"),
         "{p}"
     );
+    // the QUESTION must exist before the human can grant, or asf has nothing to answer
+    assert!(
+        p.contains("Post the same text for the record BEFORE you open the dialog"),
+        "{p}"
+    );
 }
 
 #[test]

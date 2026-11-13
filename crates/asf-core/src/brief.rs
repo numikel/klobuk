@@ -125,7 +125,7 @@ recommended one first; the human answers in that dialog, not in the inbox. Also 
 finish guard see it: `{asf} issue comment {id} --type QUESTION --to human --body \"...\"`. `{asf} issue finish` is refused while a \
 QUESTION to human is unanswered, so resolve every one before finishing.\n\
 - Scope too narrow: when you need a file outside your scope, ask for it with AskUserQuestion. The question text starts with \
-`SCOPE: <path> because <reason>`, option 1 is `Grant <path>` and option 2 refuses. Post the same text for the record: \
+`SCOPE: <path> because <reason>`, option 1 is `Grant <path>` and option 2 refuses. Post the same text for the record BEFORE you open the dialog, so the QUESTION exists when the human grants: \
 `{asf} issue comment {id} --type QUESTION --to human --body \"SCOPE: <path> because <reason>\"`. When the human picks option 1, \
 asf extends your scope and answers the QUESTION (`scope extended: ...`) at once; continue with other work and check \
 `{asf} issue inbox` if you are not sure.\n\
