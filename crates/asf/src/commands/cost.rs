@@ -1,7 +1,8 @@
 //! `asf cost` — what the runs cost, per epic and on average. Read-only.
 
-use asf_core::cost::{epic_breakdown, rollup, CostReport, Costs, EpicBreakdown, RunStat};
+use asf_core::cost::{epic_breakdown, rollup, today, CostReport, Costs, EpicBreakdown, RunStat, TodayCost};
 use asf_core::{IssueFilter, IssueStore};
+use serde::Serialize;
 
 use crate::cli::{Cli, CostArgs};
 use crate::ctx::Ctx;
@@ -20,10 +21,37 @@ pub fn run(cli: &Cli, args: &CostArgs) -> Result<Rendered, AppError> {
         }
         None => {
             let report = rollup(&issues, &runs);
-            let text = report_text(&report);
-            Rendered::new(&report, text)
+            let today = today(&issues, &runs, time::OffsetDateTime::now_utc().date());
+            let text = format!("{}\n{}", report_text(&report), today_text(&today));
+            Rendered::new(
+                &WithToday {
+                    report: &report,
+                    today: &today,
+                },
+                text,
+            )
         }
     }
+}
+
+/// The rollup with the day's cost next to it; `flatten` keeps the existing fields where they were.
+#[derive(Serialize)]
+struct WithToday<'a> {
+    #[serde(flatten)]
+    report: &'a CostReport,
+    today: &'a TodayCost,
+}
+
+fn today_text(t: &TodayCost) -> String {
+    format!(
+        "today {}: {} task runs {}, {} review runs {}, total {}",
+        t.date,
+        t.task_runs,
+        usd(t.task_cost),
+        t.review_runs,
+        usd(t.review_cost),
+        usd(t.total)
+    )
 }
 
 fn usd(v: f64) -> String {

@@ -15,6 +15,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
+use time::format_description::well_known::Rfc3339;
+use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::ids::IssueId;
 use crate::model::{Issue, IssueType, Status};
@@ -257,6 +259,54 @@ pub fn rollup(issues: &[Issue], runs: &[Run]) -> CostReport {
     report
 }
 
+/// What the runs started on one UTC date cost.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TodayCost {
+    /// The UTC date, `YYYY-MM-DD`.
+    pub date: String,
+    pub task_runs: usize,
+    pub review_runs: usize,
+    pub task_cost: f64,
+    pub review_cost: f64,
+    /// `task_cost + review_cost`.
+    pub total: f64,
+}
+
+/// The runs whose `started_at` falls on the UTC date `date`, split into task and review runs. The date is
+/// a parameter so the core reads no clock. The cost rules of the module apply: every run state counts, a
+/// run of an epic or of an unknown issue is ignored. A `started_at` that is not RFC 3339 counts for no day.
+pub fn today(issues: &[Issue], runs: &[Run], date: Date) -> TodayCost {
+    let by_id: HashMap<&IssueId, &Issue> = issues.iter().map(|i| (&i.id, i)).collect();
+    let mut out = TodayCost {
+        date: date.to_string(),
+        task_runs: 0,
+        review_runs: 0,
+        task_cost: 0.0,
+        review_cost: 0.0,
+        total: 0.0,
+    };
+    for r in runs {
+        let started = OffsetDateTime::parse(&r.started_at, &Rfc3339)
+            .ok()
+            .map(|t| t.to_offset(UtcOffset::UTC).date());
+        if started != Some(date) {
+            continue;
+        }
+        let Some(p) = by_id.get(&r.issue_id).and_then(|issue| place(&by_id, issue)) else {
+            continue;
+        };
+        if p.review {
+            out.review_runs += 1;
+            out.review_cost += r.cost_usd;
+        } else {
+            out.task_runs += 1;
+            out.task_cost += r.cost_usd;
+        }
+    }
+    out.total = out.task_cost + out.review_cost;
+    out
+}
+
 /// The tasks of `epic` with their own cost and the cost of their reviews; `None` when `epic` is not an
 /// epic of the store. The rows add up to the epic's total.
 pub fn epic_breakdown(issues: &[Issue], runs: &[Run], epic: &IssueId) -> Option<EpicBreakdown> {
@@ -307,4 +357,104 @@ pub fn epic_breakdown(issues: &[Issue], runs: &[Run], epic: &IssueId) -> Option<
         })
         .collect();
     Some(EpicBreakdown { epic: head, issues })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::date;
+
+    fn issue(id: &str, kind: IssueType, parent: Option<&str>) -> Issue {
+        Issue {
+            id: id.parse().unwrap(),
+            uid: format!("uid-{id}"),
+            title: id.into(),
+            body: String::new(),
+            kind,
+            status: Status::Done,
+            priority: 2,
+            parent_id: parent.map(|p| p.parse().unwrap()),
+            file_scope: Vec::new(),
+            acceptance: Vec::new(),
+            estimate: None,
+            labels: Vec::new(),
+            source: None,
+            created_at: "2026-11-01T00:00:00Z".into(),
+            updated_at: "2026-11-01T00:00:00Z".into(),
+            closed_at: None,
+        }
+    }
+
+    fn run(issue: &str, started_at: &str, cost: f64) -> Run {
+        Run {
+            id: format!("run-{issue}-{started_at}"),
+            issue_id: issue.parse().unwrap(),
+            attempt: 1,
+            runtime: "herdr".into(),
+            agent_name: None,
+            workspace_id: None,
+            pane_id: None,
+            claude_session_id: None,
+            transcript_path: None,
+            worktree: String::new(),
+            branch: String::new(),
+            base_sha: String::new(),
+            state: RunState::Aborted,
+            budget_usd: None,
+            cost_usd: cost,
+            input_tokens: 0,
+            output_tokens: 0,
+            turns: 0,
+            tool_calls: 0,
+            exit_reason: None,
+            report_path: None,
+            started_at: started_at.into(),
+            last_seen_at: None,
+            finished_at: None,
+            herdr_revision: None,
+        }
+    }
+
+    fn desk() -> Vec<Issue> {
+        vec![
+            issue("asf-1", IssueType::Epic, None),
+            issue("asf-2", IssueType::Task, Some("asf-1")),
+            issue("asf-3", IssueType::Review, Some("asf-2")),
+        ]
+    }
+
+    #[test]
+    fn the_utc_day_has_its_edges_at_midnight() {
+        let runs = [
+            run("asf-2", "2026-11-12T23:59:59Z", 1.0),
+            run("asf-2", "2026-11-13T00:00:00Z", 2.0),
+            run("asf-3", "2026-11-13T23:59:59Z", 0.5),
+            run("asf-3", "2026-11-14T00:00:00Z", 4.0),
+        ];
+        let t = today(&desk(), &runs, date!(2026 - 11 - 13));
+        assert_eq!(t.date, "2026-11-13");
+        assert_eq!((t.task_runs, t.review_runs), (1, 1));
+        assert_eq!((t.task_cost, t.review_cost, t.total), (2.0, 0.5, 2.5));
+        let before = today(&desk(), &runs, date!(2026 - 11 - 12));
+        assert_eq!((before.task_runs, before.review_runs, before.total), (1, 0, 1.0));
+    }
+
+    #[test]
+    fn an_offset_is_converted_to_utc_before_the_date_is_taken() {
+        // 01:30 at +02:00 is 23:30 UTC the day before
+        let runs = [run("asf-2", "2026-11-13T01:30:00+02:00", 3.0)];
+        assert_eq!(today(&desk(), &runs, date!(2026 - 11 - 12)).total, 3.0);
+        assert_eq!(today(&desk(), &runs, date!(2026 - 11 - 13)).total, 0.0);
+    }
+
+    #[test]
+    fn runs_of_epics_and_unknown_issues_and_bad_dates_do_not_count() {
+        let runs = [
+            run("asf-1", "2026-11-13T10:00:00Z", 9.0),
+            run("asf-9", "2026-11-13T10:00:00Z", 9.0),
+            run("asf-2", "yesterday", 9.0),
+        ];
+        let t = today(&desk(), &runs, date!(2026 - 11 - 13));
+        assert_eq!((t.task_runs, t.review_runs, t.total), (0, 0, 0.0));
+    }
 }

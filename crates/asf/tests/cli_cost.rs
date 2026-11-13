@@ -213,3 +213,68 @@ fn a_worker_may_read_the_costs() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
 }
+
+/// The UTC date the command is about to read; taken before and after so a midnight in between is no flake.
+fn utc_today() -> String {
+    time::OffsetDateTime::now_utc().date().to_string()
+}
+
+#[test]
+fn json_has_a_today_object_next_to_the_unchanged_fields() {
+    let (r, _) = seeded();
+    let before = utc_today();
+    let res = r.ok(&["cost"]);
+    let after = utc_today();
+    let t = &res["today"];
+    let date = t["date"].as_str().unwrap();
+    assert!(date == before || date == after, "{date}");
+    // every seeded run started just now: 3 task runs ($2.00 + $1.50 + $3.00), 3 review runs ($1.15)
+    assert_eq!(
+        (t["task_runs"].as_u64(), t["review_runs"].as_u64()),
+        (Some(3), Some(3))
+    );
+    assert!((num(&t["task_cost"]) - 6.5).abs() < 1e-9);
+    assert!((num(&t["review_cost"]) - 1.15).abs() < 1e-9);
+    assert!((num(&t["total"]) - 7.65).abs() < 1e-9);
+    for key in ["epics", "no_epic", "averages", "total"] {
+        assert!(!res[key].is_null(), "{key} is gone");
+    }
+}
+
+#[test]
+fn the_text_ends_with_the_today_line() {
+    let (r, _) = seeded();
+    let before = utc_today();
+    let out = text(&r, &["cost"]);
+    let after = utc_today();
+    let last = out.lines().last().unwrap();
+    let ok = [before, after]
+        .iter()
+        .any(|d| last == format!("today {d}: 3 task runs $6.50, 3 review runs $1.15, total $7.65"));
+    assert!(ok, "{out}");
+}
+
+#[test]
+fn with_no_runs_today_says_so_with_zeros() {
+    let r = Repo::initialised();
+    let res = r.ok(&["cost"]);
+    let t = &res["today"];
+    assert_eq!(
+        (t["task_runs"].as_u64(), t["review_runs"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(num(&t["total"]), 0.0);
+    let out = text(&r, &["cost"]);
+    let last = out.lines().last().unwrap();
+    assert!(
+        last.starts_with("today ") && last.ends_with("0 task runs $0.00, 0 review runs $0.00, total $0.00"),
+        "{out}"
+    );
+}
+
+#[test]
+fn epic_output_has_no_today() {
+    let (r, [e1, _]) = seeded();
+    assert!(r.ok(&["cost", "--epic", e1.as_str()])["today"].is_null());
+    assert!(!text(&r, &["cost", "--epic", e1.as_str()]).contains("today"));
+}
