@@ -26,6 +26,10 @@ const EDITABLE: &[(&str, &str)] = &[
         "`changes` verdicts allowed before the human decides",
     ),
     (
+        "gate.max_rounds",
+        "send-backs to the worker for a gate failure or a rebase conflict per item before the human decides (0: never send back; stored as [merge] gate_max_rounds)",
+    ),
+    (
         "merge.target",
         "local (rebase + fast-forward) or github (push + PR)",
     ),
@@ -73,8 +77,28 @@ const EDITABLE: &[(&str, &str)] = &[
 
 /// The `gate.*` keys are not a section of `config.toml` but a field of one `[[gate]]` table. They
 /// address the gate with this `name`, the one that runs `cargo test` in the dogfooding config.
+/// The one exception is [`ROUNDS_KEY`].
 const GATE_TARGET: &str = "test";
 const GATE_PREFIX: &str = "gate.";
+
+/// A limit of the whole queue, not of one gate: named `gate.max_rounds` for the operator, but kept in
+/// `[merge]` because `gate` is an array of tables and cannot also hold a plain key.
+const ROUNDS_KEY: &str = "gate.max_rounds";
+const ROUNDS_PATH: &str = "merge.gate_max_rounds";
+
+/// Whether `key` is a field of the `[[gate]]` named [`GATE_TARGET`].
+fn is_gate_field(key: &str) -> bool {
+    key.starts_with(GATE_PREFIX) && key != ROUNDS_KEY
+}
+
+/// Where `key` lives in the document: itself, except for [`ROUNDS_KEY`].
+fn doc_path(key: &str) -> &str {
+    if key == ROUNDS_KEY {
+        ROUNDS_PATH
+    } else {
+        key
+    }
+}
 
 /// The keys [`set_key`] accepts, each with a one-line description.
 pub fn editable_keys() -> &'static [(&'static str, &'static str)] {
@@ -107,6 +131,8 @@ const APPLIES: &[(&str, Applies)] = &[
     ("scheduler.max_parallel", Applies::NextTick),
     ("review.required", Applies::NextTick),
     ("review.max_rounds", Applies::NextTick),
+    // read from the refreshed `ctx.config` whenever a failure is about to be sent back
+    ("gate.max_rounds", Applies::NextTick),
     ("merge.target", Applies::NextTick),
     ("merge.verify_main_after", Applies::NextTick),
     ("merge.clean_after", Applies::NextTick),
@@ -211,12 +237,13 @@ impl ConfigField {
 }
 
 /// The value of the dotted `key` in `root`, a [`Config`] serialized to JSON; `None` when the path does
-/// not exist. A `gate.*` key is read from the `[[gate]]` named `test`, because `gate` is an array.
+/// not exist. A `gate.*` key is read from the `[[gate]]` named `test`, because `gate` is an array
+/// (`gate.max_rounds` is the exception: it is read from `[merge]`).
 /// An unset optional key is `Some(Null)`: callers treat both alike.
 pub fn lookup<'a>(root: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    let mut path = key.split('.');
+    let mut path = doc_path(key).split('.');
     let mut node = root;
-    if key.starts_with(GATE_PREFIX) {
+    if is_gate_field(key) {
         path.next();
         node = root
             .get("gate")?
@@ -294,6 +321,13 @@ const FIELDS: &[ConfigField] = &[
         group: ConfigGroup::Flow,
         kind: FieldKind::Number,
         help: "`changes` verdicts before the queue asks you",
+    },
+    ConfigField {
+        key: "gate.max_rounds",
+        label: "Gate fix rounds",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Number,
+        help: "send-backs of a failed gate or conflict",
     },
     ConfigField {
         key: "merge.target",
@@ -398,10 +432,10 @@ pub fn set_key(toml: &str, key: &str, value: &str) -> Result<String, ConfigError
         .parse()
         .map_err(|e: toml_edit::TomlError| ConfigError::Parse(e.to_string()))?;
 
-    let mut path: Vec<&str> = key.split('.').collect();
+    let mut path: Vec<&str> = doc_path(key).split('.').collect();
     let leaf = path.pop().unwrap_or_default();
 
-    let mut table: &mut dyn TableLike = if key.starts_with(GATE_PREFIX) {
+    let mut table: &mut dyn TableLike = if is_gate_field(key) {
         path.clear();
         target_gate(&mut doc).ok_or_else(|| {
             ConfigError::Invalid(format!(
@@ -475,9 +509,9 @@ pub fn unset_key(toml: &str, key: &str) -> Result<String, ConfigError> {
         .parse()
         .map_err(|e: toml_edit::TomlError| ConfigError::Parse(e.to_string()))?;
 
-    let mut path: Vec<&str> = key.split('.').collect();
+    let mut path: Vec<&str> = doc_path(key).split('.').collect();
     let leaf = path.pop().unwrap_or_default();
-    let mut table: &mut dyn TableLike = if key.starts_with(GATE_PREFIX) {
+    let mut table: &mut dyn TableLike = if is_gate_field(key) {
         path.clear();
         match target_gate(&mut doc) {
             Some(gate) => gate,
@@ -559,6 +593,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 19);
+        assert_eq!(EDITABLE.len(), 20);
     }
 }

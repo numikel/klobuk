@@ -231,6 +231,10 @@ pub struct MergeCfg {
     /// What the queue removes after a successful merge (and, with `verify_main_after`, a green main).
     /// Empty keeps everything.
     pub clean_after: Vec<CleanKind>,
+    /// Times one item may be sent back to its worker for a gate failure after the rebase, in the
+    /// worker's own verification, or for a rebase conflict, before the human is asked. `0` never sends
+    /// back. Edited as `gate.max_rounds` (`[[gate]]` is an array, so it cannot hold the key itself).
+    pub gate_max_rounds: u32,
     pub github: GitHubCfg,
 }
 
@@ -241,6 +245,7 @@ impl Default for MergeCfg {
             require_clean_main: true,
             verify_main_after: false,
             clean_after: vec![CleanKind::Worktree, CleanKind::ReviewWorktrees],
+            gate_max_rounds: 2,
             github: GitHubCfg::default(),
         }
     }
@@ -436,6 +441,7 @@ target = "local"          # local (rebase + fast-forward) | github (push + PR vi
 require_clean_main = true
 verify_main_after = false # run the gates in the repo root after each merge; a red main keeps the item `merged`, posts a BLOCKER and halts the tick
 clean_after = ["worktree", "review_worktrees"] # removed after a merge (and a green main when verify_main_after is on): worktree | branch (git branch -d) | review_worktrees; [] keeps everything; a refusal (claimed, dirty or unmerged lane) is reported, never fails the merge
+# gate_max_rounds = 2     # edited as `gate.max_rounds`: send-backs to the worker for a gate failure or a rebase conflict per item before the human is asked; 0 never sends back
 # [merge.github]          # used when target = "github"
 # remote = "origin"
 # base = "main"            # default: [repo] default_branch

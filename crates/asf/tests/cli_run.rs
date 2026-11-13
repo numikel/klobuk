@@ -447,6 +447,7 @@ fn watch_fails_run_with_out_of_scope_change_and_dirty_tree() {
 #[test]
 fn watch_runs_gates_and_records_failure() {
     let f = setup();
+    no_send_back(&f);
     let cfg = f.repo.path().join(".factory/config.toml");
     let mut s = std::fs::read_to_string(&cfg).unwrap();
     s.push_str("\n[[gate]]\nname = \"nope\"\ncmd = [\"python\", \"-c\", \"import sys; print('gate says no'); sys.exit(2)\"]\n");
@@ -1128,8 +1129,16 @@ fn start_blocks_when_the_pane_never_becomes_a_shell() {
 
 // ---- `asf run verify`-------------------------------------------------------------------------
 
+/// A failed gate in the worker's verification goes back to the idle worker while `gate.max_rounds`
+/// allows it (tested in `cli_merge.rs`). The tests that call this are about the BLOCKER and the failed
+/// run that follow when the worker is not sent back, so they switch the send-back off.
+fn no_send_back(f: &F) {
+    f.repo.ok(&["config", "set", "gate.max_rounds", "0"]);
+}
+
 /// Adds a gate that passes only once `src/fixed.rs` exists in the worktree.
 fn add_fixed_file_gate(f: &F) {
+    no_send_back(f);
     let cfg = f.repo.path().join(".factory/config.toml");
     let mut s = std::fs::read_to_string(&cfg).unwrap();
     s.push_str(

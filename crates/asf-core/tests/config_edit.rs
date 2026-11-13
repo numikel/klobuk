@@ -141,7 +141,7 @@ fn unparsable_document_is_a_parse_error() {
 }
 
 #[test]
-fn editable_keys_are_exactly_the_nineteen_named_in_the_briefs() {
+fn editable_keys_are_exactly_the_twenty_named_in_the_briefs() {
     // In the order of the Config view: models, budgets, flow, notifications.
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
     assert_eq!(
@@ -155,6 +155,7 @@ fn editable_keys_are_exactly_the_nineteen_named_in_the_briefs() {
             "scheduler.max_parallel",
             "review.required",
             "review.max_rounds",
+            "gate.max_rounds",
             "merge.target",
             "merge.verify_main_after",
             "merge.clean_after",
@@ -196,6 +197,7 @@ fn fields_carry_the_labels_and_groups_of_the_view() {
         ("scheduler.max_parallel", "Workers at once", ConfigGroup::Flow),
         ("review.required", "Review before merge", ConfigGroup::Flow),
         ("review.max_rounds", "Review rounds", ConfigGroup::Flow),
+        ("gate.max_rounds", "Gate fix rounds", ConfigGroup::Flow),
         ("merge.target", "Merge target", ConfigGroup::Flow),
         ("merge.verify_main_after", "Gates on main", ConfigGroup::Flow),
         ("merge.clean_after", "Clean up after merge", ConfigGroup::Flow),
@@ -251,6 +253,7 @@ fn field_kinds_are_choice_bool_number_or_text() {
         "worker.budget_usd",
         "scheduler.max_parallel",
         "review.max_rounds",
+        "gate.max_rounds",
         "serve.interval_s",
         "serve.max_ticks",
         "gate.slow_tests",
@@ -284,6 +287,7 @@ fn field_defaults_are_read_from_config_default() {
         Some("false")
     );
     assert_eq!(get("serve.interval_s").default_value().as_deref(), Some("10"));
+    assert_eq!(get("gate.max_rounds").default_value().as_deref(), Some("2"));
     // an optional key that is absent by default has no default value to write
     assert_eq!(get("worker.model").default_value(), None);
     assert_eq!(get("serve.max_ticks").default_value(), None);
@@ -468,6 +472,7 @@ fn a_key_the_serve_loop_reloads_says_it_applies_on_the_next_tick() {
         "review.model",
         "review.required",
         "review.max_rounds",
+        "gate.max_rounds",
         "scheduler.max_parallel",
         "merge.target",
         "merge.verify_main_after",
@@ -636,4 +641,29 @@ fn lookup_reads_gate_keys_from_the_gate_named_test() {
     assert_eq!(lookup(&root, "nope.nothing"), None);
     let none = serde_json::to_value(Config::default()).unwrap();
     assert_eq!(lookup(&none, "gate.slow_tests"), None, "no gate named test");
+}
+
+#[test]
+fn gate_max_rounds_is_a_merge_setting_not_a_field_of_a_gate() {
+    // `gate` is an array of tables, so the key cannot live in `[gate]`: it is stored in `[merge]`
+    // and needs no `[[gate]]` at all
+    let out = set_key("", "gate.max_rounds", "3").unwrap();
+    assert_eq!(Config::from_toml(&out).unwrap().merge.gate_max_rounds, 3, "{out}");
+    assert!(out.contains("gate_max_rounds = 3"), "{out}");
+    // with gates in the file none of them is touched, and a second set replaces the value in place
+    let out = set_key(WITH_GATES, "gate.max_rounds", "1").unwrap();
+    let again = set_key(&out, "gate.max_rounds", "0").unwrap();
+    let config = Config::from_toml(&again).unwrap();
+    assert_eq!(config.merge.gate_max_rounds, 0, "0 never sends back: {again}");
+    assert_eq!(config.gates.len(), 2, "{again}");
+    assert_eq!(again.matches("gate_max_rounds").count(), 1, "{again}");
+    assert!(again.contains("# the slow one"), "{again}");
+    let root = serde_json::to_value(&config).unwrap();
+    assert_eq!(lookup(&root, "gate.max_rounds"), Some(&serde_json::json!(0)));
+    let defaults = serde_json::to_value(Config::default()).unwrap();
+    assert_eq!(lookup(&defaults, "gate.max_rounds"), Some(&serde_json::json!(2)));
+    for bad in ["-1", "many", "1.5"] {
+        assert!(set_key("", "gate.max_rounds", bad).is_err(), "{bad}");
+    }
+    assert!(unset_key(&out, "gate.max_rounds").is_err(), "a required key");
 }

@@ -21,11 +21,12 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_nineteen_editable_keys_with_current_values() {
+fn show_lists_the_twenty_editable_keys_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 19, "{res}");
+    assert_eq!(rows.len(), 20, "{res}");
+    assert_eq!(entry(rows, "gate.max_rounds")["value"], 2);
     assert_eq!(entry(rows, "gate.slow_tests")["value"], Value::Null);
     assert_eq!(entry(rows, "gate.slow_after_s")["value"], Value::Null);
     assert_eq!(entry(rows, "serve.interval_s")["value"], 10);

@@ -131,6 +131,7 @@ fn tick_rebases_onto_moved_main_before_merging() {
 fn tick_blocks_on_rebase_conflict_and_posts_blocker() {
     let f = setup();
     finished_run(&f, &[("src/lib.rs", "pub fn a() { /* worker */ }\n")]);
+    lose_the_worker(&f); // an idle worker would be sent back to resolve it (see below)
     commit_in(f.repo.path(), "src/lib.rs", "pub fn a() { /* main */ }\n");
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "blocked", "{res}");
@@ -193,6 +194,7 @@ fn tick_fails_on_gate_and_retry_requeues() {
         "succeeded"
     );
     std::fs::remove_file(wt.join("PASS")).unwrap();
+    lose_the_worker(&f); // an idle worker would be sent back to fix the gate (see below)
 
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "failed", "{res}");
@@ -1164,7 +1166,18 @@ fn worker_run(f: &F) -> Run {
 
 /// Closes the worker's runtime workspace: its agent can no longer be reached.
 fn lose_the_worker(f: &F) {
-    let ws = worker_run(f).workspace_id.expect("the worker has a workspace");
+    lose_the_worker_of(f, &f.issue);
+}
+
+/// `lose_the_worker` for any issue of the repo.
+fn lose_the_worker_of(f: &F, issue: &str) {
+    let ws = store(f)
+        .runs(Some(&issue.parse().unwrap()), false)
+        .unwrap()
+        .pop()
+        .expect("the issue has a run")
+        .workspace_id
+        .expect("the worker has a workspace");
     FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
         .close_workspace(&ws)
         .unwrap();
@@ -1842,6 +1855,7 @@ fn an_open_issue_with_the_same_title_is_not_filed_again_but_a_closed_one_is() {
 fn a_rerun_that_fails_again_is_an_ordinary_failure_and_files_nothing() {
     let fl = flaky_setup("src/**", "src/greet.rs", FLAKY_TEST, 2);
     let f = &fl.f;
+    lose_the_worker_of(f, &fl.issue); // so the failure ends in the BLOCKER this test reads
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "failed", "{res}");
     assert_eq!(gate_runs(&fl), 2, "one rerun, not more");
@@ -2164,4 +2178,581 @@ fn a_red_main_cleans_nothing_and_a_green_main_cleans_after_the_check() {
         assert!(!wt_dir(&r.f, id).exists(), "{id} cleaned after its green main");
     }
     assert_eq!(cleanup(&res, "cleaned").len(), 2, "{res}");
+}
+
+// ---- a gate failure or a rebase conflict goes back to the idle worker -----------------------------
+
+/// Fails with a lint message once main's `README.txt` is in the worktree (so only after the rebase
+/// onto the moved main), unless the worker added `src/fixed.rs`.
+const LINT_FAILS: &str = "import os, sys\nif os.path.exists('README.txt') and not os.path.exists('src/fixed.rs'):\n    print('error: lint found a problem in src/greet.rs')\n    sys.exit(7)\n";
+
+/// Hangs once main's `README.txt` is in the worktree: the gate's own `timeout_s` ends it, with no exit code.
+const LINT_HANGS: &str = "import os, time\nif os.path.exists('README.txt'):\n    time.sleep(60)\n";
+
+/// The linker cannot open a test executable that exists (and is recreated on every run): the lock
+/// that `run_gates` reruns and then reports as it is.
+const LINT_LOCKED: &str = "import sys\np = sys.argv[1] + '/locked.exe'\nopen(p, 'w').write('x')\nprint('LINK : fatal error LNK1104: cannot open file \"%s\"' % p)\nsys.exit(101)\n";
+
+/// A verified item whose branch is behind a main that moved on, and a merge-stage gate `lint` (it
+/// does not run in the worker's own verification) that runs `body`. `gate_fields` are more keys of the gate.
+struct Lint {
+    f: F,
+    _dir: tempfile::TempDir,
+}
+
+fn lint_setup(body: &str, gate_fields: &str) -> Lint {
+    let f = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    std::fs::write(&script, body).unwrap();
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"lint\"\nwhen = [\"merge\"]\n{gate_fields}cmd = ['python', '{}', '{}']\n",
+        fwd(&script),
+        fwd(dir.path())
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "gate"]);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    commit_in(f.repo.path(), "README.txt", "main moved\n");
+    Lint { f, _dir: dir }
+}
+
+/// `[merge] gate_max_rounds = n`, committed so main stays clean.
+fn gate_rounds(f: &F, n: u32) {
+    set_config(
+        f,
+        "[merge]\ntarget = \"local\"",
+        &format!("[merge]\ngate_max_rounds = {n}\ntarget = \"local\""),
+    );
+}
+
+/// Prompts the worker got that contain `needle`, oldest first.
+fn prompts_with(f: &F, needle: &str) -> Vec<String> {
+    FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
+        .log()
+        .into_iter()
+        .filter(|e| e.op == "prompt")
+        .filter_map(|e| e.args["text"].as_str().map(str::to_string))
+        .filter(|t| t.contains(needle))
+        .collect()
+}
+
+/// `.factory/runs/<id>/<name>` in the worker's worktree.
+fn run_file(f: &F, name: &str) -> std::path::PathBuf {
+    f.repo
+        .path()
+        .join(".worktrees")
+        .join(&f.issue)
+        .join(".factory/runs")
+        .join(&f.issue)
+        .join(name)
+}
+
+/// STATUS comments of the orchestrator addressed to everyone.
+fn orchestrator_status(f: &F) -> Vec<String> {
+    comments_of(f, CommentType::Status)
+        .into_iter()
+        .filter(|c| c.author == "orchestrator" && c.to_lane == "all")
+        .map(|c| c.body)
+        .collect()
+}
+
+#[test]
+fn a_gate_that_fails_only_after_the_rebase_goes_back_to_the_idle_worker_instead_of_a_blocker() {
+    let l = lint_setup(LINT_FAILS, "");
+    let f = &l.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+
+    // the gate tail and a short explanation are in a file the worker reads: data, then what to do
+    let text = std::fs::read_to_string(run_file(f, "gate-1.md")).expect("gate-1.md is written");
+    assert!(!text.contains('\r'), "LF line endings:\n{text}");
+    assert!(
+        text.contains("error: lint found a problem in src/greet.rs"),
+        "the gate tail is quoted:\n{text}"
+    );
+    assert!(
+        text.contains("after the rebase onto") && text.contains("the gate `lint` failed"),
+        "{text}"
+    );
+    assert!(text.contains("Fix it on what is checked out"), "{text}");
+    assert!(text.contains("data"), "says the evidence is data:\n{text}");
+    assert!(
+        text.contains("issue finish") && text.contains(&f.issue),
+        "tells the worker to finish again:\n{text}"
+    );
+
+    // one line that points at the file, the tail is not inline
+    let prompts = prompts_with(f, "gate-");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(!prompts[0].contains('\n'), "one line: {:?}", prompts[0]);
+    assert!(
+        prompts[0].contains(&format!(".factory/runs/{}/gate-1.md", f.issue)),
+        "{prompts:?}"
+    );
+    assert!(!prompts[0].contains("lint found a problem"), "{prompts:?}");
+
+    // no BLOCKER, a STATUS for everyone, the run reopened so the item leaves NEEDS YOU
+    assert!(
+        comments_of(f, CommentType::Blocker).is_empty(),
+        "{:?}",
+        comments_of(f, CommentType::Blocker)
+    );
+    let status = orchestrator_status(f);
+    assert_eq!(status.len(), 1, "{status:?}");
+    assert!(
+        status[0].contains("the gate `lint` failed") && status[0].contains("sent to the worker"),
+        "{status:?}"
+    );
+    assert_eq!(status_of(f, &f.issue), "in-progress");
+    assert_eq!(worker_run(f).state, RunState::Working);
+    assert_eq!(running(f), (1, 0), "the worker holds its slot again");
+    let item = &store(f).merge_queue().unwrap()[0];
+    assert!(
+        item.last_error.as_deref().unwrap().contains("gate `lint` failed"),
+        "{item:?}"
+    );
+    assert!(!main_has(f, "src/greet.rs"));
+    // the failed item is left alone until the worker is done, and a retry by hand is refused
+    assert_eq!(f.repo.ok(&["merge", "tick", "--once"])["processed"], 0);
+    let (code, error, _) = f.repo.err(&["merge", "retry", &f.issue]);
+    assert_eq!((code, error.as_str()), (3, "conflict"));
+
+    // the worker fixes it and finishes again: the normal verify -> re-queue path runs
+    let res = finish_again(f, "src/fixed.rs", "\n");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(store(f).merge_queue().unwrap()[0].state, MergeState::Queued);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(main_has(f, "src/fixed.rs"));
+}
+
+#[test]
+fn a_gate_that_timed_out_is_not_sent_to_the_worker() {
+    let l = lint_setup(LINT_HANGS, "timeout_s = 1\n");
+    let f = &l.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    let item = &store(f).merge_queue().unwrap()[0];
+    assert_eq!(
+        item.gate_results.iter().find(|g| !g.ok).map(|g| g.exit_code),
+        Some(None),
+        "a timeout has no exit code: {item:?}"
+    );
+    assert!(prompts_with(f, "gate-").is_empty());
+    assert!(!run_file(f, "gate-1.md").exists());
+    assert_eq!(
+        worker_run(f).state,
+        RunState::Succeeded,
+        "the run is left as it was"
+    );
+    let blockers = comments_of(f, CommentType::Blocker);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].body.contains(&format!("asf merge retry {}", f.issue)),
+        "{}",
+        blockers[0].body
+    );
+    assert!(
+        !blockers[0].body.contains("not sent back"),
+        "it was never a candidate: {}",
+        blockers[0].body
+    );
+}
+
+#[test]
+fn a_gate_that_only_hit_a_linker_lock_is_not_sent_to_the_worker() {
+    // the gate is rerun on the lock first (about twenty seconds of pauses), then reported as it is
+    let l = lint_setup(LINT_LOCKED, "");
+    let f = &l.f;
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    let item = &store(f).merge_queue().unwrap()[0];
+    let bad = item.gate_results.iter().find(|g| !g.ok).expect("a failed gate");
+    assert!(bad.tail.contains("LNK1104"), "{bad:?}");
+    assert!(prompts_with(f, "gate-").is_empty());
+    assert!(!run_file(f, "gate-1.md").exists());
+    assert_eq!(worker_run(f).state, RunState::Succeeded);
+    let blockers = comments_of(f, CommentType::Blocker);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(blockers[0].body.contains("LNK1104"), "{}", blockers[0].body);
+    assert!(
+        blockers[0].body.contains(&format!("asf merge retry {}", f.issue)),
+        "{}",
+        blockers[0].body
+    );
+}
+
+#[test]
+fn a_gate_failure_with_an_unreachable_worker_keeps_the_blocker_and_the_retry_hint() {
+    let l = lint_setup(LINT_FAILS, "");
+    let f = &l.f;
+    lose_the_worker(f);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert!(prompts_with(f, "gate-").is_empty(), "nothing could be delivered");
+    assert_eq!(status_of(f, &f.issue), "validating");
+    assert_eq!(worker_run(f).state, RunState::Succeeded);
+    let blockers = comments_of(f, CommentType::Blocker);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert_eq!(blockers[0].to_lane, "human");
+    assert!(
+        blockers[0].body.contains("gate `lint` failed") && blockers[0].body.contains("lint found a problem"),
+        "{}",
+        blockers[0].body
+    );
+    assert!(
+        blockers[0].body.contains("The worker was not sent back"),
+        "{}",
+        blockers[0].body
+    );
+    assert!(
+        blockers[0].body.contains(&format!("asf merge retry {}", f.issue)),
+        "{}",
+        blockers[0].body
+    );
+}
+
+#[test]
+fn after_gate_max_rounds_send_backs_the_item_stays_failed_with_a_blocker_that_names_the_rounds() {
+    let l = lint_setup(LINT_FAILS, "");
+    let f = &l.f;
+    gate_rounds(f, 1);
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(
+        prompts_with(f, "gate-").len(),
+        1,
+        "round 1 goes back to the worker"
+    );
+
+    // the worker finishes without fixing the gate: the next failure is the one that asks the human
+    let res = finish_again(f, "src/other.rs", "\n");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert_eq!(
+        prompts_with(f, "gate-").len(),
+        1,
+        "nothing is sent for the last round"
+    );
+    assert!(!run_file(f, "gate-2.md").exists(), "no gate-2.md");
+    assert_eq!(worker_run(f).state, RunState::Succeeded);
+    let last = comments_of(f, CommentType::Blocker).pop().expect("a BLOCKER");
+    assert_eq!(last.to_lane, "human");
+    assert!(last.body.contains("gate `lint` failed"), "{}", last.body);
+    assert!(
+        last.body.contains("sent back 1 time(s)") && last.body.contains("gate.max_rounds is 1"),
+        "names the rounds: {}",
+        last.body
+    );
+    assert!(
+        last.body.contains(&format!("asf merge retry {}", f.issue)),
+        "{}",
+        last.body
+    );
+}
+
+#[test]
+fn a_gate_max_rounds_of_zero_never_sends_back() {
+    let l = lint_setup(LINT_FAILS, "");
+    let f = &l.f;
+    gate_rounds(f, 0);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert!(prompts_with(f, "gate-").is_empty());
+    let blockers = comments_of(f, CommentType::Blocker);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].body.contains("sent back 0 time(s)") && blockers[0].body.contains("gate.max_rounds is 0"),
+        "{}",
+        blockers[0].body
+    );
+}
+
+#[test]
+fn a_rebase_conflict_goes_to_the_idle_worker_and_the_queue_resolves_nothing() {
+    let f = setup();
+    finished_run(&f, &[("src/lib.rs", "pub fn a() { /* worker */ }\n")]);
+    commit_in(f.repo.path(), "src/lib.rs", "pub fn a() { /* main */ }\n");
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    let before = git_out(&wt, &["rev-parse", "HEAD"]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+
+    // the worktree is clean and the branch untouched: the queue aborted the rebase, it did not resolve it
+    assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+    let text = std::fs::read_to_string(run_file(&f, "conflict-1.md")).expect("conflict-1.md is written");
+    assert!(text.contains("src/lib.rs"), "names the conflicting file:\n{text}");
+    assert!(
+        text.contains("Rebase onto main") && text.contains("intent of both sides"),
+        "{text}"
+    );
+    assert!(text.contains("issue finish"), "{text}");
+    let prompts = prompts_with(&f, "conflict-");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(!prompts[0].contains('\n'), "one line: {:?}", prompts[0]);
+    assert!(
+        prompts[0].contains(&format!(".factory/runs/{}/conflict-1.md", f.issue)),
+        "{prompts:?}"
+    );
+    assert!(comments_of(&f, CommentType::Blocker).is_empty());
+    let status = orchestrator_status(&f);
+    assert_eq!(status.len(), 1, "{status:?}");
+    assert!(
+        status[0].contains("conflicts") && status[0].contains("sent to the worker"),
+        "{status:?}"
+    );
+    assert_eq!(status_of(&f, &f.issue), "in-progress");
+    assert_eq!(worker_run(&f).state, RunState::Working);
+
+    // the worker resolves it (the branch's side wins here), finishes, and the queue merges the result
+    git(&wt, &["rebase", "-X", "theirs", "main"]);
+    let res = finish_again(&f, "src/extra.rs", "\n");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(main_has(&f, "src/extra.rs"));
+}
+
+#[test]
+fn a_rebase_conflict_uses_the_same_rounds_as_the_gate_failures() {
+    let f = setup();
+    gate_rounds(&f, 1);
+    finished_run(&f, &[("src/lib.rs", "pub fn a() { /* worker */ }\n")]);
+    commit_in(f.repo.path(), "src/lib.rs", "pub fn a() { /* main */ }\n");
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(prompts_with(&f, "conflict-").len(), 1);
+
+    // finished again without resolving the conflict: the second one is the human's
+    let res = finish_again(&f, "src/extra.rs", "\n");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "blocked", "{res}");
+    assert_eq!(prompts_with(&f, "conflict-").len(), 1);
+    assert!(!run_file(&f, "conflict-2.md").exists());
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+    let last = comments_of(&f, CommentType::Blocker).pop().expect("a BLOCKER");
+    assert!(
+        last.body.contains("src/lib.rs") && last.body.contains("sent back 1 time(s)"),
+        "{}",
+        last.body
+    );
+}
+
+#[test]
+fn a_rebase_conflict_with_an_unreachable_worker_blocks_as_before() {
+    let f = setup();
+    finished_run(&f, &[("src/lib.rs", "pub fn a() { /* worker */ }\n")]);
+    lose_the_worker(&f);
+    commit_in(f.repo.path(), "src/lib.rs", "pub fn a() { /* main */ }\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "blocked", "{res}");
+    assert!(prompts_with(&f, "conflict-").is_empty());
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+    let blockers = comments_of(&f, CommentType::Blocker);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].body.contains("The worker was not sent back")
+            && blockers[0].body.contains(&format!("asf merge retry {}", f.issue)),
+        "{}",
+        blockers[0].body
+    );
+}
+
+/// A gate with no `when`: it runs in the worker's own verification too, and fails until `src/fixed.rs` exists.
+fn verify_gate(f: &F) {
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(
+        "\n[[gate]]\nname = \"needs-fix\"\ncmd = [\"python\", \"-c\", \"import os, sys; print('fix missing'); sys.exit(0 if os.path.exists('src/fixed.rs') else 2)\"]\n",
+    );
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "gate"]);
+}
+
+/// The worker commits `src/greet.rs`, writes its report and finishes; one `run watch` verifies it.
+fn finish_and_watch(f: &F) -> serde_json::Value {
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    commit_in(&wt, "src/greet.rs", "pub fn hello() {}\n");
+    let report = run_file(f, "report.md");
+    std::fs::write(&report, "# done\n").unwrap();
+    f.repo.ok(&[
+        "--lane",
+        &f.issue,
+        "issue",
+        "finish",
+        &f.issue,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    f.repo.ok(&["run", "watch", "--once"])
+}
+
+#[test]
+fn a_gate_that_fails_in_the_workers_own_verification_goes_back_the_same_way() {
+    let f = setup();
+    verify_gate(&f);
+    f.repo.ok(&["run", "start", &f.issue]);
+    let res = finish_and_watch(&f);
+    assert_eq!(res["transitions"][0]["to"], "working", "{res}");
+
+    let text = std::fs::read_to_string(run_file(&f, "gate-1.md")).expect("gate-1.md is written");
+    assert!(
+        text.contains("fix missing") && text.contains("in your verification") && text.contains("`needs-fix`"),
+        "{text}"
+    );
+    let prompts = prompts_with(&f, "gate-");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(!prompts[0].contains('\n'), "one line: {:?}", prompts[0]);
+    assert!(prompts[0].contains("gate-1.md"), "{prompts:?}");
+    assert!(
+        comments_of(&f, CommentType::Blocker).is_empty(),
+        "{:?}",
+        comments_of(&f, CommentType::Blocker)
+    );
+    let status = orchestrator_status(&f);
+    assert_eq!(status.len(), 1, "{status:?}");
+    assert!(
+        status[0].contains("the gate `needs-fix` failed") && status[0].contains("sent to the worker"),
+        "{status:?}"
+    );
+    assert_eq!(status_of(&f, &f.issue), "in-progress");
+    assert_eq!(worker_run(&f).state, RunState::Working);
+    assert!(store(&f).merge_queue().unwrap().is_empty());
+
+    // fixed and finished again: verified and queued
+    let res = finish_again(&f, "src/fixed.rs", "\n");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(status_of(&f, &f.issue), "validating");
+    assert_eq!(store(&f).merge_queue().unwrap()[0].state, MergeState::Queued);
+}
+
+#[test]
+fn a_verification_failure_beyond_the_rounds_or_with_a_lost_worker_keeps_the_blocker() {
+    // no round left
+    let f = setup();
+    verify_gate(&f);
+    gate_rounds(&f, 0);
+    f.repo.ok(&["run", "start", &f.issue]);
+    let res = finish_and_watch(&f);
+    assert_eq!(res["transitions"][0]["to"], "failed", "{res}");
+    assert!(prompts_with(&f, "gate-").is_empty());
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+    let last = comments_of(&f, CommentType::Blocker).pop().expect("a BLOCKER");
+    assert!(
+        last.body.contains("gate `needs-fix` failed") && last.body.contains("gate.max_rounds is 0"),
+        "{}",
+        last.body
+    );
+
+    // a worker that cannot be reached
+    let g = setup();
+    verify_gate(&g);
+    g.repo.ok(&["run", "start", &g.issue]);
+    lose_the_worker(&g);
+    let res = finish_and_watch(&g);
+    assert_eq!(res["transitions"][0]["to"], "failed", "{res}");
+    assert_eq!(status_of(&g, &g.issue), "blocked");
+    let last = comments_of(&g, CommentType::Blocker).pop().expect("a BLOCKER");
+    assert!(
+        last.body.contains("The worker was not sent back"),
+        "{}",
+        last.body
+    );
+}
+
+#[test]
+fn a_failed_gate_next_to_other_verification_problems_stays_a_blocker() {
+    // the report has open questions: that is the worker's to answer through QUESTION comments, not a
+    // gate to fix, so the whole failure goes to the human as before
+    let f = setup();
+    verify_gate(&f);
+    f.repo.ok(&["run", "start", &f.issue]);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    commit_in(&wt, "src/greet.rs", "pub fn hello() {}\n");
+    let report = run_file(&f, "report.md");
+    std::fs::write(&report, "# done\n\n## Open questions\n\n- should it print?\n").unwrap();
+    f.repo.ok(&[
+        "--lane",
+        &f.issue,
+        "issue",
+        "finish",
+        &f.issue,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "failed", "{res}");
+    assert!(prompts_with(&f, "gate-").is_empty());
+    assert_eq!(status_of(&f, &f.issue), "blocked");
+}
+
+// ---- a sent-back worker that committed its fix is queued again without a finish --------------------
+
+/// Scripts the next `info` answer of the fake runtime: the agent reports `state`.
+fn agent_reports(f: &F, state: &str) {
+    FakeRuntime::new(f.repo.path().join(".factory/fake-runtime.json"))
+        .script(serde_json::json!({ "info": [{ "state": state }] }))
+        .unwrap();
+}
+
+#[test]
+fn an_idle_worker_with_a_fix_committed_after_a_send_back_is_verified_and_queued_without_a_finish() {
+    let l = lint_setup(LINT_FAILS, "");
+    let f = &l.f;
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(worker_run(f).state, RunState::Working);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    let watch = |state: &str| {
+        agent_reports(f, state);
+        f.repo.ok(&["run", "watch", "--once"])
+    };
+
+    // idle but nothing was committed since it was sent back: it may still be thinking
+    assert_eq!(watch("idle")["transitions"].as_array().unwrap().len(), 0);
+    // a fix is committed but the agent is still working on it
+    commit_in(&wt, "src/fixed.rs", "\n");
+    assert_eq!(watch("working")["transitions"].as_array().unwrap().len(), 0);
+    // idle with loose changes in the worktree: not done
+    std::fs::write(wt.join("src/loose.rs"), "\n").unwrap();
+    assert_eq!(watch("idle")["transitions"].as_array().unwrap().len(), 0);
+    assert_eq!(status_of(f, &f.issue), "in-progress");
+    std::fs::remove_file(wt.join("src/loose.rs")).unwrap();
+
+    // idle, a new commit, a clean tree: that is a finish in everything but the command
+    let res = watch("idle");
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(status_of(f, &f.issue), "validating");
+    assert_eq!(worker_run(f).state, RunState::Succeeded);
+    let queue = store(f).merge_queue().unwrap();
+    assert_eq!(queue.len(), 1, "the item is reused: {queue:?}");
+    assert_eq!(queue[0].state, MergeState::Queued, "{queue:?}");
+    let note: Vec<String> = orchestrator_status(f)
+        .into_iter()
+        .filter(|s| s.contains("without `asf issue finish`"))
+        .collect();
+    assert_eq!(note.len(), 1, "{note:?}");
+    assert_eq!(events_of(f, "run.auto_finished").len(), 1);
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+}
+
+#[test]
+fn a_worker_that_was_never_sent_back_is_not_finished_for_it() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    commit_in(&wt, "src/greet.rs", "pub fn hello() {}\n");
+    agent_reports(&f, "idle");
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"].as_array().unwrap().len(), 0, "{res}");
+    assert_eq!(status_of(&f, &f.issue), "in-progress");
+    assert!(events_of(&f, "run.auto_finished").is_empty());
 }

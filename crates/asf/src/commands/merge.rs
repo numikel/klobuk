@@ -1,7 +1,9 @@
 //! `asf merge …` — the local merge queue: rebase → gates → fast-forward onto the default branch.
 //!
-//! Conflicts are never resolved automatically: the rebase is aborted, the item and the issue go
-//! `blocked`, and a BLOCKER comment names the files.
+//! Conflicts are never resolved by the queue: the rebase is aborted and, while `[merge] gate_max_rounds`
+//! allows, an idle worker is sent back to resolve it (`conflict-<n>.md`); a gate that really fails after
+//! the rebase goes back the same way (`gate-<n>.md`). When the worker cannot be reached, or the rounds
+//! are used up, the item goes `blocked` (conflict) or `failed` (gate) with a BLOCKER comment.
 
 use asf_core::brief::{parse_verdict, Verdict};
 use asf_core::config::{CleanKind, GateWhen};
@@ -15,7 +17,10 @@ use serde::Serialize;
 use crate::cli::{Cli, MergeCmd};
 use crate::ctx::{Ctx, FACTORY_DIR};
 use crate::output::{AppError, ErrorCode, Rendered};
-use crate::worker::{Finished, GateMode, GateSlot, Job, MainJob, MergeJob, Worker, RUNS_DIR};
+use crate::worker::{
+    is_environmental, Failure, Finished, Fix, GateMode, GateSlot, Job, MainJob, MergeJob, Worker, RUNS_DIR,
+    SENT_BACK,
+};
 
 use super::lane;
 
@@ -739,6 +744,16 @@ fn prepare(ctx: &Ctx, item: &MergeItem) -> Result<Prepared, AppError> {
                 item.branch,
                 files.join(", ")
             );
+            // the rebase is aborted and the worktree clean: an idle worker resolves it, never the queue
+            let failure = Failure {
+                fix: Fix::Conflict,
+                headline: format!("the rebase of {} onto {default_branch} conflicts", item.branch),
+                evidence: files.join("\n"),
+            };
+            let why = match send_back_failure(ctx, item, &failure, &msg, None)? {
+                Ok(updated) => return Ok(Prepared::ended(updated)),
+                Err(why) => why,
+            };
             let updated = fail(ctx, item, MergeState::Blocked, msg.clone(), None)?;
             let _ = ctx
                 .store
@@ -749,7 +764,7 @@ fn prepare(ctx: &Ctx, item: &MergeItem) -> Result<Prepared, AppError> {
                 CommentType::Blocker,
                 LANE_HUMAN,
                 format!(
-                    "{msg}\n\nThe rebase was aborted; the worktree ({worktree_rel}) is clean on {}. Resolve by hand \
+                    "{msg}\n\nThe worker was not sent back: {why}.\n\nThe rebase was aborted; the worktree ({worktree_rel}) is clean on {}. Resolve by hand \
                      (rebase in the worktree, or `asf run reply {} \"rebase onto {default_branch} and resolve …\"`), then \
                      `asf merge retry {}`.",
                     item.branch, item.issue_id, item.issue_id
@@ -830,13 +845,32 @@ fn conclude(
             bad.exit_code,
             last_lines(&bad.tail, 15)
         );
+        // a gate that really failed goes back to the idle worker; a timeout or a linker lock is the
+        // machine's, so it stays with the human (and the retry) as before
+        let mut note = String::new();
+        if !is_environmental(bad) {
+            let onto = rebased_onto_of(ctx, item).unwrap_or_else(|| ctx.config.repo.default_branch.clone());
+            let failure = Failure {
+                fix: Fix::Gate,
+                headline: format!(
+                    "after the rebase onto {} the gate `{}` failed",
+                    &onto[..10.min(onto.len())],
+                    bad.name
+                ),
+                evidence: bad.tail.clone(),
+            };
+            match send_back_failure(ctx, item, &failure, &msg, Some(results.clone()))? {
+                Ok(updated) => return Ok(Some(updated)),
+                Err(why) => note = format!("The worker was not sent back: {why}.\n\n"),
+            }
+        }
         let updated = fail(ctx, item, MergeState::Failed, msg.clone(), Some(results.clone()))?;
         comment(
             ctx,
             &item.issue_id,
             CommentType::Blocker,
             LANE_HUMAN,
-            format!("{msg}\n\nFix and `asf merge retry {}`.", item.issue_id),
+            format!("{msg}\n\n{note}Fix and `asf merge retry {}`.", item.issue_id),
         )?;
         return Ok(Some(updated));
     }
@@ -1527,11 +1561,16 @@ fn send_back(
     ctx.store.set_status(id, Status::InProgress, LANE_ORCHESTRATOR)?;
     let updated = fail(ctx, item, MergeState::Failed, msg.to_string(), None)?;
     ctx.store.append_event(&NewEvent {
-        kind: "merge.sent_back".into(),
+        kind: SENT_BACK.into(),
         issue_id: Some(id.clone()),
         run_id: Some(run.id.clone()),
         actor: Some(LANE_ORCHESTRATOR.into()),
-        payload: serde_json::json!({ "round": round, "file": file_rel }),
+        payload: serde_json::json!({
+            "kind": "review",
+            "round": round,
+            "file": file_rel,
+            "head": GitCli.head(&wt).ok(),
+        }),
     })?;
     comment(
         ctx,
@@ -1541,6 +1580,24 @@ fn send_back(
         format!("review round {round} asked for changes; findings sent to the worker ({file_rel})"),
     )?;
     Ok(Ok(updated))
+}
+
+/// A gate failure or a rebase conflict of a queued item goes to its idle worker (`Worker::send_back_fix`).
+/// On success the item is `failed` with `msg` (and the gate results) until the worker's next verified
+/// finish queues it again, as after a review's `changes`. The inner `Err` is why the worker was not
+/// sent back: the caller then does what it did before send-backs existed.
+fn send_back_failure(
+    ctx: &Ctx,
+    item: &MergeItem,
+    failure: &Failure,
+    msg: &str,
+    gates: Option<Vec<GateResult>>,
+) -> Result<Result<MergeItem, String>, AppError> {
+    match Worker::new(ctx).and_then(|w| w.send_back_fix(&item.issue_id, failure)) {
+        Ok(Ok(_)) => fail(ctx, item, MergeState::Failed, msg.to_string(), gates).map(Ok),
+        Ok(Err(why)) => Ok(Err(why)),
+        Err(e) => Ok(Err(e.message)),
+    }
 }
 
 /// `changes`: a worker that can be reached is sent the findings in `review-<round>.md` (see

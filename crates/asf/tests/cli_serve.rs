@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use asf_core::{IssueStore, MergeState, NewEvent};
+use asf_runtime::FakeRuntime;
 use asf_store::SqliteStore;
 use common::{git, Repo};
 
@@ -1421,6 +1422,43 @@ fn the_result_of_an_item_skipped_while_its_gates_ran_is_dropped() {
     assert_eq!(queue_states(&g), vec![MergeState::Skipped], "{lines:?}\n{stderr}");
     assert_eq!(g.issue_status(&a), "validating", "nothing was merged or closed");
     assert!(!g.event_kinds().iter().any(|(k, _)| k == "merge.merged"));
+}
+
+/// A gate that fails on its first run and passes afterwards: the log holds one line per run.
+const FAIL_ONCE_GATE: &str = "import sys\nlog = sys.argv[1]\ntry:\n    n = len(open(log).read().splitlines())\nexcept OSError:\n    n = 0\nopen(log, 'a').write('run\\n')\nif n == 0:\n    print('error: lint found a problem')\n    sys.exit(7)\n";
+
+#[test]
+fn the_loop_queues_a_sent_back_worker_that_committed_its_fix_without_a_finish() {
+    let g = gated(FAIL_ONCE_GATE, "[\"merge\"]", false);
+    let a = queued_item(&g.repo, "src/**", "src/a.rs");
+    // the queue's gate fails after the rebase and the idle worker is sent back
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "failed", "{res}");
+    assert!(g
+        .event_kinds()
+        .iter()
+        .any(|(k, i)| k == "merge.sent_back" && i.as_deref() == Some(a.as_str())));
+    // the worker commits its fix and goes idle; it never runs `asf issue finish`
+    commit_in(&g.repo.path().join(".worktrees").join(&a), "src/fix.rs", "x\n");
+    FakeRuntime::new(g.repo.path().join(".factory/fake-runtime.json"))
+        .script(serde_json::json!({ "info": [{ "state": "idle" }] }))
+        .unwrap();
+
+    let mut live = LiveServe::start(&g.repo, &LOOP);
+    live.wait_until(|_| all_merged(&g, 1) && g.issue_status(&a) == "done");
+    live.stop();
+    assert_eq!(
+        g.runs().len(),
+        2,
+        "the gate failed once and passed on the second run"
+    );
+    let kinds = g.event_kinds();
+    assert!(
+        kinds
+            .iter()
+            .any(|(k, i)| k == "run.auto_finished" && i.as_deref() == Some(a.as_str())),
+        "{kinds:?}"
+    );
 }
 
 #[test]
