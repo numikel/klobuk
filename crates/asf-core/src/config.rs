@@ -453,7 +453,7 @@ every_minutes = 30 # then again this often while it still waits; 0 reminds only 
 # command = ["pwsh", "-File", "notify.ps1"]  # optional, run once per notification or reminder without a shell (10 s limit) with
 #                                            # ASF_REMIND_ISSUE, ASF_REMIND_KIND, ASF_REMIND_AGE_MINUTES, ASF_REMIND_TEXT set
 
-[serve]                   # defaults of `asf serve`; the --interval and --max-ticks flags override them (restart serve to apply)
+[serve]                   # defaults of `asf serve`; the --interval and --max-ticks flags override them; an edit applies on the next tick of a running serve
 interval_s = 10           # seconds between ticks; >= 1
 # max_ticks = 600         # with --until-done: stop after this many ticks (the pulse and the TUI then say `max_ticks`); absent: no limit
 "#;
@@ -605,6 +605,17 @@ mod tests {
             let e = Config::from_toml(&format!("[serve]\n{bad}\n")).unwrap_err();
             assert!(matches!(e, ConfigError::Invalid(_)), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn serve_template_header_says_an_edit_reaches_the_running_loop() {
+        // the loop re-reads [serve] every tick (`Applies::NextTick`), so the template must not ask for a restart
+        let header = Config::default_toml()
+            .lines()
+            .find(|l| l.starts_with("[serve]"))
+            .expect("the template has a [serve] section");
+        assert!(!header.contains("restart"), "{header}");
+        assert!(header.contains("next tick"), "{header}");
     }
 
     #[test]
