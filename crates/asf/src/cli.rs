@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "asf",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ASF_GIT_SHA"), ")"),
     about = "auto-software-factory: local issue store and worker dispatcher"
 )]
 #[command(propagate_version = true)]
