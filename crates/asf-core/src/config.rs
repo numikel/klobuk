@@ -163,6 +163,12 @@ pub struct GateCfg {
     pub shell: Option<String>,
     /// Stages the gate runs in; absent means all of them.
     pub when: Vec<GateWhen>,
+    /// Stop the gate once at least this many distinct tests reported `has been running for over <n>
+    /// seconds` (the libtest hang warning). Absent: never stop for that.
+    pub slow_tests: Option<u32>,
+    /// Stop the gate once its first slow-test report is this many seconds old and it has not finished.
+    /// Absent: never stop for that.
+    pub slow_after_s: Option<u64>,
 }
 
 impl Default for GateCfg {
@@ -173,6 +179,8 @@ impl Default for GateCfg {
             timeout_s: 600,
             shell: None,
             when: GateWhen::ALL.to_vec(),
+            slow_tests: None,
+            slow_after_s: None,
         }
     }
 }
@@ -420,6 +428,8 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 # cmd = ["cargo", "test", "--workspace"]
 # timeout_s = 900
 # when = ["verify", "merge"]   # stages the gate runs in: verify (worker) | merge (queue, after rebase) | main (root, after merge); default: all three
+# slow_tests = 3               # optional: stop the gate once this many tests print "has been running for over 60 seconds" (cargo test)
+# slow_after_s = 300           # optional: stop it when the first such line is this old and the gate is still running
 
 [merge]
 target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
@@ -517,6 +527,13 @@ impl Config {
             if g.when.is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "gate `{}`: `when` must list at least one of verify, merge, main",
+                    g.name
+                )));
+            }
+            // 0 would stop the gate before any test could report: a typo, not a setting
+            if g.slow_tests == Some(0) || g.slow_after_s == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "gate `{}`: `slow_tests` and `slow_after_s` must be at least 1 (leave them out to turn the check off)",
                     g.name
                 )));
             }
@@ -737,6 +754,31 @@ mod tests {
         assert_eq!(c.gates[0].timeout_s, 600);
         assert_eq!(c.gates[1].timeout_s, 900);
         assert_eq!(c.gates[1].shell.as_deref(), Some("pwsh"));
+    }
+
+    #[test]
+    fn slow_test_keys_are_optional_per_gate() {
+        let c = Config::from_toml(
+            "[[gate]]\nname = \"fmt\"\ncmd = [\"cargo\", \"fmt\"]\n\
+             [[gate]]\nname = \"test\"\ncmd = [\"cargo\", \"test\"]\nslow_tests = 3\nslow_after_s = 300\n",
+        )
+        .unwrap();
+        assert_eq!((c.gates[0].slow_tests, c.gates[0].slow_after_s), (None, None));
+        assert_eq!(
+            (c.gates[1].slow_tests, c.gates[1].slow_after_s),
+            (Some(3), Some(300))
+        );
+    }
+
+    #[test]
+    fn slow_test_keys_of_zero_are_refused() {
+        for key in ["slow_tests", "slow_after_s"] {
+            let toml = format!("[[gate]]\nname = \"t\"\ncmd = [\"cargo\", \"test\"]\n{key} = 0\n");
+            assert!(
+                matches!(Config::from_toml(&toml).unwrap_err(), ConfigError::Invalid(_)),
+                "{key} = 0"
+            );
+        }
     }
 
     #[test]

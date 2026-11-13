@@ -21,11 +21,13 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_seventeen_editable_keys_with_current_values() {
+fn show_lists_the_nineteen_editable_keys_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 17, "{res}");
+    assert_eq!(rows.len(), 19, "{res}");
+    assert_eq!(entry(rows, "gate.slow_tests")["value"], Value::Null);
+    assert_eq!(entry(rows, "gate.slow_after_s")["value"], Value::Null);
     assert_eq!(entry(rows, "serve.interval_s")["value"], 10);
     assert_eq!(entry(rows, "serve.max_ticks")["value"], Value::Null);
     assert_eq!(
@@ -304,6 +306,51 @@ fn set_switches_the_immediate_notification_off_without_touching_the_reminders() 
 
     let (code, _, _) = r.err(&["config", "set", "notify.on_new", "maybe"]);
     assert_eq!(code, 1, "only a boolean is accepted");
+}
+
+/// `gate.*` keys live in the `[[gate]]` named `test`, an array of tables: `show` and `set` must read
+/// the value there (not report `(unset)` for a key that is set) and refuse a config without it.
+#[test]
+fn gate_keys_are_set_read_and_unset_on_the_gate_named_test() {
+    let r = Repo::initialised();
+    let (code, ecode, msg) = r.err(&["config", "set", "gate.slow_tests", "3"]);
+    assert_eq!((code, ecode.as_str()), (1, "validation"), "{msg}");
+    assert!(msg.contains("[[gate]]"), "{msg}");
+
+    let path = config_path(&r);
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "\n[[gate]]\nname = \"fmt\"\ncmd = [\"true\"]\n\n[[gate]]\nname = \"test\"\ncmd = [\"true\"]\n",
+    );
+    std::fs::write(&path, text).unwrap();
+
+    let res = r.ok(&["config", "set", "gate.slow_tests", "3"]);
+    assert_eq!(
+        (res["old"].clone(), res["new"].clone()),
+        (Value::Null, serde_json::json!(3)),
+        "{res}"
+    );
+    r.ok(&["config", "set", "gate.slow_after_s", "300"]);
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("slow_tests = 3") && after.contains("slow_after_s = 300"),
+        "{after}"
+    );
+    let gates = asf_core::Config::from_toml(&after).unwrap().gates;
+    assert_eq!(gates[0].slow_tests, None, "the fmt gate is untouched: {after}");
+    assert_eq!(
+        (gates[1].slow_tests, gates[1].slow_after_s),
+        (Some(3), Some(300)),
+        "{after}"
+    );
+
+    let rows = r.ok(&["config", "show"]);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(entry(rows, "gate.slow_tests")["value"], 3);
+    assert_eq!(entry(rows, "gate.slow_after_s")["value"], 300);
+
+    let (code, _, _) = r.err(&["config", "set", "gate.slow_tests", "0"]);
+    assert_eq!(code, 1, "0 is refused");
 }
 
 #[test]

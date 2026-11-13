@@ -66,6 +66,12 @@ pub struct GateSpec {
     pub cmd: Vec<String>,
     pub timeout_s: u64,
     pub shell: Option<String>,
+    /// Give up once at least this many distinct tests reported `has been running for over <n> seconds`.
+    #[serde(default)]
+    pub slow_tests: Option<u32>,
+    /// Give up once the first such report is this many seconds old and the gate is still running.
+    #[serde(default)]
+    pub slow_after_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

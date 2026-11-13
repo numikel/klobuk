@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -45,6 +45,14 @@ const LINKER_LOCK_PAUSES_ABSENT: [Duration; 4] = [
 ];
 /// How long to keep trying to move a locked file aside (1 s between tries).
 const LINKER_LOCK_MOVE_TRIES: u32 = 10;
+/// The libtest warning is `test <name> has been running for over <n> seconds`; this is the middle.
+const SLOW_MARKER: &str = " has been running for over ";
+/// libtest's own threshold, used in the header when no warning said otherwise.
+const SLOW_DEFAULT_SECS: u64 = 60;
+/// How many slow tests the header of a stopped gate names before it says `... and N more`.
+const SLOW_MAX_LISTED: usize = 50;
+/// How often the poll loop looks at the process and at the new output.
+const POLL: Duration = Duration::from_millis(50);
 
 fn tail(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
@@ -103,6 +111,19 @@ impl Drain {
         Self { buf, eof }
     }
 
+    /// The complete lines read since the last call. `from` is the caller's offset into the buffer and
+    /// moves past them; a line still being written is left for the next call.
+    fn new_lines(&self, from: &mut usize) -> Vec<String> {
+        let bytes = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
+        let end = bytes[*from..]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(*from, |i| *from + i + 1);
+        let text = String::from_utf8_lossy(&bytes[*from..end]).into_owned();
+        *from = end;
+        text.lines().map(str::to_owned).collect()
+    }
+
     /// Waits for EOF until `deadline` and returns what was read (lossy UTF-8). When the pipe is still
     /// open at the deadline its thread is left to finish on its own once the last holder lets go.
     fn collect(self, deadline: Instant) -> String {
@@ -112,6 +133,103 @@ impl Drain {
         let bytes = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
         String::from_utf8_lossy(&bytes).into_owned()
     }
+}
+
+/// `(test name, seconds)` of a libtest hang warning (`test a::b has been running for over 60 seconds`).
+fn slow_test_line(line: &str) -> Option<(&str, u64)> {
+    let (name, rest) = line.trim().strip_prefix("test ")?.split_once(SLOW_MARKER)?;
+    let secs = rest.strip_suffix(" seconds")?.trim().parse().ok()?;
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then_some((name, secs))
+}
+
+/// The tests a gate has reported as slow so far, in the order first seen, each once.
+#[derive(Default)]
+struct SlowTests {
+    names: Vec<String>,
+    /// The threshold the first warning named (libtest says 60).
+    secs: Option<u64>,
+    /// When this runner first saw a warning; `slow_after_s` counts from here.
+    first_seen: Option<Instant>,
+}
+
+impl SlowTests {
+    fn feed(&mut self, line: &str) {
+        let Some((name, secs)) = slow_test_line(line) else {
+            return;
+        };
+        if !self.names.iter().any(|n| n == name) {
+            self.names.push(name.to_string());
+        }
+        self.secs.get_or_insert(secs);
+        self.first_seen.get_or_insert_with(Instant::now);
+    }
+
+    /// Whether one of the gate's two limits is reached; a gate without limits never gives up.
+    fn limit_hit(&self, spec: &GateSpec) -> bool {
+        let enough = spec
+            .slow_tests
+            .is_some_and(|n| self.names.len() >= n.max(1) as usize);
+        let old = spec
+            .slow_after_s
+            .zip(self.first_seen)
+            .is_some_and(|(s, seen)| seen.elapsed() >= Duration::from_secs(s));
+        enough || old
+    }
+
+    /// `gate `x` <what>: N tests ran for more than 60 s:` and the names one per line; `None` when no
+    /// test was reported slow.
+    fn header(&self, gate: &str, what: &str) -> Option<String> {
+        if self.names.is_empty() {
+            return None;
+        }
+        let n = self.names.len();
+        let mut out = format!(
+            "gate `{gate}` {what}: {n} {} ran for more than {} s:",
+            if n == 1 { "test" } else { "tests" },
+            self.secs.unwrap_or(SLOW_DEFAULT_SECS)
+        );
+        for name in self.names.iter().take(SLOW_MAX_LISTED) {
+            out.push('\n');
+            out.push_str(name);
+        }
+        if n > SLOW_MAX_LISTED {
+            out.push_str(&format!("\n... and {} more", n - SLOW_MAX_LISTED));
+        }
+        Some(out)
+    }
+}
+
+/// Why a gate was stopped by the runner instead of finishing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Timeout,
+    SlowTests,
+}
+
+/// Kills `child` and everything it started. `Child::kill` ends only the process itself, and a test
+/// harness starts `asf serve` children of its own that would run on for as long as they like.
+fn kill_tree(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(windows)]
+    let mut tree = {
+        let mut c = Command::new("taskkill");
+        c.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        c
+    };
+    // the gate leads its own process group (see `run_gate`), so `-<pid>` addresses the whole tree
+    #[cfg(not(windows))]
+    let mut tree = {
+        let mut c = Command::new("kill");
+        c.args(["-KILL", "--", &format!("-{pid}")]);
+        c
+    };
+    let _ = tree
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Runs one gate; never panics. After the gate exits or is killed it waits at most [`DRAIN_GRACE`]
@@ -135,6 +253,9 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // own process group, so `kill_tree` can end the gate and everything it started in one go
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return fail(format!("cannot start `{}`: {e}", spec.cmd.join(" "))),
@@ -142,17 +263,29 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
     let t_out = Drain::start(child.stdout.take().expect("piped"));
     let t_err = Drain::start(child.stderr.take().expect("piped"));
     let timeout = Duration::from_secs(spec.timeout_s.max(1));
-    let mut timed_out = false;
+    let mut stop = None;
+    let mut slow = SlowTests::default();
+    let (mut seen_out, mut seen_err) = (0, 0);
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                timed_out = true;
+                kill_tree(&mut child);
+                stop = Some(Stop::Timeout);
                 break None;
             }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let lines = t_out.new_lines(&mut seen_out);
+                for line in lines.iter().chain(&t_err.new_lines(&mut seen_err)) {
+                    slow.feed(line);
+                }
+                if slow.limit_hit(spec) {
+                    kill_tree(&mut child);
+                    stop = Some(Stop::SlowTests);
+                    break None;
+                }
+                thread::sleep(POLL);
+            }
             Err(_) => break None,
         }
     };
@@ -166,19 +299,44 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
         }
         combined.push_str(&stderr);
     }
-    if timed_out {
-        combined.push_str(&format!(
+    if stop.is_some() {
+        // what the poll loop did not get to see before the gate was killed
+        combined.lines().for_each(|l| slow.feed(l));
+    }
+    match stop {
+        Some(Stop::Timeout) => combined.push_str(&format!(
             "\n[asf] gate `{}` killed: timeout after {}s",
             spec.name, spec.timeout_s
-        ));
+        )),
+        Some(Stop::SlowTests) => combined.push_str(&format!(
+            "\n[asf] gate `{}` killed: stopped early on slow tests ({})",
+            spec.name,
+            [
+                spec.slow_tests.map(|n| format!("slow_tests = {n}")),
+                spec.slow_after_s.map(|s| format!("slow_after_s = {s}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ")
+        )),
+        None => {}
     }
     let exit_code = status.and_then(|s| s.code());
-    let ok = !timed_out && exit_code == Some(0);
+    let ok = stop.is_none() && exit_code == Some(0);
     let mut cut = tail(&combined);
     if !ok {
         if let Some(summary) = failed_summary(&combined, &cut) {
             cut.push('\n');
             cut.push_str(&summary);
+        }
+        let header = match stop {
+            Some(Stop::Timeout) => slow.header(&spec.name, &format!("timed out after {}s", spec.timeout_s)),
+            Some(Stop::SlowTests) => slow.header(&spec.name, "stopped"),
+            None => None,
+        };
+        if let Some(header) = header {
+            cut = format!("{header}\n{cut}");
         }
     }
     GateResult {
@@ -418,6 +576,8 @@ pub fn stage_specs(gates: &[GateCfg], stage: GateWhen) -> Vec<GateSpec> {
             cmd: g.cmd.clone(),
             timeout_s: g.timeout_s,
             shell: g.shell.clone(),
+            slow_tests: g.slow_tests,
+            slow_after_s: g.slow_after_s,
         })
         .collect()
 }
@@ -649,8 +809,70 @@ pub fn foreign_tests(repo: &Path, tail: &str, changed: &[String]) -> Option<Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::locked_files;
+    use super::{locked_files, slow_test_line, SlowTests, SLOW_MAX_LISTED};
     use std::path::PathBuf;
+
+    #[test]
+    fn reads_the_name_and_seconds_of_a_libtest_hang_warning() {
+        assert_eq!(
+            slow_test_line("test serve::loop_ends has been running for over 60 seconds"),
+            Some(("serve::loop_ends", 60))
+        );
+        // Windows line ending and indentation
+        assert_eq!(
+            slow_test_line("  test a::b has been running for over 120 seconds\r"),
+            Some(("a::b", 120))
+        );
+    }
+
+    #[test]
+    fn other_lines_are_not_hang_warnings() {
+        for line in [
+            "",
+            "test a::b ... ok",
+            "test a::b ... FAILED",
+            "running 3 tests",
+            "a::b has been running for over 60 seconds",
+            "test  has been running for over 60 seconds",
+            "test two words has been running for over 60 seconds",
+            "test a::b has been running for over many seconds",
+            "test a::b has been running for over 60 seconds, really",
+        ] {
+            assert_eq!(slow_test_line(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_header_names_each_test_once_one_per_line() {
+        let mut s = SlowTests::default();
+        assert_eq!(s.header("test", "stopped"), None, "nothing slow, no header");
+        for l in [
+            "test b::two has been running for over 60 seconds",
+            "test a::one has been running for over 60 seconds",
+            "test b::two has been running for over 60 seconds",
+        ] {
+            s.feed(l);
+        }
+        assert_eq!(
+            s.header("test", "stopped").unwrap(),
+            "gate `test` stopped: 2 tests ran for more than 60 s:\nb::two\na::one"
+        );
+    }
+
+    #[test]
+    fn a_long_list_is_cut_with_a_count_of_the_rest() {
+        let mut s = SlowTests::default();
+        for i in 0..SLOW_MAX_LISTED + 7 {
+            s.feed(&format!("test t{i} has been running for over 60 seconds"));
+        }
+        let h = s.header("test", "timed out after 9s").unwrap();
+        assert!(h.starts_with(&format!(
+            "gate `test` timed out after 9s: {} tests ran",
+            SLOW_MAX_LISTED + 7
+        )));
+        assert_eq!(h.lines().count(), 1 + SLOW_MAX_LISTED + 1);
+        assert!(h.ends_with("... and 7 more"), "{h}");
+    }
 
     const EXE: &str = r"D:\Programowanie\auto-software-factory\.worktrees\asf-43\target\debug\deps\asf-ce36f34fbf868c1a.exe";
 

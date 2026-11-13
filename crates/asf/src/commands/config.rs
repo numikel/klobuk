@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use asf_core::config_edit::{apply_note, editable_keys, set_key};
+use asf_core::config_edit::{apply_note, editable_keys, lookup, set_key};
 use asf_core::Config;
 use serde::Serialize;
 use serde_json::Value;
@@ -41,11 +41,7 @@ fn read_config(cli: &Cli) -> Result<(PathBuf, String), AppError> {
 /// The value of the dotted `key` in `config`; `null` for an unset optional such as `worker.model`.
 fn value_of(config: &Config, key: &str) -> Result<Value, AppError> {
     let root = serde_json::to_value(config).map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
-    Ok(key
-        .split('.')
-        .try_fold(&root, |node, segment| node.get(segment))
-        .cloned()
-        .unwrap_or(Value::Null))
+    Ok(lookup(&root, key).cloned().unwrap_or(Value::Null))
 }
 
 fn display(value: &Value) -> String {

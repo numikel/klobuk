@@ -50,6 +50,14 @@ const EDITABLE: &[(&str, &str)] = &[
         "with --until-done: stop `asf serve` after this many ticks (unset: no limit; --max-ticks overrides it)",
     ),
     (
+        "gate.slow_tests",
+        "stop the `test` gate once this many tests print `has been running for over 60 seconds` (unset: never; set per [[gate]] in config.toml, here for the one named `test`)",
+    ),
+    (
+        "gate.slow_after_s",
+        "stop the `test` gate when its first such slow-test line is this many seconds old and it is still running (unset: never; per [[gate]] in config.toml, here for the one named `test`)",
+    ),
+    (
         "notify.on_new",
         "notify at once when something new waits for you (false: only reminders)",
     ),
@@ -62,6 +70,11 @@ const EDITABLE: &[(&str, &str)] = &[
         "minutes between repeated reminders (0: remind once)",
     ),
 ];
+
+/// The `gate.*` keys are not a section of `config.toml` but a field of one `[[gate]]` table. They
+/// address the gate with this `name`, the one that runs `cargo test` in the dogfooding config.
+const GATE_TARGET: &str = "test";
+const GATE_PREFIX: &str = "gate.";
 
 /// The keys [`set_key`] accepts, each with a one-line description.
 pub fn editable_keys() -> &'static [(&'static str, &'static str)] {
@@ -101,6 +114,9 @@ const APPLIES: &[(&str, Applies)] = &[
     // `serve::serve_loop` takes both from the refreshed config every tick, unless a flag sets them
     ("serve.interval_s", Applies::NextTick),
     ("serve.max_ticks", Applies::NextTick),
+    // `stage_specs` builds the gate specs from the refreshed config for every run
+    ("gate.slow_tests", Applies::NextTick),
+    ("gate.slow_after_s", Applies::NextTick),
     ("notify.on_new", Applies::NextTick),
     ("notify.after_minutes", Applies::NextTick),
     ("notify.every_minutes", Applies::NextTick),
@@ -186,12 +202,37 @@ impl ConfigField {
     /// [`unset_key`].
     pub fn default_value(&self) -> Option<String> {
         let root = serde_json::to_value(Config::default()).ok()?;
-        match self.key.split('.').try_fold(&root, |node, seg| node.get(seg))? {
+        match lookup(&root, self.key)? {
             serde_json::Value::Null => None,
             serde_json::Value::String(s) => Some(s.clone()),
             other => Some(other.to_string()),
         }
     }
+}
+
+/// The value of the dotted `key` in `root`, a [`Config`] serialized to JSON; `None` when the path does
+/// not exist. A `gate.*` key is read from the `[[gate]]` named `test`, because `gate` is an array.
+/// An unset optional key is `Some(Null)`: callers treat both alike.
+pub fn lookup<'a>(root: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    let mut path = key.split('.');
+    let mut node = root;
+    if key.starts_with(GATE_PREFIX) {
+        path.next();
+        node = root
+            .get("gate")?
+            .as_array()?
+            .iter()
+            .find(|g| g.get("name").and_then(serde_json::Value::as_str) == Some(GATE_TARGET))?;
+    }
+    path.try_fold(node, |n, seg| n.get(seg))
+}
+
+/// The `[[gate]]` table the `gate.*` keys edit, if the document has one.
+fn target_gate(doc: &mut DocumentMut) -> Option<&mut Table> {
+    doc.get_mut("gate")?
+        .as_array_of_tables_mut()?
+        .iter_mut()
+        .find(|g| g.get("name").and_then(Item::as_str) == Some(GATE_TARGET))
 }
 
 /// The three model keys take these names; any other model id is kept as it is.
@@ -297,6 +338,20 @@ const FIELDS: &[ConfigField] = &[
         help: "stop after this many ticks with --until-done",
     },
     ConfigField {
+        key: "gate.slow_tests",
+        label: "Slow tests to stop",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Number,
+        help: "stop `test` gate at this many tests over 60 s",
+    },
+    ConfigField {
+        key: "gate.slow_after_s",
+        label: "Slow test wait (s)",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Number,
+        help: "stop `test` gate if a slow test is this old (s)",
+    },
+    ConfigField {
         key: "notify.on_new",
         label: "Notify at once",
         group: ConfigGroup::Notifications,
@@ -346,7 +401,16 @@ pub fn set_key(toml: &str, key: &str, value: &str) -> Result<String, ConfigError
     let mut path: Vec<&str> = key.split('.').collect();
     let leaf = path.pop().unwrap_or_default();
 
-    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    let mut table: &mut dyn TableLike = if key.starts_with(GATE_PREFIX) {
+        path.clear();
+        target_gate(&mut doc).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "`{key}` edits the [[gate]] named `{GATE_TARGET}`, and config.toml has none"
+            ))
+        })?
+    } else {
+        doc.as_table_mut()
+    };
     for segment in path {
         let current = table;
         let item = current.entry(segment).or_insert(Item::Table(Table::new()));
@@ -381,7 +445,13 @@ pub fn set_key(toml: &str, key: &str, value: &str) -> Result<String, ConfigError
 
 /// Optional keys: removing one is safe because the loader falls back to a default (`worker.model`
 /// to the Claude Code default, `review.model` to `opus`). Every other key is required.
-const UNSETTABLE: &[&str] = &["worker.model", "review.model", "serve.max_ticks"];
+const UNSETTABLE: &[&str] = &[
+    "worker.model",
+    "review.model",
+    "serve.max_ticks",
+    "gate.slow_tests",
+    "gate.slow_after_s",
+];
 
 /// The keys [`unset_key`] accepts.
 pub fn unsettable_keys() -> &'static [&'static str] {
@@ -390,7 +460,8 @@ pub fn unsettable_keys() -> &'static [&'static str] {
 
 /// Removes the dotted `key` from the TOML document `toml` and returns the new text.
 ///
-/// Only optional keys (`worker.model`, `review.model`, `serve.max_ticks`) can be removed; any other key, known or not,
+/// Only optional keys (`worker.model`, `review.model`, `serve.max_ticks`, `gate.slow_tests`,
+/// `gate.slow_after_s`) can be removed; any other key, known or not,
 /// is refused with [`ConfigError::Invalid`]. Removing a key that is absent returns `toml` unchanged.
 /// Other comments, key order and formatting survive; the comment lines directly above the removed
 /// key go with it. The result is validated with [`Config::from_toml`] before it is returned.
@@ -406,7 +477,15 @@ pub fn unset_key(toml: &str, key: &str) -> Result<String, ConfigError> {
 
     let mut path: Vec<&str> = key.split('.').collect();
     let leaf = path.pop().unwrap_or_default();
-    let mut table: &mut dyn TableLike = doc.as_table_mut();
+    let mut table: &mut dyn TableLike = if key.starts_with(GATE_PREFIX) {
+        path.clear();
+        match target_gate(&mut doc) {
+            Some(gate) => gate,
+            None => return Ok(toml.to_string()), // no such gate, so no such key
+        }
+    } else {
+        doc.as_table_mut()
+    };
     for segment in path {
         let Some(next) = table.get_mut(segment).and_then(Item::as_table_like_mut) else {
             return Ok(toml.to_string()); // the section is absent, so is the key
@@ -480,6 +559,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 17);
+        assert_eq!(EDITABLE.len(), 19);
     }
 }

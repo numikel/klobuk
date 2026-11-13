@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use asf_core::config_edit::editable_keys;
+use asf_core::config_edit::{editable_keys, lookup};
 use asf_core::*;
 use asf_store::serve_pulse::{self, LoopState, ServeMode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -311,7 +311,7 @@ pub fn config_rows(toml: &str) -> Vec<ConfigRow> {
         .map(|(key, description)| {
             let (value, raw) = match &root {
                 None => ("(unreadable)".to_string(), String::new()),
-                Some(root) => match key.split('.').try_fold(root, |node, seg| node.get(seg)) {
+                Some(root) => match lookup(root, key) {
                     None | Some(serde_json::Value::Null) => ("(unset)".to_string(), String::new()),
                     Some(serde_json::Value::String(s)) => (s.clone(), s.clone()),
                     Some(other) => (other.to_string(), other.to_string()),

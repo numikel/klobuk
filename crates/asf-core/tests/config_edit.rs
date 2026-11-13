@@ -1,6 +1,6 @@
 use asf_core::config::{CleanKind, GateWhen};
 use asf_core::config_edit::{
-    applies, apply_note, editable_keys, fields, set_key, unset_key, Applies, ConfigGroup, FieldKind,
+    applies, apply_note, editable_keys, fields, lookup, set_key, unset_key, Applies, ConfigGroup, FieldKind,
 };
 use asf_core::{Config, ConfigError};
 
@@ -141,7 +141,7 @@ fn unparsable_document_is_a_parse_error() {
 }
 
 #[test]
-fn editable_keys_are_exactly_the_seventeen_named_in_the_briefs() {
+fn editable_keys_are_exactly_the_nineteen_named_in_the_briefs() {
     // In the order of the Config view: models, budgets, flow, notifications.
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
     assert_eq!(
@@ -161,6 +161,8 @@ fn editable_keys_are_exactly_the_seventeen_named_in_the_briefs() {
             "worker.remote_control",
             "serve.interval_s",
             "serve.max_ticks",
+            "gate.slow_tests",
+            "gate.slow_after_s",
             "notify.on_new",
             "notify.after_minutes",
             "notify.every_minutes",
@@ -200,6 +202,8 @@ fn fields_carry_the_labels_and_groups_of_the_view() {
         ("worker.remote_control", "Remote control", ConfigGroup::Flow),
         ("serve.interval_s", "Loop interval (s)", ConfigGroup::Flow),
         ("serve.max_ticks", "Loop tick limit", ConfigGroup::Flow),
+        ("gate.slow_tests", "Slow tests to stop", ConfigGroup::Flow),
+        ("gate.slow_after_s", "Slow test wait (s)", ConfigGroup::Flow),
     ] {
         assert_eq!((get(key).label, get(key).group), (label, group), "{key}");
     }
@@ -249,6 +253,8 @@ fn field_kinds_are_choice_bool_number_or_text() {
         "review.max_rounds",
         "serve.interval_s",
         "serve.max_ticks",
+        "gate.slow_tests",
+        "gate.slow_after_s",
         "notify.after_minutes",
         "notify.every_minutes",
     ] {
@@ -281,6 +287,8 @@ fn field_defaults_are_read_from_config_default() {
     // an optional key that is absent by default has no default value to write
     assert_eq!(get("worker.model").default_value(), None);
     assert_eq!(get("serve.max_ticks").default_value(), None);
+    assert_eq!(get("gate.slow_tests").default_value(), None);
+    assert_eq!(get("gate.slow_after_s").default_value(), None);
 }
 
 #[test]
@@ -465,6 +473,8 @@ fn a_key_the_serve_loop_reloads_says_it_applies_on_the_next_tick() {
         "merge.verify_main_after",
         "merge.clean_after",
         "worker.remote_control",
+        "gate.slow_tests",
+        "gate.slow_after_s",
         "notify.on_new",
         "notify.after_minutes",
         "notify.every_minutes",
@@ -553,4 +563,77 @@ fn serve_keys_set_validate_and_the_tick_limit_can_be_unset() {
         asf_core::config_edit::Applies::NextTick,
         "the loop takes [serve] from the refreshed config every tick"
     );
+}
+
+const WITH_GATES: &str = "\
+[[gate]]
+name = \"fmt\"
+cmd = [\"cargo\", \"fmt\"]
+
+# the slow one
+[[gate]]
+name = \"test\"
+cmd = [\"cargo\", \"test\"]
+timeout_s = 1200 # twenty minutes
+";
+
+#[test]
+fn gate_keys_land_in_the_gate_named_test_and_nowhere_else() {
+    let out = set_key(WITH_GATES, "gate.slow_tests", "3").unwrap();
+    let out = set_key(&out, "gate.slow_after_s", "300").unwrap();
+    let gates = Config::from_toml(&out).unwrap().gates;
+    assert_eq!(
+        (gates[0].slow_tests, gates[0].slow_after_s),
+        (None, None),
+        "{out}"
+    );
+    assert_eq!(
+        (gates[1].slow_tests, gates[1].slow_after_s),
+        (Some(3), Some(300)),
+        "{out}"
+    );
+    assert!(
+        out.contains("# the slow one") && out.contains("# twenty minutes"),
+        "{out}"
+    );
+    assert_eq!(gates.len(), 2, "no new [[gate]] table: {out}");
+    // a second set replaces the value in place
+    let again = set_key(&out, "gate.slow_tests", "5").unwrap();
+    assert_eq!(Config::from_toml(&again).unwrap().gates[1].slow_tests, Some(5));
+    assert_eq!(again.matches("slow_tests").count(), 1, "{again}");
+}
+
+#[test]
+fn gate_keys_need_a_gate_named_test_and_a_positive_number() {
+    let no_gate = set_key("", "gate.slow_tests", "3").unwrap_err();
+    assert!(matches!(no_gate, ConfigError::Invalid(_)), "{no_gate}");
+    assert!(no_gate.to_string().contains("[[gate]]"), "{no_gate}");
+    let only_fmt = "[[gate]]\nname = \"fmt\"\ncmd = [\"cargo\", \"fmt\"]\n";
+    assert!(set_key(only_fmt, "gate.slow_after_s", "60").is_err());
+    for bad in ["0", "-1", "soon", "1.5"] {
+        assert!(set_key(WITH_GATES, "gate.slow_tests", bad).is_err(), "{bad}");
+        assert!(set_key(WITH_GATES, "gate.slow_after_s", bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn gate_keys_can_be_unset_and_unsetting_an_absent_one_is_a_noop() {
+    let set = set_key(WITH_GATES, "gate.slow_tests", "3").unwrap();
+    let back = unset_key(&set, "gate.slow_tests").unwrap();
+    assert_eq!(Config::from_toml(&back).unwrap().gates[1].slow_tests, None);
+    assert_eq!(back, WITH_GATES, "the edit is undone byte for byte");
+    assert_eq!(unset_key(WITH_GATES, "gate.slow_after_s").unwrap(), WITH_GATES);
+    assert_eq!(unset_key("", "gate.slow_tests").unwrap(), "", "no gate, no key");
+}
+
+#[test]
+fn lookup_reads_gate_keys_from_the_gate_named_test() {
+    let config = Config::from_toml(&set_key(WITH_GATES, "gate.slow_tests", "3").unwrap()).unwrap();
+    let root = serde_json::to_value(&config).unwrap();
+    assert_eq!(lookup(&root, "gate.slow_tests"), Some(&serde_json::json!(3)));
+    assert_eq!(lookup(&root, "gate.slow_after_s"), Some(&serde_json::Value::Null));
+    assert_eq!(lookup(&root, "serve.interval_s"), Some(&serde_json::json!(10)));
+    assert_eq!(lookup(&root, "nope.nothing"), None);
+    let none = serde_json::to_value(Config::default()).unwrap();
+    assert_eq!(lookup(&none, "gate.slow_tests"), None, "no gate named test");
 }

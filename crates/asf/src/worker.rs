@@ -2703,6 +2703,8 @@ mod gate_slot_tests {
             cmd: vec!["python".into(), "-c".into(), code.into()],
             timeout_s: 60,
             shell: None,
+            slow_tests: None,
+            slow_after_s: None,
         }
     }
 

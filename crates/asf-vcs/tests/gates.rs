@@ -17,6 +17,8 @@ fn spec(name: &str, cmd: &[&str], timeout_s: u64) -> GateSpec {
         cmd: cmd.iter().map(|s| s.to_string()).collect(),
         timeout_s,
         shell: None,
+        slow_tests: None,
+        slow_after_s: None,
     }
 }
 
@@ -168,6 +170,8 @@ fn shell_pwsh_runs_through_powershell() {
         cmd: vec!["Write-Output".into(), "hello-from-pwsh".into()],
         timeout_s: 30,
         shell: Some("pwsh".into()),
+        slow_tests: None,
+        slow_after_s: None,
     };
     let results = run_gates(&[s], dir.path());
     assert!(results[0].ok, "{}", results[0].tail);
@@ -648,7 +652,250 @@ mod stages {
         assert_eq!(specs[0].cmd, ["echo", "hi"]);
         assert_eq!(specs[0].timeout_s, 7);
         assert_eq!(specs[0].shell.as_deref(), Some("sh"));
+        assert_eq!((specs[0].slow_tests, specs[0].slow_after_s), (None, None));
     }
+
+    #[test]
+    fn carries_the_slow_test_limits_over() {
+        let mut g = gate("test", None);
+        g.slow_tests = Some(3);
+        g.slow_after_s = Some(300);
+        let specs = stage_specs(&[g], GateWhen::Verify);
+        assert_eq!((specs[0].slow_tests, specs[0].slow_after_s), (Some(3), Some(300)));
+    }
+}
+
+/// A fake `cargo test`: it starts a child that sleeps 10 minutes (the way a test harness starts
+/// `asf serve`), records the child's pid, prints one libtest hang warning per name and then hangs
+/// itself, or exits 0 when `ending` says so.
+fn fake_test_binary(names: &[&str], stream: &str, ending: &str) -> String {
+    let lines: String = names
+        .iter()
+        .map(|n| {
+            format!("print('test {n} has been running for over 60 seconds', file={stream}, flush=True)\n")
+        })
+        .collect();
+    format!(
+        "import subprocess, sys, time\n\
+c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n\
+open('child.pid', 'w').write(str(c.pid))\n\
+{lines}{ending}"
+    )
+}
+
+const HANG: &str = "time.sleep(600)\n";
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+}
+
+/// The pid the fake test binary recorded for its child, if it got as far as writing it.
+fn child_pid(dir: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(dir.join("child.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The child must be gone shortly after the gate returned; a survivor is killed so the test does not
+/// leave a 10-minute sleeper behind.
+fn assert_child_gone(pid: u32) {
+    let wait = std::time::Instant::now();
+    while pid_alive(pid) {
+        if wait.elapsed().as_secs() >= 10 {
+            kill_pid(pid);
+            panic!("child {pid} of the gate is still running 10 s after the gate was stopped");
+        }
+        std::thread::sleep(ms(100));
+    }
+}
+
+fn watched(slow_tests: Option<u32>, slow_after_s: Option<u64>, timeout_s: u64, code: &str) -> GateSpec {
+    GateSpec {
+        slow_tests,
+        slow_after_s,
+        ..spec("test", &py(code), timeout_s)
+    }
+}
+
+#[test]
+fn slow_tests_stop_the_gate_early_name_both_tests_and_kill_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = fake_test_binary(&["alpha::one", "beta::two"], "sys.stdout", HANG);
+    let t = std::time::Instant::now();
+    let r = run_gates(&[watched(Some(2), None, 300, &code)], dir.path()).remove(0);
+    assert!(
+        t.elapsed().as_secs() < 100,
+        "stopped early, not at the 300 s timeout"
+    );
+    assert!(!r.ok);
+    assert_eq!(r.exit_code, None, "killed => no exit code");
+    let lines: Vec<&str> = r.tail.lines().collect();
+    assert_eq!(
+        &lines[..3],
+        [
+            "gate `test` stopped: 2 tests ran for more than 60 s:",
+            "alpha::one",
+            "beta::two"
+        ],
+        "{}",
+        r.tail
+    );
+    assert!(
+        r.tail.contains("has been running for over 60 seconds"),
+        "the normal last lines follow the header: {}",
+        r.tail
+    );
+    assert_child_gone(child_pid(dir.path()).expect("the fake binary recorded its child"));
+}
+
+#[test]
+fn an_old_slow_test_line_stops_the_gate_after_slow_after_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = fake_test_binary(&["alpha::one"], "sys.stdout", HANG);
+    let t = std::time::Instant::now();
+    let r = run_gates(&[watched(None, Some(1), 300, &code)], dir.path()).remove(0);
+    assert!(
+        t.elapsed().as_secs() < 100,
+        "stopped early, not at the 300 s timeout"
+    );
+    assert!(!r.ok);
+    assert_eq!(r.exit_code, None);
+    let lines: Vec<&str> = r.tail.lines().collect();
+    assert_eq!(
+        &lines[..2],
+        [
+            "gate `test` stopped: 1 test ran for more than 60 s:",
+            "alpha::one"
+        ],
+        "{}",
+        r.tail
+    );
+    assert_child_gone(child_pid(dir.path()).expect("the fake binary recorded its child"));
+}
+
+/// libtest prints the warning on stdout, but a wrapper may merge the streams: both are read.
+#[test]
+fn a_slow_test_line_on_stderr_counts_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = fake_test_binary(&["alpha::one", "beta::two"], "sys.stderr", HANG);
+    let r = run_gates(&[watched(Some(2), None, 300, &code)], dir.path()).remove(0);
+    assert!(r.tail.starts_with("gate `test` stopped: 2 tests"), "{}", r.tail);
+    assert_child_gone(child_pid(dir.path()).unwrap());
+}
+
+#[test]
+fn the_same_test_reported_twice_counts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = fake_test_binary(
+        &["alpha::one", "alpha::one"],
+        "sys.stdout",
+        "time.sleep(2)\nsys.exit(0)\n",
+    );
+    let r = run_gates(&[watched(Some(2), None, 60, &code)], dir.path()).remove(0);
+    assert!(r.ok, "one distinct test is below slow_tests = 2: {}", r.tail);
+    assert!(!r.tail.contains("stopped"), "{}", r.tail);
+    kill_pid(child_pid(dir.path()).unwrap());
+}
+
+/// No keys, no change: the slow tests are reported, the gate is left alone and finishes on its own.
+#[test]
+fn without_limits_a_gate_with_slow_tests_runs_to_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = fake_test_binary(
+        &["a::one", "b::two", "c::three"],
+        "sys.stdout",
+        "time.sleep(2)\nsys.exit(0)\n",
+    );
+    let r = run_gates(&[watched(None, None, 60, &code)], dir.path()).remove(0);
+    assert!(r.ok, "{}", r.tail);
+    assert_eq!(r.exit_code, Some(0));
+    assert!(!r.tail.contains("stopped"), "{}", r.tail);
+    kill_pid(child_pid(dir.path()).unwrap());
+}
+
+/// A slow test that finishes before `slow_after_s` elapses is no reason to stop the gate.
+#[test]
+fn a_gate_that_finishes_before_slow_after_s_is_not_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = fake_test_binary(&["a::one"], "sys.stdout", "time.sleep(1)\nsys.exit(0)\n");
+    let r = run_gates(&[watched(Some(5), Some(120), 60, &code)], dir.path()).remove(0);
+    assert!(r.ok, "{}", r.tail);
+    kill_pid(child_pid(dir.path()).unwrap());
+}
+
+/// The ordinary timeout names the slow tests seen so far and kills the whole tree as well. The gate's
+/// clock starts before the process does, so a gate killed before it printed anything proves nothing:
+/// the scenario is run again.
+#[test]
+fn a_timeout_lists_the_slow_tests_and_kills_the_child() {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        let dir = tempfile::tempdir().unwrap();
+        let code = fake_test_binary(&["alpha::one", "beta::two"], "sys.stdout", HANG);
+        let r = run_gates(&[watched(None, None, 8, &code)], dir.path()).remove(0);
+        assert!(!r.ok);
+        assert_eq!(r.exit_code, None);
+        assert!(r.tail.contains("timeout after 8s"), "{}", r.tail);
+        let pid = child_pid(dir.path());
+        if let Some(pid) = pid {
+            assert_child_gone(pid);
+        }
+        if pid.is_none() || !r.tail.contains("beta::two") {
+            eprintln!("attempt {attempt}/{ATTEMPTS}: the gate was killed before it printed its warnings");
+            continue;
+        }
+        let lines: Vec<&str> = r.tail.lines().collect();
+        assert_eq!(
+            &lines[..3],
+            [
+                "gate `test` timed out after 8s: 2 tests ran for more than 60 s:",
+                "alpha::one",
+                "beta::two"
+            ],
+            "{}",
+            r.tail
+        );
+        return;
+    }
+    panic!("the gate was killed before it printed its warnings in all {ATTEMPTS} attempts");
+}
+
+/// A timeout without any slow test keeps its old tail: no header.
+#[test]
+fn a_timeout_without_slow_tests_has_no_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = run_gates(&[spec("slow", &py("import time; time.sleep(30)"), 1)], dir.path()).remove(0);
+    assert!(!r.ok);
+    assert!(!r.tail.contains("tests ran for more than"), "{}", r.tail);
+    assert!(r.tail.contains("timeout after 1s"), "{}", r.tail);
 }
 
 /// A Polish linker quotes the path with „ ” instead of ASCII quotes; the recovery must still find the
