@@ -763,6 +763,49 @@ fn an_answer_is_posted_as_the_humans_reply_and_stops_the_question_waiting() {
 }
 
 #[test]
+fn an_answer_leaves_nothing_unread_for_the_human_on_that_issue_only() {
+    let store = asf_store::SqliteStore::open_in_memory().unwrap();
+    store.init_repo("D:/repo", "asf", "main").unwrap();
+    let new_issue = |title: &str| {
+        store
+            .create_issue(&NewIssue {
+                title: title.into(),
+                ..NewIssue::default()
+            })
+            .unwrap()
+    };
+    let (asked, other) = (new_issue("asked"), new_issue("other"));
+    let say = |issue: &Issue, author: &str, kind: CommentType| {
+        store
+            .add_comment(&NewComment {
+                issue_id: issue.id.clone(),
+                author: author.into(),
+                kind,
+                to_lane: LANE_HUMAN.into(),
+                body: format!("{kind:?} on {}", issue.id),
+                reply_to: None,
+            })
+            .unwrap()
+    };
+    say(&asked, LANE_ORCHESTRATOR, CommentType::Blocker);
+    let q = say(&asked, "agent:asf-1", CommentType::Question);
+    let elsewhere = say(&other, LANE_ORCHESTRATOR, CommentType::Blocker);
+    let unread = || -> Vec<i64> {
+        let items = store.inbox(LANE_HUMAN, true, false).unwrap();
+        items.iter().map(|c| c.id).collect()
+    };
+    assert_eq!(unread().len(), 3);
+
+    post_answer(&store, &asked.id, q.id, "yes").unwrap();
+
+    assert_eq!(
+        unread(),
+        [elsewhere.id],
+        "the BLOCKER, the resolved QUESTION and the answer itself are gone; another issue is untouched"
+    );
+}
+
+#[test]
 fn the_banner_is_for_the_other_views_the_footer_and_help_know_the_new_view() {
     let mut a = App::new(busy_desk());
     let t = render_to_text(&a, 120, 30);

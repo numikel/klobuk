@@ -341,6 +341,10 @@ impl Background {
 /// Posts the human's ANSWER to QUESTION comment `question` on `id` and returns the status line. It is
 /// the comment `asf issue comment --lane human --type ANSWER --reply-to <q>` writes: the worker finds
 /// it in its inbox, and the question stops blocking `asf issue finish`.
+///
+/// The answer also settles the human's side: the issue's comments to the human are marked read (the
+/// BLOCKER that announced the wait, and the answer itself, which the store shows to every lane), so the
+/// Inbox does not list the same thing a second time. Like the Inbox's `m`, the cursor is per issue.
 pub(crate) fn post_answer(
     store: &impl IssueStore,
     id: &IssueId,
@@ -355,6 +359,7 @@ pub(crate) fn post_answer(
         body: text.to_string(),
         reply_to: Some(question),
     })?;
+    store.mark_read(LANE_HUMAN, id)?;
     Ok(format!("answered #{question} on {id}"))
 }
 

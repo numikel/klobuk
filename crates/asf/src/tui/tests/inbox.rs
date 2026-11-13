@@ -929,3 +929,220 @@ fn capital_m_asks_before_marking_everything() {
     assert_eq!(a.handle_key(key('y')), Action::MarkAllRead);
     assert!(matches!(a.mode(), Mode::Normal));
 }
+
+// ---- answering a NEEDS YOU item settles the Inbox (asf-104) ----------------------------------------
+//
+// These run the whole loop except the terminal: a real store, a live fake agent, the key presses of
+// the Now view, `execute` (what the event loop calls), then the reload the loop forces after an action.
+
+mod settled {
+    use super::*;
+    use crate::ctx::Ctx;
+    use crate::tui::snapshot::{load_snapshot, RuntimeState};
+    use crate::tui::views::inbox;
+    use crate::worker::Worker;
+    use asf_runtime::FakeRuntime;
+
+    const QUESTION: &str = "Keep the old --scope flag as an alias?";
+
+    /// asf-1 has a worker `blocked` on a dialog. The human has two unread comments about it: the
+    /// orchestrator's BLOCKER with the screen and the worker's own QUESTION.
+    fn waiting_desk() -> (Ctx, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = asf_store::SqliteStore::open_in_memory().unwrap();
+        store.init_repo("D:/repo", "asf", "main").unwrap();
+        let issue = store
+            .create_issue(&NewIssue {
+                title: "Scope alias".into(),
+                ..NewIssue::default()
+            })
+            .unwrap();
+        let run = store
+            .create_run(&NewRun {
+                issue_id: issue.id.clone(),
+                runtime: "fake".into(),
+                worktree: ".worktrees/asf-1".into(),
+                branch: "feat/asf-1".into(),
+                base_sha: "base".into(),
+                budget_usd: Some(10.0),
+            })
+            .unwrap();
+        let rt = FakeRuntime::new(dir.path().join("fake.json"));
+        let ws = rt
+            .open_workspace(&OpenWorkspace {
+                cwd: dir.path().to_path_buf(),
+                label: "asf-1".into(),
+                env: vec![],
+            })
+            .unwrap();
+        rt.start_agent(&StartAgent {
+            name: issue.id.to_string(),
+            pane_id: ws.pane_id.clone(),
+            args: vec![],
+            timeout_ms: 1,
+        })
+        .unwrap();
+        store
+            .update_run(
+                &run.id,
+                &RunPatch {
+                    state: Some(RunState::Blocked),
+                    agent_name: Some(issue.id.to_string()),
+                    workspace_id: Some(ws.workspace_id),
+                    pane_id: Some(ws.pane_id),
+                    ..RunPatch::default()
+                },
+            )
+            .unwrap();
+        for (author, kind, body) in [
+            (LANE_ORCHESTRATOR, CommentType::Blocker, SCREEN_BODY),
+            ("agent:asf-1", CommentType::Question, QUESTION),
+        ] {
+            store
+                .add_comment(&NewComment {
+                    issue_id: issue.id.clone(),
+                    author: author.into(),
+                    kind,
+                    to_lane: LANE_HUMAN.into(),
+                    body: body.into(),
+                    reply_to: None,
+                })
+                .unwrap();
+        }
+        let ctx = Ctx {
+            root: dir.path().to_path_buf(),
+            config: Config::from_toml(Config::default_toml()).unwrap(),
+            store,
+            lane: LANE_HUMAN.into(),
+        };
+        (ctx, dir)
+    }
+
+    fn worker<'a>(ctx: &'a Ctx, dir: &tempfile::TempDir) -> Worker<'a> {
+        Worker {
+            ctx,
+            rt: Box::new(FakeRuntime::new(dir.path().join("fake.json"))),
+            vcs: asf_vcs::GitCli,
+        }
+    }
+
+    fn snapshot_of(ctx: &Ctx) -> Snapshot {
+        load_snapshot(ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap()
+    }
+
+    /// What `asf issue inbox --peek` prints for the human lane.
+    fn unread(ctx: &Ctx) -> Vec<(CommentType, String)> {
+        let items = ctx.store.inbox(LANE_HUMAN, true, false).unwrap();
+        items.into_iter().map(|c| (c.kind, c.body)).collect()
+    }
+
+    /// The Now view on the NEEDS YOU row of asf-1, before anything is answered.
+    fn app_on_the_row(ctx: &Ctx) -> App {
+        let mut a = App::new(snapshot_of(ctx));
+        select_need(&mut a, "asf-1");
+        assert_eq!(unread(ctx).len(), 2, "the BLOCKER and the QUESTION are unread");
+        assert!(inbox::rows(&a.snap) > 0, "and the Inbox lists them");
+        a
+    }
+
+    /// Runs `action` as the event loop does, then reloads the snapshot into `a`.
+    fn act(a: &mut App, action: Action, ctx: &Ctx, worker: &Worker<'_>) -> String {
+        let status = crate::tui::execute(action, ctx, worker).unwrap().unwrap();
+        a.replace(snapshot_of(ctx));
+        status
+    }
+
+    fn nothing_is_left(a: &mut App, ctx: &Ctx) {
+        assert!(unread(ctx).is_empty(), "{:?}", unread(ctx));
+        assert!(a.snap.needs_you.is_empty(), "{:?}", a.snap.needs_you);
+        assert_eq!(inbox::rows(&a.snap), 0);
+        a.view = View::Inbox;
+        let t = render_to_text(a, 120, 30);
+        assert!(!t.contains("alias") && !t.contains("waiting for input"), "{t}");
+    }
+
+    #[test]
+    fn option_one_in_the_overlay_answers_the_question_and_empties_the_inbox() {
+        let (ctx, dir) = waiting_desk();
+        let w = worker(&ctx, &dir);
+        let mut a = app_on_the_row(&ctx);
+
+        assert_eq!(a.handle_key(key('a')), Action::Peek(id("asf-1")));
+        let keys = a.handle_key(key('1'));
+        assert_eq!(keys, Action::Keys(id("asf-1"), vec!["1".into()]));
+        assert_eq!(act(&mut a, keys, &ctx, &w), "sent 1 to asf-1");
+
+        nothing_is_left(&mut a, &ctx);
+        let comments = ctx.store.comments(&id("asf-1")).unwrap();
+        let q = comments.iter().find(|c| c.kind == CommentType::Question).unwrap();
+        assert!(q.resolved_at.is_some(), "the QUESTION is resolved");
+    }
+
+    #[test]
+    fn a_typed_reply_in_the_overlay_does_the_same() {
+        let (ctx, dir) = waiting_desk();
+        let w = worker(&ctx, &dir);
+        let mut a = app_on_the_row(&ctx);
+
+        a.handle_key(key('a'));
+        a.handle_key(key('t'));
+        for c in "yes, keep it".chars() {
+            a.handle_key(key(c));
+        }
+        let reply = a.handle_key(code(KeyCode::Enter));
+        assert_eq!(reply, Action::Reply(id("asf-1"), "yes, keep it".into()));
+        assert_eq!(act(&mut a, reply, &ctx, &w), "sent to asf-1");
+
+        nothing_is_left(&mut a, &ctx);
+    }
+
+    #[test]
+    fn moving_the_cursor_in_the_overlay_leaves_the_question_on_the_desk() {
+        let (ctx, dir) = waiting_desk();
+        let w = worker(&ctx, &dir);
+        let mut a = app_on_the_row(&ctx);
+
+        a.handle_key(key('a'));
+        let down = a.handle_key(code(KeyCode::Down));
+        assert_eq!(down, Action::Keys(id("asf-1"), vec!["down".into()]));
+        act(&mut a, down, &ctx, &w);
+
+        assert_eq!(
+            unread(&ctx).len(),
+            2,
+            "the dialog is still open, nothing is answered"
+        );
+    }
+
+    #[test]
+    fn a_typed_answer_to_a_question_row_marks_the_old_blocker_read_too() {
+        let (ctx, dir) = waiting_desk();
+        let w = worker(&ctx, &dir);
+        // the worker moved on (the dialog is gone): only the QUESTION row is left on the desk
+        let run = ctx.store.runs(None, true).unwrap().pop().unwrap();
+        ctx.store
+            .update_run(
+                &run.id,
+                &RunPatch {
+                    state: Some(RunState::Working),
+                    ..RunPatch::default()
+                },
+            )
+            .unwrap();
+        let mut a = app_on_the_row(&ctx);
+        assert!(matches!(
+            a.selected_now_row(),
+            Some(now::NowRow::Need(n)) if matches!(n.source, NeedSource::Question(_))
+        ));
+
+        a.handle_key(key('a'));
+        for c in "yes".chars() {
+            a.handle_key(key(c));
+        }
+        let answer = a.handle_key(code(KeyCode::Enter));
+        assert!(matches!(&answer, Action::Answer(i, _, text) if *i == id("asf-1") && text == "yes"));
+        assert!(act(&mut a, answer, &ctx, &w).starts_with("answered #"));
+
+        nothing_is_left(&mut a, &ctx);
+    }
+}

@@ -531,6 +531,18 @@ fn grantable_glob(g: &str) -> bool {
     !absolute && !climbs && !everything
 }
 
+/// How a scope request starts, in the worker's QUESTION and on its dialog.
+const SCOPE_MARK: &str = "SCOPE:";
+
+/// Whether `keys` answer a dialog: they pick an option (a digit, `y`, `n`) or confirm the highlighted
+/// one (`enter`). `up`, `down` and `esc` move the cursor or dismiss, so the dialog is still waiting.
+fn answers_dialog(keys: &[String]) -> bool {
+    keys.iter().any(|k| {
+        let k = k.to_ascii_lowercase();
+        k == "enter" || k == "y" || k == "n" || (k.len() == 1 && k.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
 /// The paths of a scope request in a BLOCKER body that quotes a worker's AskUserQuestion screen: the
 /// question starts with `SCOPE: <path> because <reason>` (it may wrap onto the next lines) and option 1
 /// reads `Grant <path>`. Only the dialog block counts: option 1 is the last `1.` line of the screen and
@@ -540,14 +552,15 @@ fn grantable_glob(g: &str) -> bool {
 /// `None` otherwise (including a scope dialog whose first option is not the grant), so "1" never
 /// extends a scope by accident.
 fn scope_dialog_grant(body: &str) -> Option<Vec<String>> {
-    const MARK: &str = "SCOPE:";
     let lines: Vec<&str> = body.lines().collect();
     let option_at = option_one(&lines)?;
     let option = after_marker(lines[option_at]).strip_prefix("1.")?.trim_start();
     let granted = split_globs(option.strip_prefix("Grant")?);
-    let at = lines[..option_at].iter().rposition(|l| l.contains(MARK))?;
+    let at = lines[..option_at].iter().rposition(|l| l.contains(SCOPE_MARK))?;
     let line = lines[at];
-    let mut text = line[line.find(MARK)? + MARK.len()..].trim().to_string();
+    let mut text = line[line.find(SCOPE_MARK)? + SCOPE_MARK.len()..]
+        .trim()
+        .to_string();
     for next in lines[at + 1..option_at].iter().take(SCOPE_WRAP_LINES) {
         let next = next.trim();
         if text.contains("because") || next.is_empty() || next.starts_with(|c: char| c.is_ascii_digit()) {
@@ -1341,17 +1354,64 @@ impl<'a> Worker<'a> {
         Ok(run.clone())
     }
 
+    /// A human reply typed to the worker. Besides sending the text it settles the wait the reply ends
+    /// (see [`Worker::settle_answer`]); [`Worker::nudge`] sends text without that.
     pub fn reply(&self, id: &IssueId, text: &str) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
-        let h = Self::handle(&run)?;
+        let asked = self.newest_open_question(&run.issue_id)?;
+        self.send_text(&run, text)?;
+        self.settle_answer(&run, asked.as_ref(), text)?;
+        self.unblock(&run)
+    }
+
+    fn send_text(&self, run: &Run, text: &str) -> Result<(), AppError> {
+        let h = Self::handle(run)?;
         match self
             .rt
             .prompt(&h, text, &[], self.ctx.config.worker.prompt_timeout_ms)
         {
-            Ok(_) | Err(RuntimeError::Timeout(_)) | Err(RuntimeError::Stalled(_)) => {}
-            Err(e) => return Err(rt_err(e)),
+            Ok(_) | Err(RuntimeError::Timeout(_)) | Err(RuntimeError::Stalled(_)) => Ok(()),
+            Err(e) => Err(rt_err(e)),
         }
-        self.unblock(&run)
+    }
+
+    /// The newest QUESTION to the human on `issue` that nobody has answered: the one whose dialog is on
+    /// the worker's screen. Read before a reply or keys go out, because a scope grant answers its own
+    /// `SCOPE:` QUESTION on the way and an older open question must not then look like the newest.
+    fn newest_open_question(&self, issue: &IssueId) -> Result<Option<Comment>, AppError> {
+        let comments = self.ctx.store.comments(issue)?;
+        let open = crate::tui::snapshot::unanswered_questions(&comments);
+        Ok(comments
+            .into_iter()
+            .filter(|c| open.contains(&c.id))
+            .max_by_key(|c| c.id))
+    }
+
+    /// A human answer has reached a worker that waited on the human (`blocked` or `stalled`): settle
+    /// what announced the wait, so the Inbox, the Now view and `asf issue finish` all see it answered.
+    /// - `asked`, the QUESTION on the screen, gets an ANSWER (`reply_to`; the store sets `resolved_at`).
+    ///   A `SCOPE:` request is left alone: `asf issue scope add` answers a grant, and a refusal keeps
+    ///   the QUESTION open for the worker (pinned by the `run keys` CLI tests).
+    /// - The issue's comments to the human are marked read: the BLOCKER with the screen capture and
+    ///   the QUESTION. The cursor is per issue, so a newer unread comment of the same issue goes with them.
+    ///
+    /// A run in any other state, or text sent to a worker that did not wait, settles nothing.
+    fn settle_answer(&self, run: &Run, asked: Option<&Comment>, answer: &str) -> Result<(), AppError> {
+        if !matches!(run.state, RunState::Blocked | RunState::Stalled) {
+            return Ok(());
+        }
+        if let Some(q) = asked.filter(|q| !q.body.trim_start().starts_with(SCOPE_MARK)) {
+            self.ctx.store.add_comment(&NewComment {
+                issue_id: run.issue_id.clone(),
+                author: LANE_HUMAN.to_string(),
+                kind: CommentType::Answer,
+                to_lane: run.issue_id.to_string(),
+                body: answer.to_string(),
+                reply_to: Some(q.id),
+            })?;
+        }
+        self.ctx.store.mark_read(LANE_HUMAN, &run.issue_id)?;
+        Ok(())
     }
 
     /// Sends a worker whose run already `succeeded` back to work. The run is over (verified, queued,
@@ -1407,9 +1467,13 @@ impl<'a> Worker<'a> {
     /// is extended first with the code of `asf issue scope add` (which also answers the `SCOPE:`
     /// QUESTION), so the worker's hook lets the file through the moment the dialog closes. Any other
     /// key, or a dialog that is not a scope request, only sends the keys.
+    ///
+    /// Keys that choose an option or confirm one ([`answers_dialog`]) also settle the wait like a typed
+    /// [`Worker::reply`] does; `up`, `down` and `esc` only move the cursor, so the question stays open.
     pub fn keys(&self, id: &IssueId, keys: &[String]) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
         let h = Self::handle(&run)?;
+        let asked = self.newest_open_question(&run.issue_id)?;
         if let Some(globs) = self.granted_scope(&run, &h, keys)? {
             crate::commands::issue::scope(
                 self.ctx,
@@ -1421,6 +1485,10 @@ impl<'a> Worker<'a> {
         }
         let ks: Vec<&str> = keys.iter().map(String::as_str).collect();
         self.rt.send_keys(&h, &ks).map_err(rt_err)?;
+        if answers_dialog(keys) {
+            let how = format!("answered in the worker pane: sent {}", keys.join(" "));
+            self.settle_answer(&run, asked.as_ref(), &how)?;
+        }
         self.unblock(&run)
     }
 
@@ -1469,7 +1537,9 @@ impl<'a> Worker<'a> {
             "Reminder from asf: when the acceptance criteria hold, commit everything, write {FACTORY_DIR}/{RUNS_DIR}/{id}/report.md \
              and run `{asf} issue finish {id} --report {FACTORY_DIR}/{RUNS_DIR}/{id}/report.md`. If you are blocked, post a BLOCKER comment."
         );
-        self.reply(id, &text)
+        let run = self.run_for(id)?;
+        self.send_text(&run, &text)?;
+        self.unblock(&run)
     }
 
     pub fn abort(&self, id: &IssueId) -> Result<Run, AppError> {
@@ -2412,6 +2482,214 @@ mod tests {
         assert_ne!(again.run.id, first.run.id);
         assert_eq!(again.run.state, RunState::Working);
         assert_eq!(reviews(&fx).len(), 1);
+    }
+
+    // ---- a human answer settles the comments that announced the question (asf-104) ----------------
+
+    /// The fixture's run with a live fake agent behind it, moved to `state`.
+    fn run_in(fx: &Fx, state: RunState) -> Run {
+        let rt = FakeRuntime::new(fake_path(fx));
+        let ws = rt
+            .open_workspace(&OpenWorkspace {
+                cwd: fx.dir.path().to_path_buf(),
+                label: "asf-1".into(),
+                env: vec![],
+            })
+            .unwrap();
+        rt.start_agent(&StartAgent {
+            name: "asf-1".into(),
+            pane_id: ws.pane_id.clone(),
+            args: vec![],
+            timeout_ms: 1,
+        })
+        .unwrap();
+        fx.ctx
+            .store
+            .update_run(
+                &fx.run.id,
+                &RunPatch {
+                    state: Some(state),
+                    agent_name: Some("asf-1".into()),
+                    workspace_id: Some(ws.workspace_id),
+                    pane_id: Some(ws.pane_id),
+                    ..RunPatch::default()
+                },
+            )
+            .unwrap()
+    }
+
+    fn say(fx: &Fx, author: &str, kind: CommentType, body: &str) -> Comment {
+        fx.ctx
+            .store
+            .add_comment(&NewComment {
+                issue_id: fx.issue.id.clone(),
+                author: author.into(),
+                kind,
+                to_lane: LANE_HUMAN.into(),
+                body: body.into(),
+                reply_to: None,
+            })
+            .unwrap()
+    }
+
+    /// What a blocked worker leaves for the human: the orchestrator's BLOCKER with the screen, and the
+    /// worker's own QUESTION for the record.
+    fn announce(fx: &Fx, question: &str) -> (Comment, Comment) {
+        let blocker = say(
+            fx,
+            LANE_ORCHESTRATOR,
+            CommentType::Blocker,
+            &blocker_with(" ❯ 1. Yes\n   2. No"),
+        );
+        let q = say(fx, "agent:asf-1", CommentType::Question, question);
+        (blocker, q)
+    }
+
+    fn unread(fx: &Fx) -> Vec<i64> {
+        let inbox = fx.ctx.store.inbox(LANE_HUMAN, true, false).unwrap();
+        inbox.iter().map(|c| c.id).collect()
+    }
+
+    fn comment_by_id(fx: &Fx, id: i64) -> Comment {
+        let comments = fx.ctx.store.comments(&fx.issue.id).unwrap();
+        comments.into_iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn a_dialog_key_marks_the_announcing_comments_read_and_resolves_the_question() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let (blocker, q) = announce(&fx, "Keep the alias?");
+        assert_eq!(unread(&fx), [blocker.id, q.id]);
+
+        worker(&fx).keys(&fx.issue.id, &["1".to_string()]).unwrap();
+
+        assert!(unread(&fx).is_empty(), "nothing is left for the human");
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_some());
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert_eq!(
+            (answer.kind, answer.author.as_str(), answer.reply_to),
+            (CommentType::Answer, LANE_HUMAN, Some(q.id))
+        );
+        assert_eq!(answer.to_lane, fx.issue.id.to_string());
+        assert!(answer.body.contains('1'), "{}", answer.body);
+        assert_eq!(
+            fx.ctx.store.get_run(&fx.run.id).unwrap().unwrap().state,
+            RunState::Working
+        );
+    }
+
+    #[test]
+    fn a_typed_reply_settles_the_same_way_and_is_the_answer() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let (_, q) = announce(&fx, "Keep the alias?");
+
+        worker(&fx).reply(&fx.issue.id, "yes, keep it").unwrap();
+
+        assert!(unread(&fx).is_empty());
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert_eq!(
+            (answer.reply_to, answer.body.as_str()),
+            (Some(q.id), "yes, keep it")
+        );
+    }
+
+    #[test]
+    fn a_blocker_without_a_question_is_still_marked_read() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let blocker = say(
+            &fx,
+            LANE_ORCHESTRATOR,
+            CommentType::Blocker,
+            &blocker_with(" ❯ 1. Yes"),
+        );
+
+        worker(&fx).keys(&fx.issue.id, &["enter".to_string()]).unwrap();
+
+        assert!(!unread(&fx).contains(&blocker.id));
+        let comments = fx.ctx.store.comments(&fx.issue.id).unwrap();
+        assert!(
+            comments.iter().all(|c| c.kind != CommentType::Answer),
+            "no question, so no ANSWER is invented"
+        );
+    }
+
+    #[test]
+    fn keys_that_only_move_the_cursor_answer_nothing() {
+        for keys in [vec!["down"], vec!["up", "down"], vec!["esc"]] {
+            let fx = fixture();
+            run_in(&fx, RunState::Blocked);
+            let (blocker, q) = announce(&fx, "Keep the alias?");
+
+            let keys: Vec<String> = keys.into_iter().map(String::from).collect();
+            worker(&fx).keys(&fx.issue.id, &keys).unwrap();
+
+            assert_eq!(unread(&fx), [blocker.id, q.id], "{keys:?}");
+            assert!(comment_by_id(&fx, q.id).resolved_at.is_none(), "{keys:?}");
+        }
+        // a sequence that ends in a choice does answer
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Keep the alias?");
+        worker(&fx)
+            .keys(&fx.issue.id, &["down".to_string(), "enter".to_string()])
+            .unwrap();
+        assert!(unread(&fx).is_empty());
+    }
+
+    #[test]
+    fn a_nudge_is_a_reminder_not_an_answer() {
+        let fx = fixture();
+        run_in(&fx, RunState::Stalled);
+        let (blocker, q) = announce(&fx, "Keep the alias?");
+
+        worker(&fx).nudge(&fx.issue.id).unwrap();
+
+        assert_eq!(unread(&fx), [blocker.id, q.id]);
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
+    }
+
+    #[test]
+    fn a_run_that_was_not_waiting_on_the_human_settles_nothing() {
+        let fx = fixture();
+        run_in(&fx, RunState::Working);
+        let (blocker, q) = announce(&fx, "Keep the alias?");
+
+        worker(&fx).reply(&fx.issue.id, "carry on").unwrap();
+
+        assert_eq!(unread(&fx), [blocker.id, q.id]);
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
+    }
+
+    #[test]
+    fn only_the_newest_open_question_is_answered_by_one_answer() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let older = say(&fx, "agent:asf-1", CommentType::Question, "First?");
+        let newer = say(&fx, "agent:asf-1", CommentType::Question, "Second?");
+
+        worker(&fx).keys(&fx.issue.id, &["1".to_string()]).unwrap();
+
+        assert!(comment_by_id(&fx, newer.id).resolved_at.is_some());
+        assert!(
+            comment_by_id(&fx, older.id).resolved_at.is_none(),
+            "the dialog on the screen is the newest question"
+        );
+    }
+
+    #[test]
+    fn a_scope_request_is_left_to_scope_add() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let (blocker, q) = announce(&fx, "SCOPE: Cargo.toml because a new dependency is needed");
+
+        // refusing the grant: the QUESTION stays open (the CLI tests pin this), the screen is read
+        worker(&fx).keys(&fx.issue.id, &["2".to_string()]).unwrap();
+
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
+        assert!(!unread(&fx).contains(&blocker.id));
     }
 }
 
