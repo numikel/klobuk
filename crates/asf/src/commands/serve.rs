@@ -101,15 +101,19 @@ fn waiting_line(n: usize) -> String {
 
 /// One tick. With no `gate` slot (`--once`) the gates run inside the call, in the order the loop used
 /// before gate runs left the tick; with one (the loop) they are handed to the slot.
+///
+/// `beat` tells the pulse that the tick is alive; it runs around every worker start, which can block
+/// for the whole start window.
 fn tick(
     ctx: &Ctx,
     dispatch: bool,
     reminders: &mut RemindState,
     gate: Option<&mut GateSlot>,
+    beat: &mut dyn FnMut(),
 ) -> Result<TickReport, AppError> {
     match gate {
-        None => tick_inline(ctx, dispatch, reminders),
-        Some(slot) => tick_background(ctx, dispatch, reminders, slot),
+        None => tick_inline(ctx, dispatch, reminders, beat),
+        Some(slot) => tick_background(ctx, dispatch, reminders, slot, beat),
     }
 }
 
@@ -122,21 +126,20 @@ struct Dispatched {
 }
 
 /// Promotes what became ready, closes finished epics and, with `--dispatch`, starts the planned slots.
-fn promote_and_dispatch(ctx: &Ctx, worker: &Worker<'_>, dispatch: bool) -> Result<Dispatched, AppError> {
+fn promote_and_dispatch(
+    ctx: &Ctx,
+    worker: &Worker<'_>,
+    dispatch: bool,
+    beat: &mut dyn FnMut(),
+) -> Result<Dispatched, AppError> {
     let promoted = ctx.store.promote_ready()?;
     let closed_epics = ctx.store.close_completed_epics()?;
     let mut started = Vec::new();
     let mut start_errors = Vec::new();
     if dispatch {
         let plan = super::run::current_plan(ctx)?;
-        for slot in plan.slots {
-            match worker.start(&slot.issue, None) {
-                Ok(_) => started.push(slot.issue),
-                Err(e) => {
-                    start_errors.push(json!({ "issue": slot.issue, "code": e.code, "message": e.message }))
-                }
-            }
-        }
+        let slots = plan.slots.into_iter().map(|s| s.issue).collect();
+        (started, start_errors) = start_slots(slots, beat, |id| worker.start(id, None).map(drop));
     }
     Ok(Dispatched {
         promoted,
@@ -146,12 +149,38 @@ fn promote_and_dispatch(ctx: &Ctx, worker: &Worker<'_>, dispatch: bool) -> Resul
     })
 }
 
+/// Starts the planned issues one after another. A start blocks for up to the start window, so a batch
+/// outlasts any pulse limit unless `beat` runs around each one (before it, and after it, failed or not).
+fn start_slots(
+    slots: Vec<IssueId>,
+    beat: &mut dyn FnMut(),
+    mut start: impl FnMut(&IssueId) -> Result<(), AppError>,
+) -> (Vec<IssueId>, Vec<serde_json::Value>) {
+    let mut started = Vec::new();
+    let mut start_errors = Vec::new();
+    for issue in slots {
+        beat();
+        let outcome = start(&issue);
+        beat();
+        match outcome {
+            Ok(()) => started.push(issue),
+            Err(e) => start_errors.push(json!({ "issue": issue, "code": e.code, "message": e.message })),
+        }
+    }
+    (started, start_errors)
+}
+
 /// Order matters: merges close issues, and only then can their dependents be promoted.
-fn tick_inline(ctx: &Ctx, dispatch: bool, reminders: &mut RemindState) -> Result<TickReport, AppError> {
+fn tick_inline(
+    ctx: &Ctx,
+    dispatch: bool,
+    reminders: &mut RemindState,
+    beat: &mut dyn FnMut(),
+) -> Result<TickReport, AppError> {
     let worker = Worker::new(ctx)?;
     let watch = worker.watch()?;
     let merge = tick_all(ctx, false)?;
-    let done = promote_and_dispatch(ctx, &worker, dispatch)?;
+    let done = promote_and_dispatch(ctx, &worker, dispatch, beat)?;
     // Last, so the notifications see the state this tick has just produced.
     let remind::Notices { alerts, reminders } =
         remind::send_due(ctx, &*worker.rt, reminders, time::OffsetDateTime::now_utc())?;
@@ -180,6 +209,7 @@ fn tick_background(
     dispatch: bool,
     reminders: &mut RemindState,
     slot: &mut GateSlot,
+    beat: &mut dyn FnMut(),
 ) -> Result<TickReport, AppError> {
     let worker = Worker::new(ctx)?;
     let started_before = slot.started();
@@ -205,7 +235,7 @@ fn tick_background(
     let polled = merge::poll(ctx, main_red || slot.checks_main())?;
     items.extend(polled.items);
     cleanup.append(polled.cleanup);
-    let done = promote_and_dispatch(ctx, &worker, dispatch)?;
+    let done = promote_and_dispatch(ctx, &worker, dispatch, beat)?;
 
     if !main_red {
         let next = merge::start_next(ctx, slot)?;
@@ -468,6 +498,11 @@ fn limits(a: &ServeArgs, cfg: &asf_core::Config) -> (u64, Option<u64>) {
     )
 }
 
+/// How long one worker start may block the loop, in whole seconds (rounded up, at least 1).
+fn start_window_s(cfg: &asf_core::Config) -> u64 {
+    cfg.worker.start_timeout_ms.div_ceil(1000).max(1)
+}
+
 fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -489,7 +524,7 @@ fn takeover_check(
             p.pid,
             serve_pulse::fmt_age(age_s),
             p.started_at,
-            (p.interval_s * serve_pulse::STALE_AFTER_INTERVALS).max(serve_pulse::MIN_STALE_SECS)
+            serve_pulse::stale_after_s(p)
         )),
         _ => Ok(()),
     }
@@ -505,20 +540,27 @@ struct Heartbeat {
 
 impl Heartbeat {
     /// Starts the pulse and writes it at once, so the TUI sees the loop before its first tick ends.
-    fn start(root: &std::path::Path, mode: ServeMode, interval_s: u64, max_ticks: Option<u64>) -> Heartbeat {
+    fn start(root: &std::path::Path, mode: ServeMode, cfg: &asf_core::Config, a: &ServeArgs) -> Heartbeat {
         let mut hb = Heartbeat {
             root: root.to_path_buf(),
-            pulse: Pulse::start(mode, interval_s, max_ticks, &now_rfc3339()),
+            pulse: Pulse::start(mode, 0, None, &now_rfc3339()),
             warned: false,
         };
+        hb.set_limits(cfg, a);
         hb.save();
         hb
     }
 
-    /// The limits in force this tick (an edit of `[serve]` reaches the next tick).
-    fn set_limits(&mut self, interval_s: u64, max_ticks: Option<u64>) {
-        self.pulse.interval_s = interval_s;
-        self.pulse.max_ticks = max_ticks;
+    /// The limits in force this tick (an edit of `[serve]` or `[worker]` reaches the next tick).
+    fn set_limits(&mut self, cfg: &asf_core::Config, a: &ServeArgs) {
+        (self.pulse.interval_s, self.pulse.max_ticks) = limits(a, cfg);
+        self.pulse.start_timeout_s = start_window_s(cfg);
+    }
+
+    /// The tick in progress is alive (a worker start is about to block, or just did).
+    fn touch(&mut self) {
+        self.pulse.touch(&now_rfc3339());
+        self.save();
     }
 
     fn beat(&mut self, ticks: u64) {
@@ -548,10 +590,10 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
     let mut ctx = Ctx::load(cli)?;
     let mut reminders = RemindState::new();
     if a.once {
-        let t = tick(&ctx, a.dispatch, &mut reminders, None)?;
+        let t = tick(&ctx, a.dispatch, &mut reminders, None, &mut || {})?;
         return Rendered::new(&t, text(&t));
     }
-    let (interval, max_ticks) = limits(a, &ctx.config);
+    let (interval, _) = limits(a, &ctx.config);
     let on_disk = serve_pulse::read(&ctx.root).ok().flatten();
     let alive = on_disk
         .as_ref()
@@ -583,7 +625,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
         );
     }
     let mut gate = GateSlot::new();
-    let mut hb = Heartbeat::start(&ctx.root, mode, interval, max_ticks);
+    let mut hb = Heartbeat::start(&ctx.root, mode, &ctx.config, a);
     let result = serve_loop(cli, a, &mut ctx, &mut reminders, &mut gate, &mut hb);
     if let Err(e) = &result {
         if hb.pulse.stopped_at.is_none() {
@@ -615,9 +657,8 @@ fn serve_loop(
         if let Some(warning) = watch.refresh(ctx) {
             eprintln!("asf serve: {warning}");
         }
-        let (interval, max_ticks) = limits(a, &ctx.config);
-        hb.set_limits(interval, max_ticks);
-        let tick_ok = match tick(ctx, a.dispatch, reminders, Some(&mut *gate)) {
+        hb.set_limits(&ctx.config, a);
+        let tick_ok = match tick(ctx, a.dispatch, reminders, Some(&mut *gate), &mut || hb.touch()) {
             Ok(t) => {
                 if !t.promoted.is_empty()
                     || !t.closed_epics.is_empty()
@@ -715,11 +756,45 @@ mod tests {
             "a stale pulse is taken over"
         );
         assert!(takeover_check(None, now, None).is_ok());
+        // the "silent for N s" figure is the limit `judge` applies, not a second computation
+        let mut slow = fresh.clone();
+        slow.start_timeout_s = 200;
+        let msg = takeover_check(Some(&slow), now, Some(true)).unwrap_err();
+        assert!(
+            msg.contains(&format!("{} s", serve_pulse::stale_after_s(&slow))),
+            "{msg}"
+        );
         let mut stopped = fresh.clone();
         stopped.stop("all_done", "2026-11-11T19:59:59Z");
         assert!(
             takeover_check(Some(&stopped), now, Some(true)).is_ok(),
             "a clean stop is free"
+        );
+    }
+
+    #[test]
+    fn the_pulse_is_refreshed_around_every_worker_start() {
+        // a start blocks for up to the start window, a batch of them for much longer than one beat
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let (started, errors) = start_slots(
+            vec![id(1), id(2)],
+            &mut || log.borrow_mut().push("beat".into()),
+            |i| {
+                log.borrow_mut().push(format!("start {i}"));
+                if *i == id(2) {
+                    Err(AppError::conflict("no room"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(started, vec![id(1)]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["issue"], "asf-2");
+        assert_eq!(
+            *log.borrow(),
+            ["beat", "start asf-1", "beat", "beat", "start asf-2", "beat"],
+            "a beat before and after each start, a failed one included"
         );
     }
 

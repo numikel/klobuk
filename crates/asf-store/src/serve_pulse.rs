@@ -18,8 +18,19 @@ pub const PULSE_FILE: &str = "serve.json";
 
 /// A pulse older than this many intervals is stale ...
 pub const STALE_AFTER_INTERVALS: u64 = 3;
-/// ... but never under this many seconds: one tick can block on a worker start (up to 90 s).
+/// ... but never under this many seconds ...
 pub const MIN_STALE_SECS: u64 = 120;
+/// ... nor under this many start windows (`[worker] start_timeout_ms`): a worker start waits for the pane,
+/// may answer the trust dialog and retries once in a fresh pane. The loop also beats around every start,
+/// so this only has to cover one start, not a whole batch.
+// shortcut: a start that waits longer than 3 windows still reads as stopped; raise it if live runs show that.
+pub const START_WAITS: u64 = 3;
+/// `[worker] start_timeout_ms` default, in seconds; what a pulse written without the field assumes.
+pub const DEFAULT_START_TIMEOUT_S: u64 = 90;
+
+fn default_start_timeout_s() -> u64 {
+    DEFAULT_START_TIMEOUT_S
+}
 
 /// What the loop was started to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +59,9 @@ pub struct Pulse {
     pub mode: ServeMode,
     pub interval_s: u64,
     pub max_ticks: Option<u64>,
+    /// `[worker] start_timeout_ms` in seconds (rounded up): how long one worker start may block the loop.
+    #[serde(default = "default_start_timeout_s")]
+    pub start_timeout_s: u64,
     pub ticks: u64,
     /// Set by a clean stop only.
     pub stopped_at: Option<String>,
@@ -64,6 +78,7 @@ impl Pulse {
             mode,
             interval_s,
             max_ticks,
+            start_timeout_s: DEFAULT_START_TIMEOUT_S,
             ticks: 0,
             stopped_at: None,
             stop_reason: None,
@@ -73,6 +88,11 @@ impl Pulse {
     /// Records a finished tick.
     pub fn tick(&mut self, ticks: u64, now: &str) {
         self.ticks = ticks;
+        self.last_tick_at = now.to_string();
+    }
+
+    /// Records that the tick in progress is alive (it did not finish, so `ticks` stays).
+    pub fn touch(&mut self, now: &str) {
         self.last_tick_at = now.to_string();
     }
 
@@ -127,6 +147,15 @@ fn seconds_between(now: OffsetDateTime, then: &str) -> Option<i64> {
     Some((now - then).whole_seconds().max(0))
 }
 
+/// Seconds of silence after which a pulse without a recorded stop counts as stale. The one figure
+/// [`judge`] applies and the refusal of a second loop quotes.
+pub fn stale_after_s(p: &Pulse) -> u64 {
+    p.interval_s
+        .saturating_mul(STALE_AFTER_INTERVALS)
+        .max(MIN_STALE_SECS)
+        .max(p.start_timeout_s.saturating_mul(START_WAITS))
+}
+
 /// Decides the loop state. `pid_alive` is `Some` only when the caller checked the process (the TUI does
 /// not: it refreshes every couple of seconds and a process lookup is a child process on Windows).
 /// A pulse without `stopped_at` is stopped when it is stale or its process is gone.
@@ -146,8 +175,7 @@ pub fn judge(pulse: Option<&Pulse>, now: OffsetDateTime, pid_alive: Option<bool>
     let Some(age_s) = seconds_between(now, &p.last_tick_at) else {
         return stopped(None, &p.last_tick_at);
     };
-    let limit = (p.interval_s.saturating_mul(STALE_AFTER_INTERVALS)).max(MIN_STALE_SECS);
-    if age_s as u64 > limit || pid_alive == Some(false) {
+    if age_s as u64 > stale_after_s(p) || pid_alive == Some(false) {
         return stopped(None, &p.last_tick_at);
     }
     LoopState::Running { mode: p.mode, age_s }
@@ -325,16 +353,53 @@ mod tests {
 
     #[test]
     fn a_pulse_older_than_three_intervals_but_within_the_floor_is_still_running() {
-        let p = pulse(10);
+        let mut p = pulse(10);
+        p.start_timeout_s = 1; // a short start window leaves only the floor
+        assert_eq!(stale_after_s(&p), MIN_STALE_SECS);
         assert!(judge(Some(&p), at(MIN_STALE_SECS as i64), None).is_running());
         assert!(!judge(Some(&p), at(MIN_STALE_SECS as i64 + 1), None).is_running());
     }
 
     #[test]
     fn a_long_interval_raises_the_limit_to_three_intervals() {
-        let p = pulse(100); // 300 s
+        let mut p = pulse(100); // 300 s
+        p.start_timeout_s = 1;
+        assert_eq!(stale_after_s(&p), 300);
         assert!(judge(Some(&p), at(300), None).is_running());
         assert!(!judge(Some(&p), at(301), None).is_running());
+    }
+
+    #[test]
+    fn a_tick_that_blocks_on_slow_worker_starts_is_not_read_as_stopped() {
+        // default window: one start waits up to 90 s, a tick starts several workers one after another
+        let p = pulse(10);
+        assert_eq!(p.start_timeout_s, 90);
+        for secs in [150, 200, 260] {
+            assert!(
+                judge(Some(&p), at(secs), Some(true)).is_running(),
+                "{secs} s into a tick that is still starting workers"
+            );
+        }
+        assert!(!judge(Some(&p), at(stale_after_s(&p) as i64 + 1), None).is_running());
+    }
+
+    #[test]
+    fn the_limit_follows_the_start_window_the_loop_runs_with() {
+        let mut p = pulse(10);
+        p.start_timeout_s = 200;
+        assert_eq!(stale_after_s(&p), START_WAITS * 200);
+        p.interval_s = u64::MAX; // a silly config must not overflow
+        assert_eq!(stale_after_s(&p), u64::MAX);
+    }
+
+    #[test]
+    fn a_pulse_file_written_before_the_start_window_was_recorded_still_reads() {
+        let mut p = pulse(10);
+        p.start_timeout_s = 5;
+        let mut v = serde_json::to_value(&p).unwrap();
+        v.as_object_mut().unwrap().remove("start_timeout_s");
+        let old: Pulse = serde_json::from_value(v).unwrap();
+        assert_eq!(old.start_timeout_s, DEFAULT_START_TIMEOUT_S);
     }
 
     #[test]

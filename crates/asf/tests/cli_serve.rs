@@ -1792,6 +1792,26 @@ fn a_stale_or_stopped_pulse_is_taken_over() {
 }
 
 #[test]
+fn the_pulse_records_the_start_window_that_stretches_the_stale_limit() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let cfg = repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("auto_trust = true"), "template changed");
+    std::fs::write(
+        &cfg,
+        s.replace(
+            "auto_trust = true",
+            "start_timeout_ms = 100500\nauto_trust = true",
+        ),
+    )
+    .unwrap();
+    repo.ok(&["serve", "--until-done"]);
+    let p = pulse_of(&repo);
+    assert_eq!(p["start_timeout_s"], 101, "rounded up from 100500 ms: {p}");
+}
+
+#[test]
 fn config_sets_the_interval_and_the_tick_limit_and_flags_override_it() {
     let repo = Repo::initialised();
     use_fake_runtime(&repo);
