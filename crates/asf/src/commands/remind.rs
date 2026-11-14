@@ -5,15 +5,15 @@
 //! Both go through the runtime port's `notify` and the optional `[notify] command`. Only the serve
 //! loop calls this. The decisions are pure and live in `asf_core::remind`; this module is the IO.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use asf_core::remind::{self, EventIndex, WaitKind, Waiting, EVENT_REMINDED};
+use asf_core::remind::{self, EventIndex, WaitInput, WaitKind, Waiting, EVENT_REMINDED};
 use asf_core::{
-    AgentRuntime, Comment, CommentType, Issue, IssueFilter, IssueId, IssueStore, MergeState, NewEvent, Run,
-    RunState, Status, LANE_HUMAN, LANE_ORCHESTRATOR,
+    AgentRuntime, Comment, CommentType, IssueFilter, IssueId, IssueStore, NewEvent, LANE_HUMAN,
+    LANE_ORCHESTRATOR,
 };
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
@@ -203,117 +203,45 @@ fn deliver(
 }
 
 /// Everything that waits for the human right now, with the time it began to wait and a key that
-/// names this episode. Includes the open BLOCKER comments to the human (announced, never reminded).
-fn collect(ctx: &Ctx, index: &EventIndex, now: OffsetDateTime) -> Result<Vec<Waiting>, AppError> {
+/// names this episode: [`remind::waits`] (the rule shared with the TUI) plus the open BLOCKER
+/// comments to the human (announced, never reminded), which the store cannot tell are still open.
+pub(crate) fn collect(ctx: &Ctx, index: &EventIndex, now: OffsetDateTime) -> Result<Vec<Waiting>, AppError> {
     let store = &ctx.store;
-    let live: BTreeMap<IssueId, Issue> = store
-        .list_issues(&IssueFilter::default())?
-        .into_iter()
-        .filter(|i| !i.status.is_terminal())
-        .map(|i| (i.id.clone(), i))
-        .collect();
+    let issues = store.list_issues(&IssueFilter::default())?;
 
-    let mut comments: BTreeMap<IssueId, Vec<Comment>> = BTreeMap::new();
-    let mut out = Vec::new();
-    for issue in live.values() {
+    let mut questions: Vec<Comment> = Vec::new();
+    let mut blockers: Vec<Comment> = Vec::new();
+    let mut news: Vec<Waiting> = Vec::new();
+    for issue in issues.iter().filter(|i| !i.status.is_terminal()) {
         let list = store.comments(&issue.id)?;
         let open: BTreeSet<i64> = unanswered_questions(&list).into_iter().collect();
-        for q in list.iter().filter(|c| open.contains(&c.id)) {
-            out.push(Waiting {
-                issue: issue.id.clone(),
-                kind: WaitKind::Question,
-                since: q.created_at.clone(),
-                reason: remind::first_line(&q.body),
-                key: format!("question:{}", q.id),
-            });
-        }
-        for b in news_blockers(&list, now) {
-            out.push(Waiting {
-                issue: issue.id.clone(),
-                kind: WaitKind::Blocker,
-                since: b.created_at.clone(),
-                reason: remind::first_line(&b.body),
-                key: format!("blocker:{}", b.id),
-            });
-        }
-        if issue.status == Status::Blocked {
-            let status = issue.status.as_str();
-            let entered = index
-                .issue_entered(&issue.id, status)
-                .unwrap_or(&issue.updated_at);
-            out.push(Waiting {
-                issue: issue.id.clone(),
-                kind: WaitKind::IssueBlocked,
-                since: issue.updated_at.clone(),
-                reason: last_blocker(&list),
-                key: format!("issue:{status}@{entered}"),
-            });
-        }
-        comments.insert(issue.id.clone(), list);
+        questions.extend(list.iter().filter(|c| open.contains(&c.id)).cloned());
+        blockers.extend(
+            list.iter()
+                .filter(|c| c.kind == CommentType::Blocker)
+                .max_by_key(|c| c.id)
+                .cloned(),
+        );
+        news.extend(news_blockers(&list, now).into_iter().map(|b| Waiting {
+            issue: issue.id.clone(),
+            kind: WaitKind::Blocker,
+            since: b.created_at.clone(),
+            reason: remind::first_line(&b.body),
+            key: format!("blocker:{}", b.id),
+        }));
     }
 
-    for m in store.merge_queue()? {
-        let kind = match m.state {
-            MergeState::Failed => WaitKind::MergeFailed,
-            MergeState::Blocked => WaitKind::MergeBlocked,
-            _ => continue,
-        };
-        // A worker that a reviewer sent back is fixing the findings (the item stays failed while its
-        // run is active again): nothing waits for the human then. Same guard as `merge retry`.
-        if live.contains_key(&m.issue_id) && store.runs(Some(&m.issue_id), true)?.is_empty() {
-            let entered = index
-                .merge_entered(m.id, m.state.as_str())
-                .unwrap_or(&m.updated_at)
-                .to_string();
-            out.push(Waiting {
-                reason: m
-                    .last_error
-                    .as_deref()
-                    .map(remind::first_line)
-                    .unwrap_or_default(),
-                key: format!("merge:{}:{}@{entered}", m.id, m.state),
-                issue: m.issue_id,
-                kind,
-                since: m.updated_at,
-            });
-        }
-    }
-
-    // Only the newest run of an issue counts: an older failed attempt is history once a retry exists.
-    let mut newest: BTreeMap<IssueId, Run> = BTreeMap::new();
-    for r in store.runs(None, false)? {
-        if newest.get(&r.issue_id).is_none_or(|n| r.attempt > n.attempt) {
-            newest.insert(r.issue_id.clone(), r);
-        }
-    }
-    for (issue, run) in newest {
-        let Some(kind) = run_kind(run.state) else {
-            continue;
-        };
-        if !live.contains_key(&issue) {
-            continue;
-        }
-        let since = index
-            .run_entered(&run.id, run.state.as_str())
-            .map(str::to_string)
-            .or_else(|| run.finished_at.clone())
-            .or_else(|| run.last_seen_at.clone())
-            .unwrap_or_else(|| run.started_at.clone());
-        let reason = run
-            .exit_reason
-            .as_deref()
-            .map(remind::first_line)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| comments.get(&issue).map(|c| last_blocker(c)).unwrap_or_default());
-        out.push(Waiting {
-            key: format!("run:{}:{}@{since}", run.id, run.state),
-            issue,
-            kind,
-            since,
-            reason,
-        });
-    }
-    Ok(out)
+    let runs = store.runs(None, false)?;
+    let queue = store.merge_queue()?;
+    let waits = remind::waits(&WaitInput {
+        issues: &issues,
+        runs: &runs,
+        queue: &queue,
+        questions: &questions,
+        blockers: &blockers,
+        index,
+    });
+    Ok(waits.into_iter().map(|w| w.waiting).chain(news).collect())
 }
 
 /// The BLOCKER comments to the human that are still news: not resolved, not followed by a comment
@@ -328,26 +256,6 @@ fn news_blockers(comments: &[Comment], now: OffsetDateTime) -> Vec<&Comment> {
                 .is_ok_and(|t| now - t <= time::Duration::hours(BLOCKER_NEWS_HOURS))
         })
         .collect()
-}
-
-fn run_kind(state: RunState) -> Option<WaitKind> {
-    match state {
-        RunState::Blocked => Some(WaitKind::RunBlocked),
-        RunState::Stalled => Some(WaitKind::RunStalled),
-        RunState::OverBudget => Some(WaitKind::RunOverBudget),
-        RunState::Failed => Some(WaitKind::RunFailed),
-        _ => None,
-    }
-}
-
-/// First line of the newest BLOCKER comment; empty when there is none.
-fn last_blocker(comments: &[Comment]) -> String {
-    comments
-        .iter()
-        .filter(|c| c.kind == CommentType::Blocker)
-        .max_by_key(|c| c.id)
-        .map(|c| remind::first_line(&c.body))
-        .unwrap_or_default()
 }
 
 /// Runs `argv` without a shell in `cwd` with `env` added, and waits at most `timeout`.
@@ -508,23 +416,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(run_command(&[], &[], dir.path(), Duration::from_secs(1)).is_err());
     }
-
-    #[test]
-    fn only_run_states_that_need_the_human_have_a_kind() {
-        for s in RunState::ALL {
-            let expect = matches!(
-                s,
-                RunState::Blocked | RunState::Stalled | RunState::OverBudget | RunState::Failed
-            );
-            assert_eq!(run_kind(*s).is_some(), expect, "{s}");
-        }
-    }
 }
 
 #[cfg(test)]
 mod flow_tests {
     use super::*;
-    use asf_core::{Config, MergePatch, NewComment, NewIssue, NewRun, RunPatch};
+    use asf_core::{
+        Config, MergePatch, MergeState, NewComment, NewIssue, NewRun, RunPatch, RunState, Status,
+    };
     use asf_runtime::FakeRuntime;
     use asf_store::SqliteStore;
     use time::Duration as TimeDuration;

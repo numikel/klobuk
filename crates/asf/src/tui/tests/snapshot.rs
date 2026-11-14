@@ -220,6 +220,152 @@ fn the_loader_carries_deps_the_latest_run_per_issue_merged_today_review_links_an
     assert!(s.detail.is_none() && s.pane_preview.is_none(), "loaded on demand");
 }
 
+/// One issue for each kind of wait, and a failed merge item whose worker is fixing it (which waits
+/// for nobody). Every issue has a single wait, so no row is folded into another.
+fn every_wait() -> Ctx {
+    let store = asf_store::SqliteStore::open_in_memory().unwrap();
+    store.init_repo("D:/repo", "asf", "main").unwrap();
+    let issue = |title: &str| {
+        store
+            .create_issue(&new_issue(title, IssueType::Task, None, &[]))
+            .unwrap()
+            .id
+    };
+    let run_in = |id: &IssueId, state: RunState| {
+        let run = store.create_run(&new_run(id)).unwrap();
+        let patch = RunPatch {
+            state: Some(state),
+            exit_reason: Some(format!("{state} on purpose")),
+            ..RunPatch::default()
+        };
+        store.update_run(&run.id, &patch).unwrap();
+    };
+    let merge_in = |id: &IssueId, state: MergeState| {
+        let item = store.enqueue_merge(id, None, "feat/x").unwrap();
+        let patch = MergePatch {
+            state: Some(state),
+            last_error: Some(Some(format!("{state} on purpose"))),
+            ..MergePatch::default()
+        };
+        store.update_merge(item.id, &patch).unwrap();
+    };
+    run_in(&issue("blocked run"), RunState::Blocked);
+    let asked = issue("question");
+    store
+        .add_comment(&NewComment {
+            issue_id: asked,
+            author: "agent:asf-2".into(),
+            kind: CommentType::Question,
+            to_lane: LANE_HUMAN.into(),
+            body: "Which crate?".into(),
+            reply_to: None,
+        })
+        .unwrap();
+    run_in(&issue("failed run"), RunState::Failed);
+    merge_in(&issue("failed merge"), MergeState::Failed);
+    run_in(&issue("stalled run"), RunState::Stalled);
+    run_in(&issue("over budget run"), RunState::OverBudget);
+    merge_in(&issue("blocked merge"), MergeState::Blocked);
+    let fixing = issue("fixing after review");
+    merge_in(&fixing, MergeState::Failed);
+    run_in(&fixing, RunState::Working);
+    Ctx {
+        root: tempfile::tempdir().unwrap().keep(),
+        config: Config::from_toml(Config::default_toml()).unwrap(),
+        store,
+        lane: LANE_HUMAN.into(),
+    }
+}
+
+#[test]
+fn the_reminders_and_the_snapshot_agree_on_what_waits_for_the_human() {
+    use crate::commands::remind::collect;
+    use asf_core::remind::{EventIndex, WaitKind};
+    use std::collections::BTreeSet;
+
+    let ctx = every_wait();
+    let remind_set = |ctx: &Ctx| -> BTreeSet<(String, WaitKind)> {
+        let mut index = EventIndex::default();
+        for e in ctx.store.events_since(0, usize::MAX).unwrap() {
+            index.absorb(&e);
+        }
+        collect(ctx, &index, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .into_iter()
+            .map(|w| (w.issue.to_string(), w.kind))
+            .collect()
+    };
+    let snapshot_set = |ctx: &Ctx| -> BTreeSet<(String, WaitKind)> {
+        let s = load_snapshot(ctx, None, &BTreeMap::new(), &RuntimeState::default()).unwrap();
+        s.needs_you
+            .iter()
+            .map(|n| {
+                let kind = match &n.source {
+                    NeedSource::BlockedRun => WaitKind::RunBlocked,
+                    NeedSource::Question(_) => WaitKind::Question,
+                    NeedSource::Run(RunState::Failed) => WaitKind::RunFailed,
+                    NeedSource::Run(RunState::Stalled) => WaitKind::RunStalled,
+                    NeedSource::Run(_) => WaitKind::RunOverBudget,
+                    NeedSource::Merge(MergeState::Failed) => WaitKind::MergeFailed,
+                    NeedSource::Merge(_) => WaitKind::MergeBlocked,
+                };
+                (n.issue.to_string(), kind)
+            })
+            .collect()
+    };
+
+    let (reminders, rows) = (remind_set(&ctx), snapshot_set(&ctx));
+    assert_eq!(reminders, rows, "one rule, two readers");
+    let kinds: BTreeSet<WaitKind> = rows.iter().map(|(_, k)| *k).collect();
+    assert_eq!(
+        kinds,
+        BTreeSet::from([
+            WaitKind::RunBlocked,
+            WaitKind::Question,
+            WaitKind::RunFailed,
+            WaitKind::MergeFailed,
+            WaitKind::RunStalled,
+            WaitKind::RunOverBudget,
+            WaitKind::MergeBlocked,
+        ]),
+        "every kind a key acts on, and not the merge item its worker is fixing"
+    );
+
+    // What only the reminders announce: a blocked issue and a BLOCKER comment have no key to press
+    let blocked = ctx
+        .store
+        .create_issue(&NewIssue {
+            title: "blocked".into(),
+            status: Status::Blocked,
+            ..NewIssue::default()
+        })
+        .unwrap()
+        .id;
+    ctx.store
+        .add_comment(&NewComment {
+            issue_id: blocked.clone(),
+            author: "agent:asf-9".into(),
+            kind: CommentType::Blocker,
+            to_lane: LANE_HUMAN.into(),
+            body: "scope too narrow".into(),
+            reply_to: None,
+        })
+        .unwrap();
+    assert_eq!(
+        snapshot_set(&ctx),
+        rows,
+        "the snapshot lists only what a key acts on"
+    );
+    let extra: BTreeSet<_> = remind_set(&ctx).difference(&reminders).cloned().collect();
+    assert_eq!(
+        extra,
+        BTreeSet::from([
+            (blocked.to_string(), WaitKind::IssueBlocked),
+            (blocked.to_string(), WaitKind::Blocker),
+        ])
+    );
+}
+
 #[test]
 fn the_loader_carries_whether_a_review_is_required_and_the_labels_that_ask_for_one() {
     let (mut ctx, _) = story();

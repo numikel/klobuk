@@ -17,7 +17,8 @@ use time::OffsetDateTime;
 
 use crate::config::NotifyCfg;
 use crate::ids::IssueId;
-use crate::model::{str_enum, Event, ParseEnumError};
+use crate::model::{str_enum, Comment, CommentType, Event, Issue, ParseEnumError, Status};
+use crate::run::{MergeItem, MergeState, Run, RunState};
 
 /// Kind of the event that records a sent reminder (`issue_id`, payload `{kind, age_minutes}`).
 pub const EVENT_REMINDED: &str = "attention.reminded";
@@ -76,18 +77,21 @@ impl WaitKind {
         }
     }
 
-    /// Which wait leads an [`Alert`] when one issue has several new ones at once (lower first): what a
-    /// person wrote beats what a machine noticed, and the cause (a run) beats its consequences.
-    fn urgency(self) -> u8 {
+    /// The one order of what waits for the human (lower first); [`waits`] sorts by it, an [`Alert`] is
+    /// led by it and the TUI picks the row of an issue by it. A blocked run first (a human must press
+    /// a key before the agent goes on), then a QUESTION (the agent is parked but not failing), then a
+    /// BLOCKER comment, a failed run (the cause) before its merge item (the consequence), and last
+    /// what is stalled, over budget or blocked as a whole issue.
+    pub fn urgency(self) -> u8 {
         match self {
-            WaitKind::Question => 0,
-            WaitKind::Blocker => 1,
-            WaitKind::RunBlocked => 2,
+            WaitKind::RunBlocked => 0,
+            WaitKind::Question => 1,
+            WaitKind::Blocker => 2,
             WaitKind::RunFailed => 3,
-            WaitKind::RunStalled => 4,
-            WaitKind::RunOverBudget => 5,
-            WaitKind::MergeFailed => 6,
-            WaitKind::MergeBlocked => 7,
+            WaitKind::MergeFailed => 4,
+            WaitKind::MergeBlocked => 5,
+            WaitKind::RunStalled => 6,
+            WaitKind::RunOverBudget => 7,
             WaitKind::IssueBlocked => 8,
         }
     }
@@ -121,6 +125,268 @@ pub struct Waiting {
     /// Stable across ticks and restarts, and different for the next episode, so [`alerts`] can tell
     /// "already announced" from "new". Reminders ignore it.
     pub key: String,
+}
+
+/// The one key that acts on a wait: what the TUI prints at the end of a NEEDS YOU row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    /// `a`: the answer overlay (blocked or stalled worker) or a typed answer (QUESTION comment).
+    Answer,
+    /// `v`: rerun verification of a failed run.
+    Verify,
+    /// `r`: re-queue the merge item.
+    Retry,
+    /// `x`: abort an over-budget worker (after a confirmation).
+    Abort,
+}
+
+impl Act {
+    pub fn key(self) -> char {
+        match self {
+            Act::Answer => 'a',
+            Act::Verify => 'v',
+            Act::Retry => 'r',
+            Act::Abort => 'x',
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Act::Answer => "answer",
+            Act::Verify => "verify",
+            Act::Retry => "retry",
+            Act::Abort => "abort",
+        }
+    }
+
+    /// `a answer`: how the key is printed at the end of a row.
+    pub fn hint(self) -> String {
+        format!("{} {}", self.key(), self.label())
+    }
+}
+
+/// A [`Waiting`] with what a person can do about it, as [`waits`] returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wait {
+    pub waiting: Waiting,
+    /// The key that acts on it; `None` when no key does (a blocked issue).
+    pub act: Option<Act>,
+    /// The QUESTION comment behind a [`WaitKind::Question`].
+    pub comment: Option<i64>,
+}
+
+/// What [`waits`] reads. The adapter loads these from the store; nothing here touches it.
+#[derive(Debug, Clone, Copy)]
+pub struct WaitInput<'a> {
+    /// Every issue: a wait of a finished issue (done, cancelled) is not listed.
+    pub issues: &'a [Issue],
+    /// The runs to judge: the newest of an issue (highest `attempt`) says what it waits on, and any
+    /// run of it that has not ended means its worker is busy. Passing every run of every issue is fine.
+    pub runs: &'a [Run],
+    /// Merge items; those that are neither `failed` nor `blocked` are ignored.
+    pub queue: &'a [MergeItem],
+    /// Unanswered QUESTION comments to the human (the adapter decides what "unanswered" means).
+    pub questions: &'a [Comment],
+    /// BLOCKER comments: the newest of an issue lends its text to a wait that has none of its own.
+    pub blockers: &'a [Comment],
+    /// Supplies the moment a thing entered its state.
+    pub index: &'a EventIndex,
+}
+
+/// Everything that waits for the human right now, most urgent first: the one definition behind the
+/// reminders of `asf serve` and the NEEDS YOU rows of the TUI.
+///
+/// **Order.** By [`WaitKind::urgency`], then by the time the wait began (oldest first), then by issue
+/// and key. The order of kinds is decided here once:
+///
+/// 1. a blocked run: a human must press a key before the agent continues;
+/// 2. an unanswered QUESTION: the agent is parked but not failing;
+/// 3. a BLOCKER comment (added by the adapter, see [`WaitKind::Blocker`]);
+/// 4. a failed run, the cause of what follows;
+/// 5. a failed or blocked merge item, the consequence;
+/// 6. a stalled run, then an over-budget one;
+/// 7. a blocked issue as a whole, which no key acts on.
+///
+/// **What does not wait.** A finished issue waits for nobody. A failed or blocked merge item of an
+/// issue whose worker is busy (a run that has not ended) does not wait either: a reviewer or a gate
+/// sent the worker back to fix it, and `asf merge retry` refuses the issue until that run ends. Only
+/// the newest run of an issue counts; an older failed attempt is history once a retry exists.
+///
+/// **Reason.** One short line ([`first_line`]); empty when there is none. A question: its text. A
+/// merge item: its error. A blocked run: the line of the screen its BLOCKER quotes, else its exit
+/// reason. Any other run: its exit reason, else the first line of the newest BLOCKER of its issue.
+///
+/// A [`WaitKind::Blocker`] is not listed: whether it still blocks is not something the store says.
+pub fn waits(input: &WaitInput) -> Vec<Wait> {
+    let live: BTreeSet<&IssueId> = input
+        .issues
+        .iter()
+        .filter(|i| !i.status.is_terminal())
+        .map(|i| &i.id)
+        .collect();
+    let blocker_of = |issue: &IssueId| {
+        input
+            .blockers
+            .iter()
+            .filter(|c| &c.issue_id == issue && c.kind == CommentType::Blocker)
+            .max_by_key(|c| c.id)
+    };
+    let mut out: Vec<Wait> = Vec::new();
+
+    for issue in input.issues.iter().filter(|i| i.status == Status::Blocked) {
+        let status = issue.status.as_str();
+        let entered = input
+            .index
+            .issue_entered(&issue.id, status)
+            .unwrap_or(&issue.updated_at);
+        out.push(Wait {
+            waiting: Waiting {
+                issue: issue.id.clone(),
+                kind: WaitKind::IssueBlocked,
+                since: issue.updated_at.clone(),
+                reason: blocker_of(&issue.id)
+                    .map(|c| first_line(&c.body))
+                    .unwrap_or_default(),
+                key: format!("issue:{status}@{entered}"),
+            },
+            act: None,
+            comment: None,
+        });
+    }
+
+    for q in input.questions.iter().filter(|q| live.contains(&q.issue_id)) {
+        out.push(Wait {
+            waiting: Waiting {
+                issue: q.issue_id.clone(),
+                kind: WaitKind::Question,
+                since: q.created_at.clone(),
+                reason: first_line(&q.body),
+                key: format!("question:{}", q.id),
+            },
+            act: Some(Act::Answer),
+            comment: Some(q.id),
+        });
+    }
+
+    let mut newest: BTreeMap<&IssueId, &Run> = BTreeMap::new();
+    for r in input.runs {
+        if newest.get(&r.issue_id).is_none_or(|n| r.attempt > n.attempt) {
+            newest.insert(&r.issue_id, r);
+        }
+    }
+    let busy: BTreeSet<&IssueId> = input
+        .runs
+        .iter()
+        .filter(|r| !r.state.is_terminal())
+        .map(|r| &r.issue_id)
+        .collect();
+
+    for (issue, run) in newest {
+        let Some((kind, act)) = run_wait(run.state) else {
+            continue;
+        };
+        if !live.contains(issue) {
+            continue;
+        }
+        let since = input
+            .index
+            .run_entered(&run.id, run.state.as_str())
+            .map(str::to_string)
+            .or_else(|| run.finished_at.clone())
+            .or_else(|| run.last_seen_at.clone())
+            .unwrap_or_else(|| run.started_at.clone());
+        // A blocked run is about its prompt: the BLOCKER's other lines say nothing of it. Any other
+        // run without an exit reason lets its issue's BLOCKER explain.
+        let blocker = blocker_of(issue);
+        let blocked = run.state == RunState::Blocked;
+        let screen = blocker
+            .filter(|_| blocked)
+            .and_then(|c| screen_line(&c.body))
+            .map(|s| first_line(&s));
+        let exit = run.exit_reason.as_deref().map(first_line);
+        let quoted = blocker.filter(|_| !blocked).map(|c| first_line(&c.body));
+        let reason = [screen, exit, quoted]
+            .into_iter()
+            .flatten()
+            .find(|s| !s.is_empty())
+            .unwrap_or_default();
+        out.push(Wait {
+            waiting: Waiting {
+                key: format!("run:{}:{}@{since}", run.id, run.state),
+                issue: issue.clone(),
+                kind,
+                since,
+                reason,
+            },
+            act: Some(act),
+            comment: None,
+        });
+    }
+
+    for m in input.queue {
+        let kind = match m.state {
+            MergeState::Failed => WaitKind::MergeFailed,
+            MergeState::Blocked => WaitKind::MergeBlocked,
+            _ => continue,
+        };
+        if !live.contains(&m.issue_id) || busy.contains(&m.issue_id) {
+            continue;
+        }
+        let entered = input
+            .index
+            .merge_entered(m.id, m.state.as_str())
+            .unwrap_or(&m.updated_at);
+        out.push(Wait {
+            waiting: Waiting {
+                issue: m.issue_id.clone(),
+                kind,
+                since: m.updated_at.clone(),
+                reason: m.last_error.as_deref().map(first_line).unwrap_or_default(),
+                key: format!("merge:{}:{}@{entered}", m.id, m.state),
+            },
+            act: Some(Act::Retry),
+            comment: None,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        let (a, b) = (&a.waiting, &b.waiting);
+        (a.kind.urgency(), &a.since, &a.issue, &a.key).cmp(&(b.kind.urgency(), &b.since, &b.issue, &b.key))
+    });
+    out
+}
+
+/// What a run in `state` waits on and the key that acts on it; `None` for a run that needs nobody.
+/// The key is one the command behind it accepts for that state: `asf run verify` refuses a worker
+/// that is still active (stalled, over budget), a reply moves a stalled run back to working, and
+/// `asf run abort` takes any run that is not finished.
+fn run_wait(state: RunState) -> Option<(WaitKind, Act)> {
+    match state {
+        RunState::Blocked => Some((WaitKind::RunBlocked, Act::Answer)),
+        RunState::Stalled => Some((WaitKind::RunStalled, Act::Answer)),
+        RunState::OverBudget => Some((WaitKind::RunOverBudget, Act::Abort)),
+        RunState::Failed => Some((WaitKind::RunFailed, Act::Verify)),
+        _ => None,
+    }
+}
+
+/// The first non-empty line of the worker screen quoted in a BLOCKER body (the fenced block after
+/// `Screen:`), or `None` when the body quotes no screen.
+pub fn screen_line(body: &str) -> Option<String> {
+    let mut lines = body.lines().skip_while(|l| l.trim() != "Screen:");
+    lines.next()?; // the `Screen:` line itself
+    let mut fenced = false;
+    for line in lines {
+        if line.trim_start().starts_with("```") {
+            if fenced {
+                return None;
+            }
+            fenced = true;
+        } else if fenced && !line.trim().is_empty() {
+            return Some(line.trim().to_string());
+        }
+    }
+    None
 }
 
 /// A reminder that is due now.

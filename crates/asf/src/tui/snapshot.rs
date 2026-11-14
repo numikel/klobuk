@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use asf_core::config_edit::{editable_keys, lookup};
+pub use asf_core::remind::Act;
+use asf_core::remind::{self, EventIndex, Wait, WaitInput, WaitKind};
 use asf_core::*;
 use asf_store::serve_pulse::{self, LoopState, ServeMode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -347,44 +349,6 @@ pub fn unanswered_questions(comments: &[Comment]) -> Vec<i64> {
 // NEEDS YOU
 // ---------------------------------------------------------------------------------------------
 
-/// The one key that acts on a NEEDS YOU row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Act {
-    /// `a`: the answer overlay (blocked or stalled worker) or a typed answer (QUESTION comment).
-    Answer,
-    /// `v`: rerun verification of a failed run.
-    Verify,
-    /// `r`: re-queue the merge item.
-    Retry,
-    /// `x`: abort an over-budget worker (after a confirmation).
-    Abort,
-}
-
-impl Act {
-    pub fn key(self) -> char {
-        match self {
-            Act::Answer => 'a',
-            Act::Verify => 'v',
-            Act::Retry => 'r',
-            Act::Abort => 'x',
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Act::Answer => "answer",
-            Act::Verify => "verify",
-            Act::Retry => "retry",
-            Act::Abort => "abort",
-        }
-    }
-
-    /// `a answer`: how the key is printed at the end of a row.
-    pub fn hint(self) -> String {
-        format!("{} {}", self.key(), self.label())
-    }
-}
-
 /// Where a NEEDS YOU row comes from (its kind).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NeedSource {
@@ -417,159 +381,77 @@ pub fn first_line(s: &str) -> Option<&str> {
     s.lines().map(str::trim).find(|l| !l.is_empty())
 }
 
-/// The first non-empty line of the worker screen quoted in a BLOCKER body (the fenced block after
-/// `Screen:`), or `None` when the body quotes no screen.
-pub fn screen_line(body: &str) -> Option<String> {
-    let mut lines = body.lines().skip_while(|l| l.trim() != "Screen:");
-    lines.next()?; // the `Screen:` line itself
-    let mut fenced = false;
-    for line in lines {
-        if line.trim_start().starts_with("```") {
-            if fenced {
-                return None;
-            }
-            fenced = true;
-        } else if fenced && !line.trim().is_empty() {
-            return Some(line.trim().to_string());
-        }
-    }
-    None
+/// The row `w` makes in NEEDS YOU, with the words the TUI shows when the wait has no text of its own;
+/// `None` for a wait that no key acts on (a blocked issue).
+fn need_of(w: Wait) -> Option<Need> {
+    let act = w.act?;
+    let (source, label, fallback) = match w.waiting.kind {
+        WaitKind::RunBlocked => (NeedSource::BlockedRun, "question", "waiting for your answer"),
+        WaitKind::Question => (NeedSource::Question(w.comment?), "question", "(empty question)"),
+        WaitKind::RunFailed => (
+            NeedSource::Run(RunState::Failed),
+            "failed",
+            "no exit reason recorded",
+        ),
+        WaitKind::RunStalled => (
+            NeedSource::Run(RunState::Stalled),
+            "stalled",
+            "no exit reason recorded",
+        ),
+        WaitKind::RunOverBudget => (
+            NeedSource::Run(RunState::OverBudget),
+            "over_budget",
+            "no exit reason recorded",
+        ),
+        WaitKind::MergeFailed => (
+            NeedSource::Merge(MergeState::Failed),
+            "merge failed",
+            "no error recorded",
+        ),
+        WaitKind::MergeBlocked => (
+            NeedSource::Merge(MergeState::Blocked),
+            "merge blocked",
+            "no error recorded",
+        ),
+        WaitKind::IssueBlocked | WaitKind::Blocker => return None,
+    };
+    let text = match w.waiting.reason {
+        r if r.is_empty() => fallback.to_string(),
+        r => r,
+    };
+    Some(Need {
+        issue: w.waiting.issue,
+        source,
+        label: label.into(),
+        text,
+        since: w.waiting.since,
+        act,
+    })
 }
 
-/// When `run` entered its current state: the newest `run.state` event that moved it there, else the
-/// time the run finished or started.
-fn state_since(snap: &Snapshot, run: &Run) -> String {
-    snap.events
-        .iter()
-        .find(|e| {
-            e.kind == "run.state"
-                && e.run_id.as_deref() == Some(run.id.as_str())
-                && e.payload["to"].as_str() == Some(run.state.as_str())
-        })
-        .map(|e| e.ts.clone())
-        .or_else(|| run.finished_at.clone())
-        .unwrap_or_else(|| run.started_at.clone())
-}
-
-/// How actionable a source is now (lower first): a blocked run is a live prompt, a QUESTION is a
-/// person waiting for a reply, a failed/stalled/over-budget run is the cause of what follows, and a
-/// merge item is only the consequence. (`asf serve` ranks its alerts alike, except that it puts a
-/// QUESTION before a blocked run.) A blocked *issue* has no row of its own: no key acts on it.
-fn actionability(source: &NeedSource) -> u8 {
-    match source {
-        NeedSource::BlockedRun => 0,
-        NeedSource::Question(_) => 1,
-        NeedSource::Run(_) => 2,
-        NeedSource::Merge(_) => 3,
-    }
-}
-
-/// Whether the worker of `id` is working right now (it has an active run). A failed merge item of
-/// such an issue is not waiting for the human: a reviewer or a post-rebase gate sent the worker back
-/// to fix it, and `asf merge retry` refuses the issue until that run ends. `asf serve` applies the
-/// same guard before it reminds (`commands/remind.rs`).
-pub fn is_being_fixed(snap: &Snapshot, id: &IssueId) -> bool {
-    snap.runs.iter().any(|r| &r.issue_id == id)
-}
-
-/// What needs the human: one row per issue, oldest first. Candidates are blocked runs, unanswered
-/// QUESTIONs to the human, runs in `failed`/`stalled`/`over_budget`, and merge items in
-/// `failed`/`blocked` of a live issue whose worker is not running. When several wait on one issue the
-/// row is the most actionable of them ([`actionability`]) and its age is the oldest one's.
+/// What needs the human: one row per issue, oldest first. The waits come from [`remind::waits`], the
+/// rule `asf serve` reminds by (what waits, what does not, in which order); this keeps the ones a key
+/// acts on. When several wait on one issue the row is the first of them, the most urgent
+/// ([`WaitKind::urgency`]), and its age is the oldest one's.
 pub fn compute_needs(snap: &Snapshot) -> Vec<Need> {
-    let mut out = Vec::new();
-    for run in snap.runs.iter().chain(&snap.failed_runs) {
-        let reason = || {
-            run.exit_reason
-                .as_deref()
-                .and_then(first_line)
-                .unwrap_or("no exit reason recorded")
-                .to_string()
-        };
-        match run.state {
-            RunState::Blocked => {
-                let screen = snap
-                    .blockers
-                    .iter()
-                    .filter(|c| c.issue_id == run.issue_id)
-                    .max_by_key(|c| c.id)
-                    .and_then(|c| screen_line(&c.body));
-                out.push(Need {
-                    issue: run.issue_id.clone(),
-                    source: NeedSource::BlockedRun,
-                    label: "question".into(),
-                    text: screen.unwrap_or_else(|| "waiting for your answer".into()),
-                    since: state_since(snap, run),
-                    act: Act::Answer,
-                });
-            }
-            // The key on a row is one that the command behind it accepts for that state:
-            // `asf run verify` refuses a worker that is still active (stalled, over budget),
-            // a reply moves a stalled run back to working, and `asf run abort` takes any
-            // run that is not finished.
-            RunState::Failed | RunState::Stalled | RunState::OverBudget => out.push(Need {
-                issue: run.issue_id.clone(),
-                source: NeedSource::Run(run.state),
-                label: run.state.to_string(),
-                text: reason(),
-                since: state_since(snap, run),
-                act: match run.state {
-                    RunState::Failed => Act::Verify,
-                    RunState::Stalled => Act::Answer,
-                    _ => Act::Abort,
-                },
-            }),
-            _ => {}
-        }
-    }
-    for q in &snap.questions {
-        out.push(Need {
-            issue: q.issue_id.clone(),
-            source: NeedSource::Question(q.id),
-            label: "question".into(),
-            text: first_line(&q.body).unwrap_or("(empty question)").to_string(),
-            since: q.created_at.clone(),
-            act: Act::Answer,
-        });
-    }
-    for m in &snap.queue {
-        let label = match m.state {
-            MergeState::Failed => "merge failed",
-            MergeState::Blocked => "merge blocked",
-            _ => continue,
-        };
-        // the same guard as `asf serve`: a closed issue, or one whose worker is fixing it, waits for nobody
-        let live = snap.issue(&m.issue_id).is_some_and(|i| !i.status.is_terminal());
-        if !live || is_being_fixed(snap, &m.issue_id) {
-            continue;
-        }
-        out.push(Need {
-            issue: m.issue_id.clone(),
-            source: NeedSource::Merge(m.state),
-            label: label.into(),
-            text: m
-                .last_error
-                .as_deref()
-                .and_then(first_line)
-                .unwrap_or("no error recorded")
-                .to_string(),
-            since: m.updated_at.clone(),
-            act: Act::Retry,
-        });
-    }
-    // One row per issue: the most actionable candidate, aged by the oldest one. A tie keeps the first
-    // candidate, which is the older QUESTION (the questions are sorted by time).
+    // `events` is newest first; the index wants them in the order they happened.
+    let mut index = EventIndex::default();
+    snap.events.iter().rev().for_each(|e| index.absorb(e));
+    let runs: Vec<Run> = snap.runs.iter().chain(&snap.failed_runs).cloned().collect();
+    let waits = remind::waits(&WaitInput {
+        issues: &snap.issues,
+        runs: &runs,
+        queue: &snap.queue,
+        questions: &snap.questions,
+        blockers: &snap.blockers,
+        index: &index,
+    });
     let mut rows: Vec<Need> = Vec::new();
-    for need in out {
-        let Some(row) = rows.iter_mut().find(|r| r.issue == need.issue) else {
-            rows.push(need);
-            continue;
-        };
-        let oldest = row.since.clone().min(need.since.clone());
-        if actionability(&need.source) < actionability(&row.source) {
-            *row = need;
+    for need in waits.into_iter().filter_map(need_of) {
+        match rows.iter_mut().find(|r| r.issue == need.issue) {
+            None => rows.push(need),
+            Some(row) => row.since = row.since.clone().min(need.since),
         }
-        row.since = oldest;
     }
     // RFC 3339 UTC strings sort by time; the issue id keeps ties stable.
     rows.sort_by(|a, b| (&a.since, &a.issue).cmp(&(&b.since, &b.issue)));
