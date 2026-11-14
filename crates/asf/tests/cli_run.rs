@@ -899,8 +899,8 @@ fn start_blocks_when_the_kickoff_stays_unsent_after_the_extra_submit_key() {
     );
     assert_eq!(
         wait_timeouts(&f),
-        [90_000, 90_000],
-        "a full start window before the key and another one after it"
+        [15_000, 75_000],
+        "a short first window, the key, then what is left of the 90 s start budget"
     );
     assert_eq!(count_op(&f, "prompt"), 1);
     assert_eq!(active_run(&f).state, RunState::Blocked);
@@ -909,6 +909,72 @@ fn start_blocks_when_the_kickoff_stays_unsent_after_the_extra_submit_key() {
         cs.iter().filter(|c| c.kind == CommentType::Blocker).count(),
         1,
         "{cs:?}"
+    );
+}
+
+#[test]
+fn start_presses_the_submit_key_after_a_short_first_window_not_the_whole_budget() {
+    // asf-164: the prompt was typed, the Enter lost, and the key came after the full 90 s or never
+    let f = setup();
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "timeout"}] }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(
+        enters(&f),
+        1,
+        "an idle pane with the kick-off in its input gets the key"
+    );
+    assert_eq!(
+        wait_timeouts(&f)[0],
+        15_000,
+        "the first wait is the short window, not the 90 s start budget"
+    );
+    assert_eq!(count_op(&f, "prompt"), 1, "the prompt is never typed twice");
+    assert!(no_blocker(&f));
+}
+
+#[test]
+fn start_reports_a_kickoff_line_that_is_not_on_the_pane_as_the_reason_for_no_key() {
+    // the line scrolled out of the 60 lines that are read: nothing proves there is text to submit
+    let f = setup();
+    let noise = "output line\n".repeat(100);
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "stalled", "swallow_enter": 99}], "screen": noise }))
+        .unwrap();
+    let (code, ecode, msg) = f.repo.err(&["run", "start", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (1, "blocked"), "{msg}");
+    assert!(msg.contains("0 submit key press"), "{msg}");
+    assert!(msg.contains("kick-off line not found on the pane"), "{msg}");
+    assert_eq!(enters(&f), 0, "no key without the line in the input box");
+    assert_eq!(
+        wait_timeouts(&f),
+        [15_000, 75_000],
+        "the first window ended without a key, the rest of the budget was still waited"
+    );
+}
+
+#[test]
+fn start_reports_an_agent_that_is_not_idle_as_the_reason_for_no_key() {
+    let f = setup();
+    fake(&f)
+        .script(serde_json::json!({
+            "prompt": [{"error": "stalled", "swallow_enter": 99}],
+            "info": vec![serde_json::json!({"state": "unknown"}); 20]
+        }))
+        .unwrap();
+    let (code, ecode, msg) = f.repo.err(&["run", "start", &f.issue]);
+    assert_eq!((code, ecode.as_str()), (1, "blocked"), "{msg}");
+    assert!(
+        msg.contains("agent still unknown after 0 submit key press"),
+        "{msg}"
+    );
+    assert!(msg.contains("state not idle"), "{msg}");
+    assert_eq!(
+        enters(&f),
+        0,
+        "Enter on a pane Herdr cannot classify could answer a dialog"
     );
 }
 

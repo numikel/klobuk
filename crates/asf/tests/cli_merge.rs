@@ -1495,6 +1495,143 @@ fn item_state(f: &F) -> MergeState {
     store(f).merge_queue().unwrap()[0].state
 }
 
+/// A gate that appends one line to a log outside the repo per run, with `reuse_verification` off so
+/// that every gate run of the queue itself shows. `runs` counts the lines: the worker's verification
+/// counts too, so take a baseline after `finished_run`.
+struct CountingGate {
+    log: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl CountingGate {
+    fn runs(&self) -> usize {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
+
+fn counting_gate(f: &F) -> CountingGate {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    std::fs::write(&script, "import sys\nopen(sys.argv[1], 'a').write('run\\n')\n").unwrap();
+    let log = dir.path().join("gate.log");
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("reuse_verification = true", "reuse_verification = false");
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"counted\"\ncmd = ['python', '{}', '{}']\n",
+        fwd(&script),
+        fwd(&log)
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "counted gate"]);
+    CountingGate { log, _dir: dir }
+}
+
+/// `require_review` + a short start window + a counting gate + a finished run, with the first
+/// reviewer start scripted to fail. Returns the fixture and the gate runs seen so far.
+fn failed_reviewer_start_setup() -> (F, CountingGate) {
+    let f = setup();
+    require_review(&f);
+    short_start_window(&f);
+    let gate = counting_gate(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    failing_reviewer_starts(&f, 1);
+    (f, gate)
+}
+
+#[test]
+fn a_failed_reviewer_start_keeps_the_item_in_review_and_the_gates_run_once() {
+    let (f, gate) = failed_reviewer_start_setup();
+    let (verified, agents) = (gate.runs(), start_agents(&f));
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(start_agents(&f), agents + 1, "the first reviewer did not come up");
+    assert_eq!(gate.runs(), verified + 1, "the queue gated the branch once");
+
+    // the next tick starts a fresh reviewer; neither the branch nor main moved, so no gate run
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(start_agents(&f), agents + 2, "a fresh reviewer");
+    assert_eq!(status_of(&f, &review_id(&f)), "in-progress");
+    assert_eq!(gate.runs(), verified + 1, "the gates were not repeated");
+    assert_eq!(
+        store(&f).merge_queue().unwrap()[0].attempts,
+        1,
+        "one pass of the queue"
+    );
+    assert!(events_of(&f, "merge.requeued").is_empty());
+    assert_eq!(events_of(&f, "merge.review_started").len(), 2);
+    assert_eq!(
+        item_last_error(&f),
+        None,
+        "the failure is cleared once a reviewer is up"
+    );
+}
+
+#[test]
+fn a_branch_that_moved_after_a_failed_reviewer_start_is_gated_again() {
+    let (f, gate) = failed_reviewer_start_setup();
+    let agents = start_agents(&f);
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "reviewing"
+    );
+    let gated = gate.runs();
+    commit_in(
+        &f.repo.path().join(".worktrees").join(&f.issue),
+        "src/extra.rs",
+        "pub fn x() {}\n",
+    );
+
+    // the gates passed on a head that is gone: back to the queue, no reviewer yet
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "queued", "{res}");
+    assert_eq!(start_agents(&f), agents + 1, "no reviewer on stale gates");
+    let requeued = events_of(&f, "merge.requeued");
+    assert_eq!(requeued.len(), 1);
+    assert_eq!(requeued[0].payload["reason"], "branch_moved");
+    assert_eq!(gate.runs(), gated);
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(gate.runs(), gated + 1, "the new head is gated");
+    assert_eq!(start_agents(&f), agents + 2);
+}
+
+#[test]
+fn a_main_that_moved_after_a_failed_reviewer_start_is_gated_again() {
+    let (f, gate) = failed_reviewer_start_setup();
+    let agents = start_agents(&f);
+    assert_eq!(
+        f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
+        "reviewing"
+    );
+    let gated = gate.runs();
+    commit_in(f.repo.path(), "README.txt", "main moved\n");
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "queued", "{res}");
+    assert_eq!(start_agents(&f), agents + 1, "no reviewer on stale gates");
+    assert_eq!(events_of(&f, "merge.requeued")[0].payload["reason"], "main_moved");
+    assert_eq!(gate.runs(), gated);
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(gate.runs(), gated + 1, "the rebased branch is gated");
+    assert_eq!(start_agents(&f), agents + 2);
+}
+
+fn item_last_error(f: &F) -> Option<String> {
+    store(f).merge_queue().unwrap()[0].last_error.clone()
+}
+
 #[test]
 fn a_reviewer_that_cannot_start_closes_its_review_and_leaves_the_item_for_the_next_tick() {
     let f = setup();
@@ -1505,7 +1642,7 @@ fn a_reviewer_that_cannot_start_closes_its_review_and_leaves_the_item_for_the_ne
     let agents = start_agents(&f);
 
     let res = f.repo.ok(&["merge", "tick", "--once"]);
-    assert_eq!(res["items"][0]["state"], "queued", "{res}");
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
     assert_eq!(start_agents(&f), agents + 1);
     let err = res["items"][0]["last_error"].as_str().expect("the cause is kept");
     assert!(err.contains("reviewer") && err.contains("1 of 2"), "{err}");
@@ -1559,7 +1696,7 @@ fn two_failed_reviewer_starts_in_a_row_fail_the_item_with_a_blocker() {
 
     assert_eq!(
         f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
-        "queued"
+        "reviewing"
     );
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(res["items"][0]["state"], "failed", "{res}");
@@ -1602,7 +1739,7 @@ fn a_human_retry_starts_the_count_of_failed_reviewer_starts_over() {
     failing_reviewer_starts(&f, 1);
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(
-        res["items"][0]["state"], "queued",
+        res["items"][0]["state"], "reviewing",
         "one failed start after a retry is the first of the new count, not the third: {res}"
     );
     let err = res["items"][0]["last_error"].as_str().unwrap();
@@ -1639,11 +1776,16 @@ fn a_reviewer_that_started_resets_the_count_of_failed_starts() {
     );
     assert_eq!(
         f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
-        "queued"
+        "reviewing"
     );
     assert_eq!(
         f.repo.ok(&["merge", "tick", "--once"])["items"][0]["state"],
         "reviewing"
+    );
+    assert_eq!(
+        events_of(&f, "merge.review_started").len(),
+        2,
+        "the second start came up"
     );
 
     lose_the_worker(&f);
@@ -1660,10 +1802,10 @@ fn a_reviewer_that_started_resets_the_count_of_failed_starts() {
 
     let res = f.repo.ok(&["merge", "tick", "--once"]);
     assert_eq!(
-        res["items"][0]["state"], "queued",
+        res["items"][0]["state"], "reviewing",
         "the earlier failure does not count: {res}"
     );
-    assert_eq!(item_state(&f), MergeState::Queued);
+    assert_eq!(item_state(&f), MergeState::Reviewing);
 }
 
 // ---- a gate failure on a test outside the branch is rerun once and filed as flaky ------------------

@@ -22,10 +22,14 @@ use crate::output::{AppError, ErrorCode};
 pub const RUNS_DIR: &str = "runs";
 pub const HOOK_TIMEOUT_S: u64 = 30;
 const TRUST_MARKERS: [&str; 2] = ["trust this folder", "Yes, I trust"];
-/// Extra submit-key presses a kick-off gets, after a full wait, before the start gives up. The
-/// submission inside `agent prompt` counts as the first press; Herdr may report its effect up to
-/// ~90 s late, so a second key must not follow while that one may still be landing.
+/// Extra submit-key presses a kick-off gets before the start gives up. The submission inside
+/// `agent prompt` counts as the first press.
 const KICKOFF_ENTERS: usize = 1;
+/// How long `ensure_submitted` waits for the agent to take the kick-off before it looks at the pane
+/// and presses the submit key (capped by `start_timeout_ms`). Herdr may report a submission that did
+/// work up to ~90 s late, but a prompt it typed and did not submit sat unsent for the whole start
+/// budget on asf-155, asf-157, asf-164 and asf-173; the owner chose the key after this window.
+const KICKOFF_FIRST_WINDOW_MS: u64 = 15_000;
 /// Characters of the kick-off line that identify it on the pane text.
 const KICKOFF_PROBE_CHARS: usize = 40;
 /// How long `agent start` is retried while Herdr says the pane's shell is not ready yet (capped by
@@ -1138,16 +1142,20 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// After a kick-off that Herdr could not see start. The runtime reports a state change late (up to
-    /// ~90 s observed live), so the first thing to do is wait, for as long as the start itself may take
-    /// (`start_timeout_ms`), for the agent to turn `working`, `blocked` (a dialog took over, the watch
-    /// loop answers it) or `done`. Only an agent that is still `idle` after that, with the kick-off line
-    /// still on the pane, gets the submit key, once (`KICKOFF_ENTERS`), followed by one more full wait.
-    /// `unknown` gets no key at all: Enter on a dialog Herdr cannot classify could answer it with its
-    /// default. Whatever is left ends in a `Timeout` naming the last state seen, which becomes the
-    /// BLOCKER text.
+    /// After a kick-off that Herdr could not see start. The runtime reports a state change late, so the
+    /// first thing to do is wait for the agent to turn `working`, `blocked` (a dialog took over, the
+    /// watch loop answers it) or `done`, but only for `KICKOFF_FIRST_WINDOW_MS` (capped by the start
+    /// budget `start_timeout_ms`). An agent that is `idle` then, with the kick-off line still on the
+    /// pane, gets the submit key, once (`KICKOFF_ENTERS`), followed by a wait for what is left of the
+    /// budget. A check that withholds the key (`submit_withheld`) while budget is left only extends the
+    /// wait: the pane is looked at again at the end of the budget, so a pane that becomes interactive
+    /// late still gets its key. `unknown` never gets one: Enter on a dialog Herdr cannot classify could
+    /// answer it with its default. Whatever is left ends in a `Timeout` naming the last state seen, the
+    /// key presses and the check that withheld the key; it becomes the BLOCKER text.
     fn ensure_submitted(&self, handle: &AgentHandle, text: &str) -> Result<AgentInfo, RuntimeError> {
-        let window = self.ctx.config.worker.start_timeout_ms;
+        let budget = self.ctx.config.worker.start_timeout_ms;
+        let first = budget.min(KICKOFF_FIRST_WINDOW_MS);
+        let (mut window, mut left) = (first, budget - first);
         let taken = [AgentState::Working, AgentState::Blocked, AgentState::Done];
         let mut pressed = 0;
         loop {
@@ -1160,17 +1168,42 @@ impl<'a> Worker<'a> {
             if taken.contains(&info.state) {
                 return Ok(info);
             }
-            if info.state != AgentState::Idle
-                || pressed >= KICKOFF_ENTERS
-                || !self.kickoff_in_input_box(handle, text)
-            {
-                return Err(RuntimeError::Timeout(format!(
-                    "kick-off prompt not submitted: agent still {} after {pressed} submit key press(es)",
-                    info.state
-                )));
+            match self.submit_withheld(handle, text, &info, pressed) {
+                None => {
+                    self.rt.send_keys(handle, &["enter"])?;
+                    pressed += 1;
+                    // the key needs time to show: what is left of the budget, at least one first window
+                    (window, left) = (left.max(first), 0);
+                }
+                Some(_) if pressed == 0 && left > 0 => (window, left) = (left, 0),
+                Some(why) => {
+                    return Err(RuntimeError::Timeout(format!(
+                        "kick-off prompt not submitted: agent still {} after {pressed} submit key press(es) ({why})",
+                        info.state
+                    )))
+                }
             }
-            self.rt.send_keys(handle, &["enter"])?;
-            pressed += 1;
+        }
+    }
+
+    /// Why the submit key is not pressed now: `None` when it should be. The agent must be `idle` (a
+    /// dialog Herdr cannot classify is not ours to answer), the key limit must not be used up and the
+    /// kick-off line must still be on the pane.
+    fn submit_withheld(
+        &self,
+        handle: &AgentHandle,
+        text: &str,
+        info: &AgentInfo,
+        pressed: usize,
+    ) -> Option<&'static str> {
+        if pressed >= KICKOFF_ENTERS {
+            Some("no further key: the submit key limit is used up")
+        } else if info.state != AgentState::Idle {
+            Some("no key: state not idle")
+        } else if !self.kickoff_in_input_box(handle, text) {
+            Some("no key: kick-off line not found on the pane")
+        } else {
+            None
         }
     }
 
@@ -1178,13 +1211,19 @@ impl<'a> Worker<'a> {
     /// gone was submitted or cleared, so another Enter has nothing to submit. The pane text keeps the
     /// line after a submission too (it moves into the history), so this can only withhold the key,
     /// never prove a success. An unreadable or blank pane counts as "still there": the key is pressed.
+    /// Whitespace and box-drawing characters are ignored on both sides, so a line that the input box
+    /// wrapped (borders and line breaks inside the text) is still found.
     fn kickoff_in_input_box(&self, handle: &AgentHandle, text: &str) -> bool {
-        let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let dense = |t: &str| {
+            t.chars()
+                .filter(|c| !c.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(c))
+                .collect::<String>()
+        };
         let Ok(screen) = self.rt.read(handle, 60) else {
             return true;
         };
-        let screen = squash(&screen);
-        let probe: String = squash(text).chars().take(KICKOFF_PROBE_CHARS).collect();
+        let screen = dense(&screen);
+        let probe: String = dense(text).chars().take(KICKOFF_PROBE_CHARS).collect();
         screen.is_empty() || screen.contains(&probe)
     }
 

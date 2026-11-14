@@ -1143,7 +1143,7 @@ fn integrate(
             // main moved on after the rebase (another item merged first): nothing is wrong with the
             // branch, so it goes back to the queue to be rebased and gated again
             if !matches!(e, VcsError::Dirty(_)) && main_moved_since_rebase(ctx, item) {
-                return requeue_main_moved(ctx, item);
+                return requeue(ctx, item, "main_moved");
             }
             return fail(
                 ctx,
@@ -1177,10 +1177,12 @@ fn rebased_onto_of(ctx: &Ctx, item: &MergeItem) -> Option<String> {
         .and_then(|m| m.rebased_onto)
 }
 
-/// Puts an approved item whose fast-forward lost the race with another merge back to `queued`; no
-/// failure, no comment. The next tick rebases it, re-runs the gates and, when the patch is unchanged,
-/// skips the review thanks to the recorded approval.
-fn requeue_main_moved(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
+/// Puts an item back to `queued` because what it was gated on is outdated; no failure, no comment.
+/// `reason` is `main_moved` for an approved item whose fast-forward lost the race with another merge
+/// (the next tick rebases it, re-runs the gates and, when the patch is unchanged, skips the review
+/// thanks to the recorded approval) and for an item waiting for a fresh reviewer, or `branch_moved`
+/// for the latter when the branch itself gained or lost commits.
+fn requeue(ctx: &Ctx, item: &MergeItem, reason: &str) -> Result<MergeItem, AppError> {
     let updated = set(
         ctx,
         item.id,
@@ -1195,7 +1197,7 @@ fn requeue_main_moved(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError
         issue_id: Some(item.issue_id.clone()),
         run_id: item.run_id.clone(),
         actor: Some(LANE_ORCHESTRATOR.into()),
-        payload: serde_json::json!({ "reason": "main_moved", "branch": item.branch }),
+        payload: serde_json::json!({ "reason": reason, "branch": item.branch }),
     })?;
     Ok(updated)
 }
@@ -1262,23 +1264,6 @@ fn newest_comment(ctx: &Ctx, id: &IssueId) -> Result<i64, AppError> {
         }
     }
     Ok(newest)
-}
-
-/// Comment id after which a verdict belongs to the current review round of `id`.
-fn round_boundary(ctx: &Ctx, id: &IssueId) -> Result<i64, AppError> {
-    let mut boundary = 0;
-    let mut seq = 0;
-    loop {
-        let page = ctx.store.events_since(seq, 500)?;
-        let Some(last) = page.last() else { break };
-        seq = last.seq;
-        for e in &page {
-            if e.kind == REVIEW_STARTED && e.issue_id.as_ref() == Some(id) {
-                boundary = e.payload["after_comment"].as_i64().unwrap_or(boundary);
-            }
-        }
-    }
-    Ok(boundary)
 }
 
 /// Patch-id fingerprint of what `item.branch` changes relative to the default branch. `None` when it
@@ -1437,8 +1422,9 @@ fn enter_review(ctx: &Ctx, item: &MergeItem, run: &Option<Run>) -> Result<MergeI
 
 /// A reviewer that could not start (its pane never came up, the prompt never went in, the runtime is
 /// down) is no verdict on the branch, so the first failures do not burn the item: the dead reviewer is
-/// closed and the item goes back to `queued`, where the next tick starts a fresh one. Only
-/// `REVIEW_START_ATTEMPTS` failed starts in a row fail the item, with a BLOCKER for the human.
+/// closed and the item stays in `reviewing`, where the next tick starts a fresh one (`restart_reviewer`;
+/// the gates that already passed are not run again unless the branch or the default branch moved).
+/// Only `REVIEW_START_ATTEMPTS` failed starts in a row fail the item, with a BLOCKER for the human.
 fn review_start_failed(ctx: &Ctx, item: &MergeItem, cause: &str) -> Result<MergeItem, AppError> {
     close_reviews_as(
         ctx,
@@ -1460,7 +1446,7 @@ fn review_start_failed(ctx: &Ctx, item: &MergeItem, cause: &str) -> Result<Merge
         return fail(
             ctx,
             item,
-            MergeState::Queued,
+            MergeState::Reviewing,
             format!(
                 "{msg} (failed start {in_a_row} of {REVIEW_START_ATTEMPTS}; the next tick starts a fresh reviewer)"
             ),
@@ -1523,20 +1509,79 @@ fn failed_review_starts_in_a_row(ctx: &Ctx, id: &IssueId) -> Result<usize, AppEr
     Ok(streak)
 }
 
+/// An item in `reviewing` whose last reviewer start failed (`review_start_failed` left it here): a
+/// fresh reviewer takes the round, on the gates that already passed. They stand only while the branch
+/// head and the default branch are where the last rebase and gate run left them; if either moved, the
+/// item goes back to `queued` to be rebased and gated again (a gate run that nothing outdated is not
+/// repeated, the same rule an approved item follows when its fast-forward loses a race). `None` when
+/// every reviewer slot is taken: nothing is written and the next tick asks again.
+fn restart_reviewer(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, AppError> {
+    if waits_for_reviewer(ctx, item)? {
+        return Ok(None);
+    }
+    let (run, _, wt) = locate(ctx, item)?;
+    if GitCli.head(&wt).ok() != item.head_sha {
+        return requeue(ctx, item, "branch_moved").map(Some);
+    }
+    if main_moved_since_rebase(ctx, item) {
+        return requeue(ctx, item, "main_moved").map(Some);
+    }
+    enter_review(ctx, item, &run).map(Some)
+}
+
+/// What the review events of an item say about the current round: the comment id after which a
+/// verdict belongs to it, and whether its reviewer failed to start (the last `review_started` /
+/// `review_start_failed` event is the failure).
+struct ReviewRound {
+    boundary: i64,
+    start_failed: bool,
+}
+
+/// One scan of the event log for `id`; see `ReviewRound`.
+fn review_round(ctx: &Ctx, id: &IssueId) -> Result<ReviewRound, AppError> {
+    let mut round = ReviewRound {
+        boundary: 0,
+        start_failed: false,
+    };
+    let mut seq = 0;
+    loop {
+        let page = ctx.store.events_since(seq, 500)?;
+        let Some(last) = page.last() else { break };
+        seq = last.seq;
+        for e in page.iter().filter(|e| e.issue_id.as_ref() == Some(id)) {
+            match e.kind.as_str() {
+                REVIEW_STARTED => {
+                    round.boundary = e.payload["after_comment"].as_i64().unwrap_or(round.boundary);
+                    round.start_failed = false;
+                }
+                REVIEW_START_FAILED => round.start_failed = true,
+                _ => {}
+            }
+        }
+    }
+    Ok(round)
+}
+
 /// One look at an item waiting for its reviewer. `None` when there is no verdict of the current
-/// round yet (nothing is written) or the approved item is parked behind a dirty main.
+/// round yet (nothing is written), the approved item is parked behind a dirty main, or the reviewer
+/// that failed to start has to wait for a free slot. An item whose reviewer failed to start gets a
+/// fresh one here (`restart_reviewer`).
 fn poll_review(
     ctx: &Ctx,
     item: &MergeItem,
     mode: GateMode,
     park_approved: bool,
 ) -> Result<Option<MergeItem>, AppError> {
-    let boundary = round_boundary(ctx, &item.issue_id)?;
+    let round = review_round(ctx, &item.issue_id)?;
     let Some((_, verdict)) = verdicts(ctx, &item.issue_id)?
         .into_iter()
-        .rfind(|(id, _)| *id > boundary)
+        .rfind(|(id, _)| *id > round.boundary)
     else {
-        return Ok(None);
+        return if round.start_failed {
+            restart_reviewer(ctx, item)
+        } else {
+            Ok(None)
+        };
     };
     // the reviewer is done once its verdict is read, whatever happens to the item next: free its
     // claim, run and reviewer slot now, not after a merge that may never come
