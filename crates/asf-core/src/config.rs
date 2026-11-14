@@ -417,8 +417,8 @@ name = "asf-default"      # `asf method list`; repo-local ones live in .factory/
 
 [worker]
 runtime = "herdr"         # herdr | fake
-# model = "sonnet"
-budget_usd = 5.0          # per issue; from statusLine cost estimate
+# model = "sonnet"        # fable | opus | sonnet | haiku, or a full model id (claude-...); unset: Claude Code default
+budget_usd = 5.0          # per issue; cost as reported by Claude Code for each session (API list prices incl. cache; on a subscription an equivalent, not a bill)
 stall_minutes = 15
 max_wall_minutes = 90
 max_tool_calls = 400
@@ -458,14 +458,14 @@ clean_after = ["worktree", "review_worktrees"] # removed after a merge (and a gr
 [review]
 required = false
 on_labels = []            # e.g. ["risky"]: labels that force a review worker before merge
-# model = "opus"          # model of the read-only reviewer
+# model = "opus"          # model of the read-only reviewer: fable | opus | sonnet | haiku, or a full model id
 # max_rounds = 2          # `changes` verdicts allowed before the human has to decide
 # max_parallel = 2        # reviewers running at once (own limit, not counted in [scheduler] max_parallel); >= 1
 
 [planner]
 runner = "claude"         # claude (headless `claude -p`, read-only tools) | fake (tests)
-model = "claude-haiku-5-5"
-budget_usd = 1.0          # per planning step
+model = "claude-haiku-5-5"  # fable | opus | sonnet | haiku, or a full model id
+budget_usd = 1.0          # per planning step; cost as reported by Claude Code (see [worker] budget_usd)
 max_turns = 15
 
 [notify]                  # `asf serve` tells you when something starts to wait for you and reminds you while it still does (blocked issue, failed merge, stalled run, question)

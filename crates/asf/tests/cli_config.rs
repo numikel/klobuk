@@ -21,11 +21,16 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_twenty_one_editable_keys_with_current_values() {
+fn show_lists_every_editable_key_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 21, "{res}");
+    let shown: Vec<&str> = rows.iter().map(|row| row["key"].as_str().unwrap()).collect();
+    let editable: Vec<&str> = asf_core::config_edit::editable_keys()
+        .iter()
+        .map(|(k, _)| *k)
+        .collect();
+    assert_eq!(shown, editable, "{res}");
     assert_eq!(entry(rows, "merge.reuse_verification")["value"], true);
     assert_eq!(entry(rows, "merge.verify_main_after")["value"], false);
     for key in ["merge.verify_main_after", "merge.reuse_verification"] {
@@ -158,6 +163,51 @@ fn a_planner_key_says_only_asf_plan_reads_it() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains(PLAN_ONLY), "{text}");
     assert!(!text.contains("restart"), "{text}");
+}
+
+#[test]
+fn every_model_key_takes_fable_and_the_descriptions_name_it() {
+    let r = Repo::initialised();
+    for key in ["worker.model", "review.model", "planner.model"] {
+        let res = r.ok(&["config", "set", key, "fable"]);
+        assert_eq!(res["new"], "fable", "{key}: {res}");
+    }
+    let shown = r.ok(&["config", "show"]);
+    let rows = shown.as_array().unwrap();
+    for key in ["worker.model", "review.model", "planner.model"] {
+        assert_eq!(entry(rows, key)["value"], "fable", "{key}");
+        let description = entry(rows, key)["description"].as_str().unwrap();
+        assert!(description.contains("fable"), "{key}: {description}");
+    }
+    // a full model id is still taken as it is
+    let res = r.ok(&["config", "set", "worker.model", "claude-fable-5-2"]);
+    assert_eq!(res["new"], "claude-fable-5-2", "{res}");
+}
+
+#[test]
+fn the_budget_keys_say_where_the_cost_comes_from() {
+    let r = Repo::initialised();
+    let shown = r.ok(&["config", "show"]);
+    let rows = shown.as_array().unwrap();
+    for key in ["worker.budget_usd", "planner.budget_usd"] {
+        let description = entry(rows, key)["description"].as_str().unwrap();
+        assert!(
+            description.contains("as reported by Claude Code"),
+            "{key}: {description}"
+        );
+    }
+}
+
+#[test]
+fn the_config_template_lists_the_models_it_comments_on() {
+    let r = Repo::initialised();
+    let text = String::from_utf8(config_bytes(&r)).unwrap();
+    for line in text
+        .lines()
+        .filter(|l| l.trim_start_matches("# ").starts_with("model = "))
+    {
+        assert!(line.contains("fable"), "{line}");
+    }
 }
 
 #[test]

@@ -247,7 +247,8 @@ fn the_text_ends_with_the_today_line() {
     let before = utc_today();
     let out = text(&r, &["cost"]);
     let after = utc_today();
-    let last = out.lines().last().unwrap();
+    // the footer comes after it
+    let last = out.lines().rev().nth(1).unwrap();
     let ok = [before, after]
         .iter()
         .any(|d| last == format!("today {d}: 3 task runs $6.50, 3 review runs $1.15, total $7.65"));
@@ -265,11 +266,41 @@ fn with_no_runs_today_says_so_with_zeros() {
     );
     assert_eq!(num(&t["total"]), 0.0);
     let out = text(&r, &["cost"]);
-    let last = out.lines().last().unwrap();
+    let last = out.lines().rev().nth(1).unwrap();
     assert!(
         last.starts_with("today ") && last.ends_with("0 task runs $0.00, 0 review runs $0.00, total $0.00"),
         "{out}"
     );
+}
+
+const SOURCE: &str = "cost as reported by Claude Code for each session: API list prices including cache reads and writes; on a subscription plan this is an equivalent, not a bill";
+
+#[test]
+fn the_text_ends_with_one_line_on_where_the_cost_comes_from() {
+    let (r, [e1, _]) = seeded();
+    for args in [vec!["cost"], vec!["cost", "--epic", e1.as_str()]] {
+        let out = text(&r, &args);
+        let notes: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("as reported by Claude Code"))
+            .collect();
+        assert_eq!(notes, [SOURCE], "{args:?}:\n{out}");
+        assert_eq!(out.lines().last(), Some(SOURCE), "{args:?}:\n{out}");
+    }
+    let empty = Repo::initialised();
+    assert_eq!(text(&empty, &["cost"]).lines().last(), Some(SOURCE));
+}
+
+#[test]
+fn the_source_line_stays_out_of_the_json() {
+    let (r, [e1, _]) = seeded();
+    for args in [vec!["cost"], vec!["cost", "--epic", e1.as_str()]] {
+        let res = r.ok(&args);
+        assert!(
+            !res.to_string().contains("as reported by Claude Code"),
+            "{args:?}: {res}"
+        );
+    }
 }
 
 #[test]

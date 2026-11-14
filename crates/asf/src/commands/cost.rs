@@ -1,6 +1,8 @@
 //! `asf cost` — what the runs cost, per epic and on average. Read-only.
 
-use asf_core::cost::{epic_breakdown, rollup, today, CostReport, Costs, EpicBreakdown, RunStat, TodayCost};
+use asf_core::cost::{
+    epic_breakdown, rollup, today, CostReport, Costs, EpicBreakdown, RunStat, TodayCost, COST_SOURCE,
+};
 use asf_core::{IssueFilter, IssueStore};
 use serde::Serialize;
 
@@ -16,13 +18,13 @@ pub fn run(cli: &Cli, args: &CostArgs) -> Result<Rendered, AppError> {
         Some(id) => {
             let b = epic_breakdown(&issues, &runs, id)
                 .ok_or_else(|| AppError::not_found(format!("{id} is not an epic")))?;
-            let text = epic_text(&b);
+            let text = format!("{}\n{COST_SOURCE}", epic_text(&b));
             Rendered::new(&b, text)
         }
         None => {
             let report = rollup(&issues, &runs);
             let today = today(&issues, &runs, time::OffsetDateTime::now_utc().date());
-            let text = format!("{}\n{}", report_text(&report), today_text(&today));
+            let text = format!("{}\n{}\n{COST_SOURCE}", report_text(&report), today_text(&today));
             Rendered::new(
                 &WithToday {
                     report: &report,

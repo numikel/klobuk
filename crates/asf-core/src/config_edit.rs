@@ -11,14 +11,26 @@ use crate::config::{Config, ConfigError};
 /// Keys the CLI and the TUI may change, with a one-line description each. The order is the order of
 /// the Config view (models, budgets, flow, notifications); [`FIELDS`] lists the same keys in it.
 const EDITABLE: &[(&str, &str)] = &[
-    ("planner.model", "model used by `asf plan` (headless claude -p)"),
+    (
+        "planner.model",
+        "model used by `asf plan` (headless claude -p): fable, opus, sonnet, haiku or a full model id",
+    ),
     (
         "worker.model",
-        "model workers run on (unset: Claude Code default)",
+        "model workers run on: fable, opus, sonnet, haiku or a full model id (unset: Claude Code default)",
     ),
-    ("review.model", "model the reviewer runs on"),
-    ("planner.budget_usd", "USD budget per planning step"),
-    ("worker.budget_usd", "USD budget per issue"),
+    (
+        "review.model",
+        "model the reviewer runs on: fable, opus, sonnet, haiku or a full model id",
+    ),
+    (
+        "planner.budget_usd",
+        "USD budget per planning step; cost as reported by Claude Code: API list prices incl. cache, on a subscription an equivalent, not a bill",
+    ),
+    (
+        "worker.budget_usd",
+        "USD budget per issue; cost as reported by Claude Code: API list prices incl. cache, on a subscription an equivalent, not a bill",
+    ),
     ("scheduler.max_parallel", "workers running at the same time"),
     ("review.required", "run a read-only reviewer before every merge"),
     (
@@ -268,8 +280,8 @@ fn target_gate(doc: &mut DocumentMut) -> Option<&mut Table> {
         .find(|g| g.get("name").and_then(Item::as_str) == Some(GATE_TARGET))
 }
 
-/// The three model keys take these names; any other model id is kept as it is.
-const MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+/// The three model keys take these Claude Code aliases, strongest first; any other model id is kept as it is.
+const MODELS: &[&str] = &["fable", "opus", "sonnet", "haiku"];
 
 const FIELDS: &[ConfigField] = &[
     ConfigField {
@@ -298,14 +310,14 @@ const FIELDS: &[ConfigField] = &[
         label: "Planning step",
         group: ConfigGroup::Budgets,
         kind: FieldKind::Number,
-        help: "ceiling for one planning call",
+        help: "ceiling per call, cost as Claude Code says",
     },
     ConfigField {
         key: "worker.budget_usd",
         label: "Per issue",
         group: ConfigGroup::Budgets,
         kind: FieldKind::Number,
-        help: "the worker is stopped when it is exceeded",
+        help: "stops the worker; cost as Claude Code says",
     },
     ConfigField {
         key: "scheduler.max_parallel",
@@ -606,6 +618,19 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 21);
+    }
+
+    #[test]
+    fn the_key_lists_describe_the_same_keys_in_the_same_order() {
+        let editable: Vec<&str> = EDITABLE.iter().map(|(k, _)| *k).collect();
+        let fields: Vec<&str> = FIELDS.iter().map(|f| f.key).collect();
+        let unsettable_are_known = UNSETTABLE.iter().all(|k| editable.contains(k));
+        assert_eq!(editable, fields);
+        assert!(unsettable_are_known);
+    }
+
+    #[test]
+    fn model_choices_list_the_strongest_first() {
+        assert_eq!(MODELS, ["fable", "opus", "sonnet", "haiku"]);
     }
 }

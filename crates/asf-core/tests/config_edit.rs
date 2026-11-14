@@ -141,36 +141,46 @@ fn unparsable_document_is_a_parse_error() {
 }
 
 #[test]
-fn editable_keys_are_exactly_the_twenty_one_named_in_the_briefs() {
-    // In the order of the Config view: models, budgets, flow, notifications.
+fn editable_keys_are_unique_described_and_in_the_order_of_the_config_view() {
+    // No count and no key list is pinned here: a task that adds a key must not touch this test. The key
+    // lists are compared with each other instead (EDITABLE and FIELDS below, APPLIES in the unit tests).
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
-    assert_eq!(
-        keys,
-        [
-            "planner.model",
-            "worker.model",
-            "review.model",
-            "planner.budget_usd",
-            "worker.budget_usd",
-            "scheduler.max_parallel",
-            "review.required",
-            "review.max_rounds",
-            "gate.max_rounds",
-            "merge.target",
-            "merge.verify_main_after",
-            "merge.reuse_verification",
-            "merge.clean_after",
-            "worker.remote_control",
-            "serve.interval_s",
-            "serve.max_ticks",
-            "gate.slow_tests",
-            "gate.slow_after_s",
-            "notify.on_new",
-            "notify.after_minutes",
-            "notify.every_minutes",
-        ]
-    );
+    let unique: std::collections::HashSet<_> = keys.iter().collect();
+    assert_eq!(unique.len(), keys.len(), "duplicate key in {keys:?}");
     assert!(editable_keys().iter().all(|(_, d)| !d.trim().is_empty()));
+    // models, budgets, flow, notifications: the groups never go back
+    let rank = |g: ConfigGroup| ConfigGroup::ALL.iter().position(|x| *x == g).unwrap();
+    let ranks: Vec<usize> = fields().iter().map(|f| rank(f.group)).collect();
+    assert!(ranks.windows(2).all(|w| w[0] <= w[1]), "{ranks:?}");
+    // every group is used, so an empty section never reaches the view
+    for g in ConfigGroup::ALL {
+        assert!(fields().iter().any(|f| f.group == g), "{}", g.title());
+    }
+}
+
+#[test]
+fn every_model_choice_is_accepted_and_the_strongest_comes_first() {
+    const CHOICES: &[&str] = &["fable", "opus", "sonnet", "haiku"];
+    for key in ["planner.model", "worker.model", "review.model"] {
+        let field = fields().iter().find(|f| f.key == key).unwrap();
+        assert_eq!(field.kind, FieldKind::Choice(CHOICES), "{key}");
+        for &model in CHOICES {
+            let out = set_key("", key, model).unwrap_or_else(|e| panic!("{key} = {model}: {e}"));
+            let c = Config::from_toml(&out).unwrap();
+            let stored = match key {
+                "planner.model" => Some(c.planner.model),
+                "worker.model" => c.worker.model,
+                _ => Some(c.review.model),
+            };
+            assert_eq!(stored.as_deref(), Some(model), "{key}");
+        }
+        // a full model id stays legal
+        assert!(set_key("", key, "claude-fable-5-2").is_ok(), "{key}");
+    }
+    for key in ["planner.model", "worker.model", "review.model"] {
+        let described = editable_keys().iter().find(|(k, _)| *k == key).unwrap().1;
+        assert!(described.contains("fable"), "{key}: {described}");
+    }
 }
 
 #[test]
@@ -236,7 +246,7 @@ fn field_kinds_are_choice_bool_number_or_text() {
     for key in ["planner.model", "worker.model", "review.model"] {
         assert_eq!(
             get(key).kind,
-            FieldKind::Choice(&["opus", "sonnet", "haiku"]),
+            FieldKind::Choice(&["fable", "opus", "sonnet", "haiku"]),
             "{key}"
         );
     }

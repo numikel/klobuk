@@ -25,6 +25,10 @@ use crate::run::{Run, RunState};
 /// How far up the parent chain an epic is looked for.
 const MAX_DEPTH: usize = 8;
 
+/// Where every cost figure comes from: `asf hook status` stores `cost.total_cost_usd` of the Claude Code
+/// status line untouched, so the factory keeps no price table of its own.
+pub const COST_SOURCE: &str = "cost as reported by Claude Code for each session: API list prices including cache reads and writes; on a subscription plan this is an equivalent, not a bill";
+
 /// Cost figures of one group of issues (an epic, or everything without one).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct Costs {

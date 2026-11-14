@@ -84,7 +84,7 @@ fn it_lists_the_groups_with_labels_instead_of_dotted_keys_at_120_columns() {
     );
     assert_eq!(col(&row(&t, "Per issue"), "$10.00"), col(&workers, "sonnet"));
     assert_eq!(
-        col(&row(&t, "Per issue"), "the worker is stopped"),
+        col(&row(&t, "Per issue"), "stops the worker"),
         col(&workers, "writes the code")
     );
 }
@@ -95,7 +95,10 @@ fn a_selected_choice_shows_the_current_one_in_brackets_and_the_others_after_it()
     let t = render_to_text(&a, 120, 40);
     let planning = row(&t, "Planning  ");
     assert!(planning.contains("▸ Planning"), "{planning}");
-    assert!(planning.contains("‹ opus ›   sonnet   haiku"), "{planning}");
+    assert!(
+        planning.contains("‹ opus ›   fable   sonnet   haiku"),
+        "{planning}"
+    );
     // the others are secondary text, the current one is not
     let (_, m) = cell_style(&a, "Planning  ", "sonnet");
     assert!(m.contains(Modifier::DIM), "the other choices are dim");
@@ -112,9 +115,17 @@ fn a_model_outside_the_list_is_kept_and_shown_as_the_current_choice() {
     let a = at("[planner]\nmodel = \"claude-haiku-5-5\"\n", "planner.model");
     let t = render_to_text(&a, 120, 40);
     let planning = row(&t, "Planning  ");
+    // the value cell is 44 columns wide: a long full id leaves room for the first choices only (the
+    // tail is clipped with `…`; h / l still reach every choice), a short custom name for all four
     assert!(
-        planning.contains("‹ claude-haiku-5-5 ›   opus   sonnet   haiku"),
+        planning.contains("‹ claude-haiku-5-5 ›   fable   opus   sonne"),
         "{planning}"
+    );
+    let short = at("[planner]\nmodel = \"my-model\"\n", "planner.model");
+    let t = render_to_text(&short, 120, 40);
+    assert!(
+        row(&t, "Planning  ").contains("‹ my-model ›   fable   opus   sonnet   haiku"),
+        "{t}"
     );
     let b = view("[planner]\nmodel = \"claude-haiku-5-5\"\n");
     let t = render_to_text(&b, 120, 40);
@@ -318,14 +329,20 @@ fn l_and_h_step_through_the_choices_and_write_at_once() {
     );
     assert_eq!(
         a.handle_key(key('h')),
-        Action::SetConfig("planner.model".into(), "haiku".into()),
-        "before the first comes the last"
+        Action::SetConfig("planner.model".into(), "fable".into()),
+        "fable, the strongest, comes before opus"
+    );
+    // before the first comes the last
+    let mut first = at("[planner]\nmodel = \"fable\"\n", "planner.model");
+    assert_eq!(
+        first.handle_key(key('h')),
+        Action::SetConfig("planner.model".into(), "haiku".into())
     );
     // from the last, next wraps to the first
     let mut b = at("[planner]\nmodel = \"haiku\"\n", "planner.model");
     assert_eq!(
         b.handle_key(key('l')),
-        Action::SetConfig("planner.model".into(), "opus".into())
+        Action::SetConfig("planner.model".into(), "fable".into())
     );
     // no overlay opens: the write is the action
     assert!(matches!(b.mode(), Mode::Normal));
@@ -347,7 +364,7 @@ fn a_value_outside_the_list_steps_into_the_list_from_either_side() {
     let mut a = at(toml, "planner.model");
     assert_eq!(
         a.handle_key(key('l')),
-        Action::SetConfig("planner.model".into(), "opus".into())
+        Action::SetConfig("planner.model".into(), "fable".into())
     );
     assert_eq!(
         a.handle_key(key('h')),
@@ -357,7 +374,7 @@ fn a_value_outside_the_list_steps_into_the_list_from_either_side() {
     let mut w = at(Config::default_toml(), "worker.model");
     assert_eq!(
         w.handle_key(key('l')),
-        Action::SetConfig("worker.model".into(), "opus".into())
+        Action::SetConfig("worker.model".into(), "fable".into())
     );
 }
 
