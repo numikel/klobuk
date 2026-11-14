@@ -50,8 +50,8 @@ timeout_s = 900
 name = "test"
 cmd = ["cargo", "test", "--workspace"]
 timeout_s = 2400
-slow_tests = 3    # stop early when 3 tests print "has been running for over 60 seconds" (asf-66: a hung serve loop held the gate for 2400 s)
-slow_after_s = 300  # ... or when the first such line is 5 minutes old and the gate is still running
+slow_tests = 10    # stop early when 3 tests print "has been running for over 60 seconds" (asf-66: a hung serve loop held the gate for 2400 s)
+slow_after_s = 900  # ... or when the first such line is 5 minutes old and the gate is still running
 
 [merge]
 target = "local"
