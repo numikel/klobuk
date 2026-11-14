@@ -2745,6 +2745,55 @@ fn an_idle_worker_with_a_fix_committed_after_a_send_back_is_verified_and_queued_
 }
 
 #[test]
+fn a_sent_back_worker_with_an_open_question_is_not_finished_for_it() {
+    // `asf issue finish` refuses while a QUESTION to the human is open; the automatic finish must too,
+    // or the branch could merge with the question unanswered
+    let l = lint_setup(LINT_FAILS, "");
+    let f = &l.f;
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(worker_run(f).state, RunState::Working);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    commit_in(&wt, "src/fixed.rs", "\n");
+    let q = f.repo.ok(&[
+        "--lane",
+        &f.issue,
+        "issue",
+        "comment",
+        &f.issue,
+        "--type",
+        "QUESTION",
+        "--to",
+        "human",
+        "--body",
+        "keep the old name?",
+    ]);
+    agent_reports(f, "idle");
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"].as_array().unwrap().len(), 0, "{res}");
+    assert_eq!(status_of(f, &f.issue), "in-progress");
+    assert_eq!(worker_run(f).state, RunState::Working);
+    assert!(events_of(f, "run.auto_finished").is_empty());
+
+    // answered: the next tick finishes it
+    f.repo.ok(&[
+        "issue",
+        "comment",
+        &f.issue,
+        "--type",
+        "ANSWER",
+        "--to",
+        &f.issue,
+        "--reply-to",
+        &q["id"].as_i64().unwrap().to_string(),
+        "--body",
+        "yes",
+    ]);
+    agent_reports(f, "idle");
+    let res = f.repo.ok(&["run", "watch", "--once"]);
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+}
+
+#[test]
 fn a_worker_that_was_never_sent_back_is_not_finished_for_it() {
     let f = setup();
     f.repo.ok(&["run", "start", &f.issue]);

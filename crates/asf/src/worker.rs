@@ -151,6 +151,9 @@ pub fn is_environmental(r: &GateResult) -> bool {
 }
 
 /// Every `merge.sent_back` event of `id`, oldest first.
+// shortcut: full event scan per call (the store has no query by issue and kind), upgrade to one when
+// events > ~50k or ticks slow; callers scan once per send-back and, in `auto_finish`, only for a run
+// that was reopened by a send-back.
 fn sent_back_events(ctx: &Ctx, id: &IssueId) -> Result<Vec<Event>, AppError> {
     let mut found = Vec::new();
     let mut seq = 0;
@@ -168,24 +171,24 @@ fn sent_back_events(ctx: &Ctx, id: &IssueId) -> Result<Vec<Event>, AppError> {
 
 /// Times `id` was sent back for a gate failure or a rebase conflict (not for a review): what
 /// `[merge] gate_max_rounds` limits.
-pub fn gate_rounds(ctx: &Ctx, id: &IssueId) -> Result<usize, AppError> {
-    Ok(sent_back_events(ctx, id)?
+fn gate_rounds(sent_back: &[Event]) -> usize {
+    sent_back
         .iter()
         .filter(|e| matches!(e.payload["kind"].as_str(), Some("gate" | "conflict")))
-        .count())
+        .count()
 }
 
-/// Why `id` is not sent back for another gate failure or conflict, or `None` when it may be.
-pub fn gate_rounds_used_up(ctx: &Ctx, id: &IssueId) -> Result<Option<String>, AppError> {
-    let rounds = gate_rounds(ctx, id)?;
+/// Why `id` is not sent back for another gate failure or conflict after `rounds` of them, or `None`
+/// when it may be.
+fn gate_rounds_used_up(ctx: &Ctx, id: &IssueId, rounds: usize) -> Option<String> {
     let max = ctx.config.merge.gate_max_rounds as usize;
-    Ok((rounds >= max).then(|| {
+    (rounds >= max).then(|| {
         format!(
             "{id} was already sent back {rounds} time(s) for gate failures or conflicts and gate.max_rounds is {max} \
              (`asf config set gate.max_rounds {}` allows another round)",
             max + 1
         )
-    }))
+    })
 }
 
 /// What a worker sent back to fix a gate or a conflict reads first: the evidence as data, then the way
@@ -1600,10 +1603,11 @@ impl<'a> Worker<'a> {
     /// The inner `Err` is why the worker was not sent back (rounds used up, the run is not sent back
     /// at all, no pane, the agent is gone or waits on a dialog); nothing but the file has changed then.
     pub fn send_back_fix(&self, id: &IssueId, failure: &Failure) -> Result<Result<Run, String>, AppError> {
-        if let Some(why) = gate_rounds_used_up(self.ctx, id)? {
+        let rounds = gate_rounds(&sent_back_events(self.ctx, id)?);
+        if let Some(why) = gate_rounds_used_up(self.ctx, id, rounds) {
             return Ok(Err(why));
         }
-        let round = gate_rounds(self.ctx, id)? + 1;
+        let round = rounds + 1;
         let run = self.run_for(id)?;
         let wt = self.ctx.root.join(&run.worktree);
         if !wt.is_dir() {
@@ -1667,6 +1671,9 @@ impl<'a> Worker<'a> {
     /// sent back at, the worktree is clean and on its branch (not in the middle of a rebase). That is a
     /// finish in everything but the command, so the issue goes `in-review` the way `asf issue finish`
     /// leaves it and the verification takes over. Returns the issue when it did.
+    ///
+    /// `asf issue finish` refuses while a QUESTION to the human is unanswered, and so does this: a
+    /// worker that asked and went idle waits for the ANSWER, it did not finish.
     fn auto_finish(
         &self,
         run: &Run,
@@ -1674,7 +1681,17 @@ impl<'a> Worker<'a> {
         agent: Option<&AgentInfo>,
     ) -> Result<Option<Issue>, AppError> {
         let idle = agent.is_some_and(|a| matches!(a.state, AgentState::Idle | AgentState::Done));
-        if run.state != RunState::Working || issue.status != Status::InProgress || !idle {
+        // `send_back` always leaves an exit reason on the run it reopens, so a run without one was
+        // never sent back and costs no event scan on this tick.
+        if run.state != RunState::Working
+            || issue.status != Status::InProgress
+            || !idle
+            || run.exit_reason.is_none()
+        {
+            return Ok(None);
+        }
+        let comments = self.ctx.store.comments(&run.issue_id)?;
+        if !crate::tui::snapshot::unanswered_questions(&comments).is_empty() {
             return Ok(None);
         }
         let Some(sent) = sent_back_events(self.ctx, &run.issue_id)?.pop() else {
