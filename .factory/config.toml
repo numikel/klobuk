@@ -49,9 +49,8 @@ timeout_s = 900
 [[gate]]
 name = "test"
 cmd = ["cargo", "test", "--workspace"]
-timeout_s = 2400
-# slow_tests = 10   # off since 2026-11-14: ten tests crossed 60 s only because three full test runs shared the CPU
-slow_after_s = 1800  # stop when the first "running for over 60 seconds" line is 30 minutes old and the gate still runs
+timeout_s = 2700
+# no early slow-test stop (slow_tests / slow_after_s): on 2026-11-14 it cut six healthy runs and no hung one; the timeout is the guard
 
 [merge]
 target = "local"
