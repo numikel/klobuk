@@ -417,6 +417,66 @@ fn a_changes_verdict_that_was_sent_back_is_one_line_not_two() {
 }
 
 #[test]
+fn a_failure_sent_back_to_the_worker_is_a_sentence_not_a_review_verdict() {
+    // a gate or a conflict goes back under its own event kind: the Log must not call it a review
+    let s = log_desk(vec![
+        ev(
+            2,
+            NOW,
+            "run.fix_sent_back",
+            Some("asf-24"),
+            serde_json::json!({
+                "kind":"conflict","round":2,"file":"x","head":"abc",
+                "headline":"the rebase of feat/asf-24 onto main conflicts"
+            }),
+        ),
+        ev(
+            1,
+            NOW,
+            "run.fix_sent_back",
+            Some("asf-24"),
+            serde_json::json!({
+                "kind":"gate","round":1,"file":"x","head":"abc",
+                "headline":"after the rebase onto abc the gate `clippy` failed"
+            }),
+        ),
+    ]);
+    let lines = lines(&s);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[1].ends_with(
+            "after the rebase onto abc the gate `clippy` failed, sent back to the worker (round 1)"
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        lines[0]
+            .ends_with("the rebase of feat/asf-24 onto main conflicts, sent back to the worker (round 2)"),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.contains("review verdict") && !l.contains("run.fix_sent_back")),
+        "{lines:?}"
+    );
+
+    // an event without a headline still reads as a sentence
+    let s = log_desk(vec![ev(
+        1,
+        NOW,
+        "run.fix_sent_back",
+        Some("asf-24"),
+        serde_json::json!({"kind":"gate","round":1}),
+    )]);
+    let lines = self::lines(&s);
+    assert!(
+        lines[0].ends_with("sent back to the worker to fix a gate (round 1)"),
+        "{lines:?}"
+    );
+}
+
+#[test]
 fn a_review_that_failed_for_another_reason_is_a_failed_merge() {
     let mut s = log_desk(vec![merge_state(2, 1, "reviewing", "failed")]);
     s.queue = vec![merge_item(

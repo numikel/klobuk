@@ -1437,7 +1437,7 @@ fn the_loop_queues_a_sent_back_worker_that_committed_its_fix_without_a_finish() 
     assert!(g
         .event_kinds()
         .iter()
-        .any(|(k, i)| k == "merge.sent_back" && i.as_deref() == Some(a.as_str())));
+        .any(|(k, i)| k == "run.fix_sent_back" && i.as_deref() == Some(a.as_str())));
     // the worker commits its fix and goes idle; it never runs `asf issue finish`
     commit_in(&g.repo.path().join(".worktrees").join(&a), "src/fix.rs", "x\n");
     FakeRuntime::new(g.repo.path().join(".factory/fake-runtime.json"))

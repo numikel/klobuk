@@ -105,10 +105,15 @@ pub enum GateMode {
     Background,
 }
 
-/// Event for a worker sent back to fix something: a review's findings, a gate that failed or a rebase
-/// conflict. Its payload has the `kind` (`review`, `gate` or `conflict`), the `round`, the `file` that
-/// tells the worker what to do and the branch `head` at that moment; `run_id` is the reopened run.
+/// Event for a worker sent back to fix a reviewer's findings. The TUI Log shows it as a review
+/// verdict. Its payload has the `kind` (`review`), the `round`, the `file` that tells the worker what to
+/// do and the branch `head` at that moment; `run_id` is the reopened run.
 pub const SENT_BACK: &str = "merge.sent_back";
+
+/// Event for a worker sent back to fix a gate that failed or a rebase conflict: not a review, so not
+/// [`SENT_BACK`]. Same payload plus the `headline` of the failure, and `kind` is `gate` or `conflict`.
+/// The rounds that `[merge] gate_max_rounds` limits are the events of this kind.
+pub const FIX_SENT_BACK: &str = "run.fix_sent_back";
 
 /// Event for a sent-back worker that was found idle with new commits and no `asf issue finish`.
 const AUTO_FINISHED: &str = "run.auto_finished";
@@ -150,7 +155,7 @@ pub fn is_environmental(r: &GateResult) -> bool {
     r.exit_code.is_none() || r.tail.contains(LINKER_LOCK)
 }
 
-/// Every `merge.sent_back` event of `id`, oldest first.
+/// Every `merge.sent_back` and `run.fix_sent_back` event of `id`, oldest first.
 // shortcut: full event scan per call (the store has no query by issue and kind), upgrade to one when
 // events > ~50k or ticks slow; callers scan once per send-back and, in `auto_finish`, only for a run
 // that was reopened by a send-back.
@@ -161,10 +166,9 @@ fn sent_back_events(ctx: &Ctx, id: &IssueId) -> Result<Vec<Event>, AppError> {
         let page = ctx.store.events_since(seq, 500)?;
         let Some(last) = page.last() else { break };
         seq = last.seq;
-        found.extend(
-            page.into_iter()
-                .filter(|e| e.kind == SENT_BACK && e.issue_id.as_ref() == Some(id)),
-        );
+        found.extend(page.into_iter().filter(|e| {
+            matches!(e.kind.as_str(), SENT_BACK | FIX_SENT_BACK) && e.issue_id.as_ref() == Some(id)
+        }));
     }
     Ok(found)
 }
@@ -172,10 +176,7 @@ fn sent_back_events(ctx: &Ctx, id: &IssueId) -> Result<Vec<Event>, AppError> {
 /// Times `id` was sent back for a gate failure or a rebase conflict (not for a review): what
 /// `[merge] gate_max_rounds` limits.
 fn gate_rounds(sent_back: &[Event]) -> usize {
-    sent_back
-        .iter()
-        .filter(|e| matches!(e.payload["kind"].as_str(), Some("gate" | "conflict")))
-        .count()
+    sent_back.iter().filter(|e| e.kind == FIX_SENT_BACK).count()
 }
 
 /// Why `id` is not sent back for another gate failure or conflict after `rounds` of them, or `None`
@@ -1641,7 +1642,7 @@ impl<'a> Worker<'a> {
             .store
             .set_status(id, Status::InProgress, LANE_ORCHESTRATOR)?;
         self.ctx.store.append_event(&NewEvent {
-            kind: SENT_BACK.into(),
+            kind: FIX_SENT_BACK.into(),
             issue_id: Some(id.clone()),
             run_id: Some(sent.id.clone()),
             actor: Some(LANE_ORCHESTRATOR.into()),
@@ -1650,6 +1651,7 @@ impl<'a> Worker<'a> {
                 "round": round,
                 "file": file_rel,
                 "head": self.vcs.head(&wt).ok(),
+                "headline": failure.headline,
             }),
         })?;
         self.ctx.store.add_comment(&NewComment {

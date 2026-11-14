@@ -2500,6 +2500,8 @@ fn a_rebase_conflict_goes_to_the_idle_worker_and_the_queue_resolves_nothing() {
         prompts[0].contains(&format!(".factory/runs/{}/conflict-1.md", f.issue)),
         "{prompts:?}"
     );
+    assert!(events_of(&f, "merge.sent_back").is_empty());
+    assert_eq!(events_of(&f, "run.fix_sent_back")[0].payload["kind"], "conflict");
     assert!(comments_of(&f, CommentType::Blocker).is_empty());
     let status = orchestrator_status(&f);
     assert_eq!(status.len(), 1, "{status:?}");
@@ -2562,6 +2564,30 @@ fn a_rebase_conflict_with_an_unreachable_worker_blocks_as_before() {
         "{}",
         blockers[0].body
     );
+}
+
+/// The TUI Log shows `merge.sent_back` as "review verdict: changes", so a gate failure or a rebase
+/// conflict sent back to the worker is recorded under its own event kind.
+#[test]
+fn a_gate_or_conflict_send_back_is_not_recorded_as_a_review_verdict() {
+    let l = lint_setup(LINT_FAILS, "");
+    let f = &l.f;
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert!(events_of(f, "merge.sent_back").is_empty());
+    let sent = events_of(f, "run.fix_sent_back");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].payload["kind"], "gate", "{:?}", sent[0].payload);
+    assert_eq!(sent[0].payload["round"], 1);
+    assert!(sent[0].payload["file"].as_str().unwrap().ends_with("gate-1.md"));
+    assert!(sent[0].payload["head"].is_string());
+
+    // the worker's own verification goes through the same path
+    let g = setup();
+    verify_gate(&g);
+    g.repo.ok(&["run", "start", &g.issue]);
+    finish_and_watch(&g);
+    assert!(events_of(&g, "merge.sent_back").is_empty());
+    assert_eq!(events_of(&g, "run.fix_sent_back").len(), 1);
 }
 
 /// A gate with no `when`: it runs in the worker's own verification too, and fails until `src/fixed.rs` exists.

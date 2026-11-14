@@ -538,6 +538,20 @@ fn describe(snap: &Snapshot, idx: usize) -> Option<Said> {
             &[some("this patch was approved before")],
         ),
         "merge.sent_back" => said(Sym::Review, "review verdict: changes", &[]),
+        // a gate failure or a rebase conflict, sent to the worker: not a review verdict
+        "run.fix_sent_back" => {
+            let round = count(e, "round")
+                .map(|n| format!(" (round {n})"))
+                .unwrap_or_default();
+            let head = match text(e, "headline") {
+                Some(what) => format!("{what}, sent back to the worker{round}"),
+                None => format!(
+                    "sent back to the worker to fix a {}{round}",
+                    text(e, "kind").unwrap_or("failure")
+                ),
+            };
+            said(Sym::Working, head, &[])
+        }
         "merge.review_start_failed" => said(
             Sym::Failed,
             "reviewer could not start",
