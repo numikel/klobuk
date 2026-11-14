@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::commands::merge::GATES_REUSED;
 use crate::tui::app::{Action, View};
 use crate::tui::bindings::*;
 use crate::tui::snapshot::{
@@ -74,6 +75,9 @@ pub const BINDINGS: &[Binding] = &[
         Slot::Hint,
     ),
 ];
+
+/// What the Queue view says of an item whose gates were not run again (the Log view says it too).
+pub const GATES_REUSED_TEXT: &str = "gates reused from verification";
 
 pub const EMPTY: &str = "Queue is empty. A branch arrives here after its worker's run is verified.";
 
@@ -184,7 +188,19 @@ fn main_ahead(snap: &Snapshot) -> Stage {
     }
 }
 
-fn gates_done(item: &MergeItem) -> Stage {
+/// Whether the gates of the item's latest attempt were not run because the worker's verification had
+/// passed them on this very commit (`[merge] reuse_verification`). The event names the attempt, so an
+/// older reuse is not read into a later attempt that ran the gates.
+fn gates_reused(snap: &Snapshot, item: &MergeItem) -> bool {
+    snap.events.iter().any(|e| {
+        e.kind == GATES_REUSED && e.payload["merge_id"] == item.id && e.payload["attempt"] == item.attempts
+    })
+}
+
+fn gates_done(snap: &Snapshot, item: &MergeItem) -> Stage {
+    if gates_reused(snap, item) {
+        return Stage::Done("reused".into());
+    }
     match item.gate_results.len() {
         0 => Stage::Done("done".into()),
         n => Stage::Done(format!("{n} of {n}")),
@@ -267,25 +283,25 @@ pub fn stages(snap: &Snapshot, item: &MergeItem) -> [Stage; 5] {
             if let Some(round) = review_round(snap, &item.issue_id) {
                 detail.push_str(&format!(" · round {round}"));
             }
-            [done(), gates_done(item), Running(detail), Pending, main]
+            [done(), gates_done(snap, item), Running(detail), Pending, main]
         }
         MergeState::PrOpen => [
             done(),
-            gates_done(item),
+            gates_done(snap, item),
             review_behind(snap, item),
             Running("PR open".into()),
             main,
         ],
         MergeState::Merging => [
             done(),
-            gates_done(item),
+            gates_done(snap, item),
             review_behind(snap, item),
             Running("merging".into()),
             main,
         ],
         MergeState::Merged => [
             done(),
-            gates_done(item),
+            gates_done(snap, item),
             review_behind(snap, item),
             done(),
             // a red main is a fact whatever the config says now; green only if it was checked
@@ -302,7 +318,7 @@ pub fn stages(snap: &Snapshot, item: &MergeItem) -> [Stage; 5] {
             let (at, what) = failure(item);
             let before = |i: usize| match i {
                 0 => done(),
-                1 => gates_done(item),
+                1 => gates_done(snap, item),
                 _ => review_behind(snap, item),
             };
             std::array::from_fn(|i| match i.cmp(&at) {
@@ -665,6 +681,13 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
             lines.push(item_line(e, &cols, i == sel, avail, theme));
             if needs_a_fix(e.item) {
                 lines.extend(detail_lines(e, &cols, avail, theme));
+            } else if gates_reused(snap, e.item) {
+                let indent = cols.indent();
+                let room = avail.saturating_sub(indent).max(1);
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(trunc(GATES_REUSED_TEXT, room), theme.dim()),
+                ]));
             }
             if i == sel {
                 block = (start, lines.len());
@@ -704,11 +727,16 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
 // Keys
 // ---------------------------------------------------------------------------------------------
 
-/// The gate output of an item as one text: the error, then every gate with its exit code and tail.
-fn gate_output(item: &MergeItem) -> String {
+/// The gate output of an item as one text: the error, whether the gates were reused from the
+/// verification, then every gate with its exit code and tail.
+fn gate_output(snap: &Snapshot, item: &MergeItem) -> String {
     let mut out = String::new();
     if let Some(e) = &item.last_error {
         out.push_str(e.trim_end());
+        out.push_str("\n\n");
+    }
+    if gates_reused(snap, item) {
+        out.push_str(GATES_REUSED_TEXT);
         out.push_str("\n\n");
     }
     for g in &item.gate_results {
@@ -746,7 +774,7 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
             item.state
         )),
         KeyCode::Enter => {
-            let body = gate_output(item);
+            let body = gate_output(snap, item);
             if body.is_empty() {
                 return Action::Status(format!("{id} has no gate output yet"));
             }

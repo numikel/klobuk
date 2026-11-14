@@ -35,7 +35,11 @@ const EDITABLE: &[(&str, &str)] = &[
     ),
     (
         "merge.verify_main_after",
-        "run the gates in the repo root after each merge",
+        "run the gates in the repo root after each merge: one more full gate run per merge; redundant after a fast-forward, where main is exactly the tree the queue gates passed",
+    ),
+    (
+        "merge.reuse_verification",
+        "skip the queue gates when the worker's verification passed them on this very commit and the rebase changed nothing (off: every merge pays one more full gate run; a real rebase or a new commit always runs them)",
     ),
     (
         "merge.clean_after",
@@ -135,6 +139,8 @@ const APPLIES: &[(&str, Applies)] = &[
     ("gate.max_rounds", Applies::NextTick),
     ("merge.target", Applies::NextTick),
     ("merge.verify_main_after", Applies::NextTick),
+    // read from the refreshed `ctx.config` when an item is rebased, before its gates
+    ("merge.reuse_verification", Applies::NextTick),
     ("merge.clean_after", Applies::NextTick),
     ("worker.remote_control", Applies::NextTick),
     // `serve::serve_loop` takes both from the refreshed config every tick, unless a flag sets them
@@ -341,7 +347,14 @@ const FIELDS: &[ConfigField] = &[
         label: "Gates on main",
         group: ConfigGroup::Flow,
         kind: FieldKind::Bool,
-        help: "run the gates again after each merge",
+        help: "one more gate run per merge; redundant after ff",
+    },
+    ConfigField {
+        key: "merge.reuse_verification",
+        label: "Reuse verification",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Bool,
+        help: "skip queue gates if verified commit is unchanged",
     },
     ConfigField {
         key: "merge.clean_after",
@@ -593,6 +606,6 @@ mod tests {
             assert_eq!(k.split('.').count(), 2, "{k}");
             assert!(seen.insert(*k), "duplicate {k}");
         }
-        assert_eq!(EDITABLE.len(), 20);
+        assert_eq!(EDITABLE.len(), 21);
     }
 }

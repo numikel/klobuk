@@ -115,6 +115,11 @@ pub const SENT_BACK: &str = "merge.sent_back";
 /// The rounds that `[merge] gate_max_rounds` limits are the events of this kind.
 pub const FIX_SENT_BACK: &str = "run.fix_sent_back";
 
+/// Event a successful verification appends to its run: the branch `head` the gates ran on and their
+/// `gates` results. The merge queue reads it to skip gates that already passed on that very commit
+/// (`[merge] reuse_verification`); the newest one of a run counts.
+pub const RUN_VERIFIED: &str = "run.verified";
+
 /// Event for a sent-back worker that was found idle with new commits and no `asf issue finish`.
 const AUTO_FINISHED: &str = "run.auto_finished";
 
@@ -244,6 +249,8 @@ pub struct VerifyJob {
     /// What the cheap checks before the gates found; the gates add their own.
     pub problems: Vec<String>,
     pub changed: usize,
+    /// The commit the worktree was on when the gates started (`None` when git could not say).
+    pub head: Option<String>,
 }
 
 /// A rebased merge-queue item waiting for its gates (`GateWhen::Merge`, in its worktree).
@@ -2125,12 +2132,14 @@ impl<'a> Worker<'a> {
                 outside.join(", ")
             ));
         }
+        let head = self.vcs.head(&wt_abs).ok();
         Ok(VerifyJob {
             run: run.clone(),
             issue: issue.clone(),
             wt: wt_abs,
             problems,
             changed: changed.len(),
+            head,
         })
     }
 
@@ -2142,6 +2151,7 @@ impl<'a> Worker<'a> {
             issue,
             mut problems,
             changed,
+            head,
             ..
         } = job;
         let (run, issue) = (&run, &issue);
@@ -2186,6 +2196,16 @@ impl<'a> Worker<'a> {
             self.ctx
                 .store
                 .set_status(&run.issue_id, Status::Validating, LANE_ORCHESTRATOR)?;
+            // What the queue needs to skip these gates later: the commit they passed on, with their results.
+            if let Some(head) = head {
+                self.ctx.store.append_event(&NewEvent {
+                    kind: RUN_VERIFIED.into(),
+                    issue_id: Some(run.issue_id.clone()),
+                    run_id: Some(run.id.clone()),
+                    actor: Some(LANE_ORCHESTRATOR.into()),
+                    payload: json!({ "head": head, "gates": results }),
+                })?;
+            }
             // A branch that is already queued (an earlier verification, or `merge enqueue` by hand) is
             // reused: a second `enqueue_merge` would be a conflict that aborts the whole tick. An item
             // that `failed` is the one a reviewer's `changes` verdict left behind while the worker fixed

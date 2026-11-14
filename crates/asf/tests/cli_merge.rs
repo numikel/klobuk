@@ -164,8 +164,11 @@ fn tick_blocks_on_rebase_conflict_and_posts_blocker() {
 fn tick_fails_on_gate_and_retry_requeues() {
     let f = setup();
     let cfg = f.repo.path().join(".factory/config.toml");
-    let mut s = std::fs::read_to_string(&cfg).unwrap();
-    s.push_str("\n[[gate]]\nname = \"flaky\"\ncmd = [\"python\", \"-c\", \"import os,sys; sys.exit(0 if os.path.exists('PASS') else 7)\"]\n");
+    // this test breaks the gate after the verification, so the queue has to run it again
+    let mut s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("reuse_verification = true", "reuse_verification = false");
+    s.push_str("\n[[gate]]\nname = \"flaky\"\ncmd =[\"python\", \"-c\", \"import os,sys; sys.exit(0 if os.path.exists('PASS') else 7)\"]\n");
     std::fs::write(&cfg, s).unwrap();
     git(f.repo.path(), &["add", ".factory/config.toml"]);
     git(f.repo.path(), &["commit", "-q", "-m", "gate"]);
@@ -240,7 +243,10 @@ fn red_setup(verify_main_after: bool) -> Red {
     let log = dir.path().join("gate.log");
     let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
     let cfg = f.repo.path().join(".factory/config.toml");
-    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    // these tests count the gate runs of the queue itself
+    let mut s = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("reuse_verification = true", "reuse_verification = false");
     if verify_main_after {
         assert!(
             s.contains("verify_main_after = false"),
@@ -2830,4 +2836,126 @@ fn a_worker_that_was_never_sent_back_is_not_finished_for_it() {
     assert_eq!(res["transitions"].as_array().unwrap().len(), 0, "{res}");
     assert_eq!(status_of(&f, &f.issue), "in-progress");
     assert!(events_of(&f, "run.auto_finished").is_empty());
+}
+
+// ---- [merge] reuse_verification: the queue does not gate a tree that the verification already gated ----
+
+/// A gate named `counted` that appends one line to a log for every run, in every stage. Committed to
+/// main, so a worker started afterwards carries it. Returns the log's directory (keep it alive) and the log.
+fn counted_gate(f: &F) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\nopen(sys.argv[1], 'a').write(os.getcwd() + '\\n')\n",
+    )
+    .unwrap();
+    let log = dir.path().join("gate.log");
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"counted\"\ncmd = ['python', '{}', '{}']\n",
+        fwd(&script),
+        fwd(&log)
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "counted gate"]);
+    (dir, log)
+}
+
+fn counted_runs(log: &Path) -> usize {
+    std::fs::read_to_string(log).unwrap_or_default().lines().count()
+}
+
+fn worktree_head(f: &F) -> String {
+    git_out(
+        &f.repo.path().join(".worktrees").join(&f.issue),
+        &["rev-parse", "HEAD"],
+    )
+}
+
+#[test]
+fn a_verified_item_whose_rebase_changed_nothing_skips_the_queue_gates() {
+    let f = setup();
+    let (_dir, log) = counted_gate(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    assert_eq!(counted_runs(&log), 1, "the verification ran the gate");
+    let verified = events_of(&f, "run.verified");
+    assert_eq!(verified.len(), 1, "{verified:?}");
+    assert_eq!(verified[0].payload["head"], worktree_head(&f).as_str());
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(counted_runs(&log), 1, "the queue did not run the gate again");
+
+    let item = &store(&f).merge_queue().unwrap()[0];
+    let recorded: Vec<(&str, bool)> = item
+        .gate_results
+        .iter()
+        .map(|g| (g.name.as_str(), g.ok))
+        .collect();
+    assert_eq!(
+        recorded,
+        [("counted", true)],
+        "the verification's results are the item's"
+    );
+    let reused = events_of(&f, "merge.gates_reused");
+    assert_eq!(reused.len(), 1, "{reused:?}");
+    assert_eq!(reused[0].payload["merge_id"], item.id);
+    assert_eq!(reused[0].payload["attempt"], item.attempts);
+    assert_eq!(reused[0].payload["head"], verified[0].payload["head"]);
+}
+
+#[test]
+fn a_real_rebase_runs_the_queue_gates_as_before() {
+    let f = setup();
+    let (_dir, log) = counted_gate(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    commit_in(f.repo.path(), "README.txt", "main moved\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(counted_runs(&log), 2, "verification and queue each ran the gate");
+    assert!(events_of(&f, "merge.gates_reused").is_empty());
+    assert_eq!(store(&f).merge_queue().unwrap()[0].gate_results.len(), 1);
+}
+
+#[test]
+fn a_commit_after_verification_runs_the_queue_gates() {
+    let f = setup();
+    let (_dir, log) = counted_gate(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    commit_in(&wt, "src/more.rs", "pub fn more() {}\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(counted_runs(&log), 2, "the unverified commit is gated");
+    assert!(events_of(&f, "merge.gates_reused").is_empty());
+}
+
+#[test]
+fn with_reuse_verification_off_the_queue_gates_every_item_as_before() {
+    let f = setup();
+    set_config(&f, "reuse_verification = true", "reuse_verification = false");
+    let (_dir, log) = counted_gate(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(counted_runs(&log), 2, "verification and queue each ran the gate");
+    assert!(events_of(&f, "merge.gates_reused").is_empty());
+}
+
+#[test]
+fn reused_gates_go_on_to_the_review_as_usual() {
+    let f = setup();
+    require_review(&f);
+    let (_dir, log) = counted_gate(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(counted_runs(&log), 1, "no queue gate run before the review");
+    assert_eq!(events_of(&f, "merge.gates_reused").len(), 1);
+    assert_eq!(reviews_of(&f, &f.issue).len(), 1, "the reviewer was started");
+    assert_eq!(store(&f).merge_queue().unwrap()[0].gate_results.len(), 1);
 }

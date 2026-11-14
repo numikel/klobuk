@@ -1017,3 +1017,49 @@ fn every_key_of_the_view_is_on_the_help_page() {
         assert!(t.contains(text), "{text}:\n{t}");
     }
 }
+
+#[test]
+fn gates_reused_from_the_verification_replace_the_gates_passed_line_of_that_attempt_only() {
+    // newest first: attempt 2 (gates ran) is above attempt 1 (reused)
+    let mut s = log_desk(vec![
+        ev(
+            9,
+            NOW,
+            "merge.state",
+            Some("asf-25"),
+            serde_json::json!({"merge_id":4,"from":"gating","to":"reviewing"}),
+        ),
+        ev(
+            8,
+            NOW,
+            "merge.state",
+            Some("asf-25"),
+            serde_json::json!({"merge_id":4,"from":"rebasing","to":"gating"}),
+        ),
+        ev(
+            5,
+            NOW,
+            "merge.gates_reused",
+            Some("asf-25"),
+            serde_json::json!({"merge_id":4,"attempt":1,"head":"abc1234000","gates":["fmt"]}),
+        ),
+        ev(
+            4,
+            NOW,
+            "merge.state",
+            Some("asf-25"),
+            serde_json::json!({"merge_id":4,"from":"rebasing","to":"gating"}),
+        ),
+    ]);
+    let mut item = merge_item(4, "asf-25", MergeState::Reviewing, None, NOW);
+    item.gate_results = vec![gate("fmt", true)];
+    s.queue = vec![item];
+    // the reuse event is folded into its gating line; the verification's own event is not a line
+    assert_eq!(
+        lines(&s),
+        [
+            "✓ gates passed after rebase · fmt",
+            "✓ gates reused from verification · abc1234"
+        ]
+    );
+}

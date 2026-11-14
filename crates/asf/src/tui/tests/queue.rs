@@ -2,6 +2,7 @@
 //! this file only.
 
 use super::*;
+use crate::commands::merge::GATES_REUSED;
 use crate::tui::snapshot::{text_width, REVIEW_STARTED};
 use crate::tui::views::queue::{failed_tests, stages, Stage};
 
@@ -692,4 +693,59 @@ fn queue_view_selects_its_own_issue() {
     a.handle_key(key('5'));
     assert_eq!(a.selected_issue().unwrap().as_str(), "asf-1");
     assert_eq!(a.rows(View::Queue), 1);
+}
+
+fn reused_event(seq: u64, issue: &str, merge_id: i64, attempt: i64) -> Event {
+    Event {
+        seq,
+        ts: "2026-11-06T11:58:00Z".into(),
+        kind: GATES_REUSED.into(),
+        issue_id: Some(id(issue)),
+        run_id: None,
+        actor: None,
+        payload: serde_json::json!({
+            "merge_id": merge_id, "attempt": attempt, "head": "abc1234000", "gates": ["fmt", "clippy", "test"]
+        }),
+    }
+}
+
+#[test]
+fn gates_reused_from_the_verification_are_said_in_the_cell_under_the_row_and_in_the_gate_output() {
+    use Stage::*;
+    let mut s = queue_desk();
+    s.events.push(reused_event(10, "asf-28", 1, 1));
+    s.derive();
+    assert_eq!(stages(&s, &s.queue[0])[1], Done("reused".into()));
+    assert_eq!(
+        stages(&s, &s.queue[1])[1],
+        Failed("test".into()),
+        "an item that ran its gates is not marked"
+    );
+    let t = render_to_text(&queue_app(s.clone()), 120, 40);
+    assert!(item_row(&t, "asf-28").contains("✓ reused"), "{t}");
+    assert!(t.contains("gates reused from verification"), "{t}");
+
+    let mut a = queue_app(s.clone());
+    a.handle_key(code(KeyCode::Enter));
+    match a.mode() {
+        Mode::Comment { comment, .. } => {
+            assert!(
+                comment.body.contains("gates reused from verification"),
+                "{}",
+                comment.body
+            );
+            assert!(
+                comment.body.contains("gate fmt: ok"),
+                "the reused results are listed too"
+            );
+        }
+        other => panic!("not the comment modal: {other:?}"),
+    }
+
+    // the same item queued again: its newer attempt ran the gates, the old reuse does not count
+    let mut later = s.clone();
+    later.queue[0].attempts = 2;
+    assert_eq!(stages(&later, &later.queue[0])[1], Done("3 of 3".into()));
+    let t = render_to_text(&queue_app(later), 120, 40);
+    assert!(!t.contains("gates reused from verification"), "{t}");
 }

@@ -141,7 +141,7 @@ fn unparsable_document_is_a_parse_error() {
 }
 
 #[test]
-fn editable_keys_are_exactly_the_twenty_named_in_the_briefs() {
+fn editable_keys_are_exactly_the_twenty_one_named_in_the_briefs() {
     // In the order of the Config view: models, budgets, flow, notifications.
     let keys: Vec<&str> = editable_keys().iter().map(|(k, _)| *k).collect();
     assert_eq!(
@@ -158,6 +158,7 @@ fn editable_keys_are_exactly_the_twenty_named_in_the_briefs() {
             "gate.max_rounds",
             "merge.target",
             "merge.verify_main_after",
+            "merge.reuse_verification",
             "merge.clean_after",
             "worker.remote_control",
             "serve.interval_s",
@@ -200,6 +201,11 @@ fn fields_carry_the_labels_and_groups_of_the_view() {
         ("gate.max_rounds", "Gate fix rounds", ConfigGroup::Flow),
         ("merge.target", "Merge target", ConfigGroup::Flow),
         ("merge.verify_main_after", "Gates on main", ConfigGroup::Flow),
+        (
+            "merge.reuse_verification",
+            "Reuse verification",
+            ConfigGroup::Flow,
+        ),
         ("merge.clean_after", "Clean up after merge", ConfigGroup::Flow),
         ("worker.remote_control", "Remote control", ConfigGroup::Flow),
         ("serve.interval_s", "Loop interval (s)", ConfigGroup::Flow),
@@ -243,6 +249,7 @@ fn field_kinds_are_choice_bool_number_or_text() {
     for key in [
         "review.required",
         "merge.verify_main_after",
+        "merge.reuse_verification",
         "worker.remote_control",
         "notify.on_new",
     ] {
@@ -282,6 +289,14 @@ fn field_defaults_are_read_from_config_default() {
         Some("[\"worktree\",\"review_worktrees\"]")
     );
     assert_eq!(get("notify.on_new").default_value().as_deref(), Some("true"));
+    assert_eq!(
+        get("merge.reuse_verification").default_value().as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        get("merge.verify_main_after").default_value().as_deref(),
+        Some("false")
+    );
     assert_eq!(
         get("worker.remote_control").default_value().as_deref(),
         Some("false")
@@ -323,6 +338,7 @@ fn every_editable_key_accepts_its_default_value() {
         ("scheduler.max_parallel", "3"),
         ("merge.target", "local"),
         ("merge.verify_main_after", "false"),
+        ("merge.reuse_verification", "true"),
         ("merge.clean_after", "[\"worktree\", \"review_worktrees\"]"),
         ("worker.remote_control", "false"),
         ("notify.on_new", "true"),
@@ -476,6 +492,7 @@ fn a_key_the_serve_loop_reloads_says_it_applies_on_the_next_tick() {
         "scheduler.max_parallel",
         "merge.target",
         "merge.verify_main_after",
+        "merge.reuse_verification",
         "merge.clean_after",
         "worker.remote_control",
         "gate.slow_tests",
@@ -491,6 +508,30 @@ fn a_key_the_serve_loop_reloads_says_it_applies_on_the_next_tick() {
             "{key}"
         );
     }
+}
+
+#[test]
+fn the_two_gate_run_keys_say_what_they_cost_and_when_they_save_it() {
+    let describe = |key: &str| editable_keys().iter().find(|(k, _)| *k == key).unwrap().1;
+    let main = describe("merge.verify_main_after");
+    assert!(main.contains("one more full gate run per merge"), "{main}");
+    assert!(main.contains("redundant after a fast-forward"), "{main}");
+    let reuse = describe("merge.reuse_verification");
+    assert!(reuse.contains("one more full gate run"), "{reuse}");
+    assert!(reuse.contains("rebase changed nothing"), "{reuse}");
+}
+
+#[test]
+fn reuse_verification_is_set_and_read_back_like_any_flow_toggle() {
+    let out = set_key(
+        "[merge]\nreuse_verification = true\n",
+        "merge.reuse_verification",
+        "false",
+    )
+    .unwrap();
+    assert!(!Config::from_toml(&out).unwrap().merge.reuse_verification);
+    let from_nothing = set_key("", "merge.reuse_verification", "false").unwrap();
+    assert!(!Config::from_toml(&from_nothing).unwrap().merge.reuse_verification);
 }
 
 #[test]

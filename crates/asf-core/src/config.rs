@@ -228,6 +228,10 @@ pub struct MergeCfg {
     pub require_clean_main: bool,
     /// Run the `[[gate]]`s in the repository root right after every merge to detect a red default branch.
     pub verify_main_after: bool,
+    /// Skip the queue's gates for an item whose run was verified, whose rebase changed nothing and whose
+    /// branch head is the head that was verified: the verification's results stand in for them. A real
+    /// rebase or a later commit always runs the gates. Off: the queue gates every item, as before.
+    pub reuse_verification: bool,
     /// What the queue removes after a successful merge (and, with `verify_main_after`, a green main).
     /// Empty keeps everything.
     pub clean_after: Vec<CleanKind>,
@@ -244,6 +248,7 @@ impl Default for MergeCfg {
             target: "local".into(),
             require_clean_main: true,
             verify_main_after: false,
+            reuse_verification: true,
             clean_after: vec![CleanKind::Worktree, CleanKind::ReviewWorktrees],
             gate_max_rounds: 2,
             github: GitHubCfg::default(),
@@ -439,7 +444,8 @@ pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json bef
 [merge]
 target = "local"          # local (rebase + fast-forward) | github (push + PR via gh)
 require_clean_main = true
-verify_main_after = false # run the gates in the repo root after each merge; a red main keeps the item `merged`, posts a BLOCKER and halts the tick
+verify_main_after = false # run the gates in the repo root after each merge; a red main keeps the item `merged`, posts a BLOCKER and halts the tick; costs one more full gate run per merge, and is redundant after a fast-forward (main is then the tree the queue gates passed)
+reuse_verification = true # skip the queue gates when the worker's verification passed them on this very commit and the rebase changed nothing; false: every item pays another full gate run
 clean_after = ["worktree", "review_worktrees"] # removed after a merge (and a green main when verify_main_after is on): worktree | branch (git branch -d) | review_worktrees; [] keeps everything; a refusal (claimed, dirty or unmerged lane) is reported, never fails the merge
 # gate_max_rounds = 2     # edited as `gate.max_rounds`: send-backs to the worker for a gate failure or a rebase conflict per item before the human is asked; 0 never sends back
 # [merge.github]          # used when target = "github"
@@ -703,6 +709,7 @@ mod tests {
         );
         assert!(c.merge.require_clean_main);
         assert!(!c.merge.verify_main_after, "off unless asked for");
+        assert!(c.merge.reuse_verification, "on unless switched off");
         assert!(!c.review.required);
     }
 
@@ -733,6 +740,16 @@ mod tests {
         assert!(c.merge.require_clean_main, "other merge defaults survive");
         let t = Config::from_toml(Config::default_toml()).unwrap();
         assert!(!t.merge.verify_main_after);
+    }
+
+    #[test]
+    fn reuse_verification_is_on_by_default_parses_and_the_template_keeps_it_on() {
+        assert!(Config::from_toml("").unwrap().merge.reuse_verification);
+        let c = Config::from_toml("[merge]\nreuse_verification = false\n").unwrap();
+        assert!(!c.merge.reuse_verification);
+        assert!(c.merge.require_clean_main, "other merge defaults survive");
+        let t = Config::from_toml(Config::default_toml()).unwrap();
+        assert!(t.merge.reuse_verification);
     }
 
     #[test]

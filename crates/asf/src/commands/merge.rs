@@ -19,7 +19,7 @@ use crate::ctx::{Ctx, FACTORY_DIR};
 use crate::output::{AppError, ErrorCode, Rendered};
 use crate::worker::{
     is_environmental, Failure, Finished, Fix, GateMode, GateSlot, Job, MainJob, MergeJob, Worker, RUNS_DIR,
-    SENT_BACK,
+    RUN_VERIFIED, SENT_BACK,
 };
 
 use super::lane;
@@ -64,6 +64,12 @@ const REVIEW_SKIPPED: &str = "merge.review_skipped";
 /// Event the queue appends when a gate failed only on tests outside the branch and runs once more.
 /// Its payload names the `gate`, the `tests`, the `files` they live in and the `branch`.
 const GATE_RERUN_FOREIGN: &str = "merge.gate_rerun_foreign";
+
+/// Event the queue appends when it skips the gates of an item because the worker's verification passed
+/// them on this very commit (`[merge] reuse_verification`). Its payload has the `merge_id`, the `attempt`
+/// it belongs to (the item's `attempts` at that moment, so a later attempt that runs the gates is not
+/// mistaken for it), the verified `head` and the names of the reused `gates`.
+pub const GATES_REUSED: &str = "merge.gates_reused";
 
 /// Label of the issues filed for tests that failed outside the branch and passed on the rerun.
 const FLAKY_LABEL: &str = "flaky";
@@ -335,6 +341,8 @@ pub fn start_next(ctx: &Ctx, slot: &mut GateSlot) -> Result<TickResult, AppError
                     items.extend(conclude_finished(ctx, finished)?);
                 }
             }
+            // nothing to wait for: the slot stays free and the next item is looked at in this pass
+            Prepared::Reused(job, results) => items.extend(conclude_merge(ctx, *job, results)?),
         }
     }
     Ok(TickResult {
@@ -647,22 +655,24 @@ fn locate(ctx: &Ctx, item: &MergeItem) -> Result<(Option<Run>, String, std::path
 /// Rebase → gates → (review) → ff-merge for one queued item, the gates run in this thread. Never
 /// returns `Err` for a merge problem: the problem lands in the item's state and `last_error`.
 fn process(ctx: &Ctx, item: &MergeItem) -> Result<MergeItem, AppError> {
-    match prepare(ctx, item)? {
-        Prepared::Ended(done) => Ok(*done),
+    let (job, results) = match prepare(ctx, item)? {
+        Prepared::Ended(done) => return Ok(*done),
         Prepared::Gates(job) => {
-            let id = job.item.id;
             let results = run_gates(&gate_specs(ctx, GateWhen::Merge), &job.wt);
-            match conclude(ctx, *job, results, GateMode::Inline)? {
-                Some(done) => Ok(done),
-                // the operator skipped or retried the item during a rerun: the item is theirs now
-                None => ctx
-                    .store
-                    .merge_queue()?
-                    .into_iter()
-                    .find(|m| m.id == id)
-                    .ok_or_else(|| AppError::not_found(format!("merge item #{id} is gone"))),
-            }
+            (job, results)
         }
+        Prepared::Reused(job, results) => (job, results),
+    };
+    let id = job.item.id;
+    match conclude(ctx, *job, results, GateMode::Inline)? {
+        Some(done) => Ok(done),
+        // the operator skipped or retried the item during a rerun: the item is theirs now
+        None => ctx
+            .store
+            .merge_queue()?
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| AppError::not_found(format!("merge item #{id} is gone"))),
     }
 }
 
@@ -672,6 +682,9 @@ enum Prepared {
     Ended(Box<MergeItem>),
     /// Rebased and in scope, the item is `gating`: the gates come next, then `conclude`.
     Gates(Box<MergeJob>),
+    /// As `Gates`, but the verification already passed them on this very commit: `conclude` takes
+    /// these results (the verification's, for the merge-stage gates) and no gate runs.
+    Reused(Box<MergeJob>, Vec<GateResult>),
 }
 
 impl Prepared {
@@ -726,8 +739,20 @@ fn prepare(ctx: &Ctx, item: &MergeItem) -> Result<Prepared, AppError> {
     let main_head = vcs
         .head(&ctx.root)
         .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
+    // Only read when the option is on, so with it off `prepare` does exactly what it always did.
+    let head_before = if ctx.config.merge.reuse_verification {
+        vcs.head(&wt).ok()
+    } else {
+        None
+    };
+    // The branch head after a rebase that changed nothing (the branch already sat on `default_branch`).
+    // A rebase that moves the branch replays its commits under new ids, so equal heads mean no-op.
+    let mut unchanged_head: Option<String> = None;
     match vcs.rebase(&wt, &default_branch) {
         Ok(RebaseOutcome::Clean { head }) => {
+            if head_before.as_deref() == Some(head.as_str()) {
+                unchanged_head = Some(head.clone());
+            }
             set(
                 ctx,
                 item.id,
@@ -815,11 +840,59 @@ fn prepare(ctx: &Ctx, item: &MergeItem) -> Result<Prepared, AppError> {
             ..MergePatch::default()
         },
     )?;
-    Ok(Prepared::Gates(Box::new(MergeJob {
+    let job = Box::new(MergeJob {
         item: item.clone(),
         run,
         wt,
-    })))
+    });
+    // 3b. the verification may have gated this very tree already
+    if let Some(head) = unchanged_head {
+        if let Some(results) = verified_gate_results(ctx, item, &head)? {
+            ctx.store.append_event(&NewEvent {
+                kind: GATES_REUSED.into(),
+                issue_id: Some(item.issue_id.clone()),
+                run_id: item.run_id.clone(),
+                actor: Some(LANE_ORCHESTRATOR.into()),
+                payload: serde_json::json!({
+                    "merge_id": item.id,
+                    "attempt": item.attempts + 1,
+                    "head": head,
+                    "gates": results.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                }),
+            })?;
+            return Ok(Prepared::Reused(job, results));
+        }
+    }
+    Ok(Prepared::Gates(job))
+}
+
+/// The results the merge-stage gates of `item` can take over from its run's verification: `Some` only
+/// when the newest verification of the run passed on exactly `head` and every merge-stage gate has a
+/// green result of the same name in it. A merge-stage gate the verification did not run (its `when`
+/// leaves out `verify`), or a stage with no gates at all, runs as usual.
+fn verified_gate_results(
+    ctx: &Ctx,
+    item: &MergeItem,
+    head: &str,
+) -> Result<Option<Vec<GateResult>>, AppError> {
+    let Some(run_id) = &item.run_id else {
+        return Ok(None);
+    };
+    let Some(verified) = ctx.store.last_run_event(run_id, RUN_VERIFIED)? else {
+        return Ok(None);
+    };
+    if verified.payload["head"].as_str() != Some(head) {
+        return Ok(None);
+    }
+    let Ok(passed) = serde_json::from_value::<Vec<GateResult>>(verified.payload["gates"].clone()) else {
+        return Ok(None);
+    };
+    let specs = gate_specs(ctx, GateWhen::Merge);
+    let reused: Vec<GateResult> = specs
+        .iter()
+        .filter_map(|s| passed.iter().find(|r| r.name == s.name && r.ok).cloned())
+        .collect();
+    Ok((!specs.is_empty() && reused.len() == specs.len()).then_some(reused))
 }
 
 /// The part of `process` after the gates: the gates' verdict, then the review (if one is wanted) and

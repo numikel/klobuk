@@ -21,11 +21,20 @@ fn entry<'a>(rows: &'a [Value], key: &str) -> &'a Value {
 }
 
 #[test]
-fn show_lists_the_twenty_editable_keys_with_current_values() {
+fn show_lists_the_twenty_one_editable_keys_with_current_values() {
     let r = Repo::initialised();
     let res = r.ok(&["config", "show"]);
     let rows = res.as_array().unwrap_or_else(|| panic!("{res}"));
-    assert_eq!(rows.len(), 20, "{res}");
+    assert_eq!(rows.len(), 21, "{res}");
+    assert_eq!(entry(rows, "merge.reuse_verification")["value"], true);
+    assert_eq!(entry(rows, "merge.verify_main_after")["value"], false);
+    for key in ["merge.verify_main_after", "merge.reuse_verification"] {
+        let description = entry(rows, key)["description"].as_str().unwrap();
+        assert!(
+            description.contains("one more full gate run"),
+            "{key}: {description}"
+        );
+    }
     assert_eq!(entry(rows, "gate.max_rounds")["value"], 2);
     assert_eq!(entry(rows, "gate.slow_tests")["value"], Value::Null);
     assert_eq!(entry(rows, "gate.slow_after_s")["value"], Value::Null);
@@ -124,6 +133,7 @@ fn every_key_a_serve_tick_reloads_says_so_and_never_hints_at_a_restart() {
         ("review.max_rounds", "3"),
         ("scheduler.max_parallel", "2"),
         ("merge.verify_main_after", "true"),
+        ("merge.reuse_verification", "false"),
         ("merge.clean_after", "[\"worktree\", \"branch\"]"),
         ("worker.remote_control", "true"),
         ("notify.on_new", "false"),

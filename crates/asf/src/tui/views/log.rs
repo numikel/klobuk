@@ -15,11 +15,14 @@ use ratatui::Frame;
 
 use asf_core::{Event, IssueId, IssueType, MergeItem};
 
+use crate::commands::merge::GATES_REUSED;
 use crate::tui::app::{Action, View};
 use crate::tui::bindings::{b, Binding, Group, Slot, HELP_MOVE, HELP_OPEN, NORMAL};
 use crate::tui::snapshot::{move_selection, offset_of, parse_time, text_width, trunc, Snapshot};
 use crate::tui::theme::{Mark, Theme};
 use crate::tui::views::agents;
+use crate::tui::views::queue::GATES_REUSED_TEXT;
+use crate::worker::RUN_VERIFIED;
 
 /// The sentence of an empty log.
 pub const EMPTY: &str = "Nothing has happened yet. Events appear here as the factory works.";
@@ -274,6 +277,25 @@ fn merge_to(e: &Event, merge_id: i64) -> Option<&str> {
         .flatten()
 }
 
+/// The `merge.gates_reused` event of the attempt whose `gating` move is `snap.events[idx]`. The list is
+/// newest first and the queue appends it right after that move, so it is among the newer events, before
+/// the item's next `gating` move.
+fn newer_reuse(snap: &Snapshot, idx: usize, merge_id: i64) -> Option<&Event> {
+    for e in snap.events[..idx].iter().rev() {
+        if merge_to(e, merge_id) == Some("gating") {
+            return None;
+        }
+        if e.kind == GATES_REUSED && count(e, "merge_id") == Some(merge_id) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+fn reused_after(snap: &Snapshot, idx: usize, merge_id: i64) -> bool {
+    newer_reuse(snap, idx, merge_id).is_some()
+}
+
 /// How the gates after the rebase ended, for the `gating` event at `idx`. The newest attempt reads the
 /// results of the merge item; an earlier attempt reads what the item did next (the item only keeps
 /// the last attempt, so the names of an older one are gone).
@@ -340,6 +362,13 @@ fn merge_state(snap: &Snapshot, idx: usize, e: &Event) -> Option<Said> {
     let item = find_merge(snap, merge_id);
     let reason = item.and_then(|m| m.last_error.as_deref()).and_then(first_line);
     match text(e, "to")? {
+        // the gates of this attempt were not run: the verification had passed them on this commit
+        "gating" if reused_after(snap, idx, merge_id) => {
+            let head = newer_reuse(snap, idx, merge_id)
+                .and_then(|e| text(e, "head"))
+                .map(|h| h.chars().take(7).collect::<String>());
+            said(Sym::Done, GATES_REUSED_TEXT, &[head])
+        }
         // rebasing is folded into the gate line that follows it
         "gating" => match gates_after(snap, idx, merge_id) {
             Gates::Passed(names) => {
@@ -616,6 +645,8 @@ fn describe(snap: &Snapshot, idx: usize) -> Option<Said> {
             said(Sym::Needs, head, &[])
         }
         "store.imported" => said(Sym::Waiting, "store imported from the JSONL export", &[]),
+        // the gating line says it, and `run verified` is the verification's own line
+        GATES_REUSED | RUN_VERIFIED => None,
         kind => {
             let payload = compact(&e.payload);
             let head = if payload.is_empty() {

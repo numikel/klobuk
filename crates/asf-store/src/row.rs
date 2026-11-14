@@ -156,6 +156,27 @@ pub(crate) fn events_since(c: &Connection, seq: u64, limit: usize) -> Result<Vec
     rows.collect::<Result<Vec<_>, _>>().map_err(backend)
 }
 
+pub(crate) fn last_run_event(c: &Connection, run_id: &str, kind: &str) -> Result<Option<Event>, StoreError> {
+    c.query_row(
+        "SELECT seq, ts, kind, issue_id, run_id, actor, payload FROM events \
+         WHERE run_id = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1",
+        params![run_id, kind],
+        |r| {
+            Ok(Event {
+                seq: r.get::<_, i64>(0)? as u64,
+                ts: r.get(1)?,
+                kind: r.get(2)?,
+                issue_id: opt_id_col(r, 3)?,
+                run_id: r.get(4)?,
+                actor: r.get(5)?,
+                payload: json_col(r, 6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(backend)
+}
+
 pub(crate) const CLAIM_COLS: &str = "issue_id, worker, run_id, worktree, branch, claimed_at, note";
 
 pub(crate) fn claim(row: &Row<'_>) -> rusqlite::Result<Claim> {

@@ -103,6 +103,8 @@ pub trait IssueStore: Send + Sync {
 
     fn append_event(&self, e: &NewEvent) -> Result<u64, StoreError>;
     fn events_since(&self, seq: u64, limit: usize) -> Result<Vec<Event>, StoreError>;
+    /// The newest event of `kind` that belongs to run `run_id`, if there is one.
+    fn last_run_event(&self, run_id: &str, kind: &str) -> Result<Option<Event>, StoreError>;
 
     fn export_jsonl(&self, w: &mut dyn Write, o: &ExportOpts) -> Result<(), StoreError>;
     fn import_jsonl(&self, r: &mut dyn BufRead, m: ImportMode) -> Result<ImportReport, StoreError>;

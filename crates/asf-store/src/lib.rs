@@ -731,6 +731,10 @@ impl IssueStore for SqliteStore {
         self.read(|c| row::events_since(c, seq, limit))
     }
 
+    fn last_run_event(&self, run_id: &str, kind: &str) -> Result<Option<Event>, StoreError> {
+        self.read(|c| row::last_run_event(c, run_id, kind))
+    }
+
     fn export_jsonl(&self, w: &mut dyn Write, o: &ExportOpts) -> Result<(), StoreError> {
         jsonl::export(self, w, o)
     }
