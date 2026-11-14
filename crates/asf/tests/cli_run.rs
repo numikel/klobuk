@@ -956,6 +956,34 @@ fn start_reports_a_kickoff_line_that_is_not_on_the_pane_as_the_reason_for_no_key
 }
 
 #[test]
+fn start_presses_the_submit_key_when_the_input_box_wrapped_the_kickoff_line() {
+    // asf-164 suspect: the input box breaks the typed line mid-word and draws its border between the
+    // halves, so the line is never found as one string; only the dense match (no whitespace, no
+    // box-drawing characters) still sees it. The raw echo is scrolled out of the 60 lines read.
+    let f = setup();
+    let id = &f.issue;
+    let kick = format!("Start {id}: read .factory/runs/{id}/brief.md and follow it.");
+    // inside the first 40 characters that the probe compares, else the first half alone would match
+    let cut = kick.find("factory").unwrap() + 3;
+    let (head, tail) = kick.split_at(cut);
+    let box_screen = format!(
+        "{}\n╭{}╮\n│ > {head}{}│\n│   {tail}{}│\n╰{}╯",
+        "output line\n".repeat(60).trim_end(),
+        "─".repeat(70),
+        " ".repeat(70 - 4 - head.len()),
+        " ".repeat(70 - 4 - tail.len()),
+        "─".repeat(70),
+    );
+    fake(&f)
+        .script(serde_json::json!({ "prompt": [{"error": "stalled"}], "screen": box_screen }))
+        .unwrap();
+    let res = f.repo.ok(&["run", "start", &f.issue]);
+    assert_eq!(res["run"]["state"], "working", "{res}");
+    assert_eq!(enters(&f), 1, "the wrapped kick-off line is still found");
+    assert!(no_blocker(&f));
+}
+
+#[test]
 fn start_reports_an_agent_that_is_not_idle_as_the_reason_for_no_key() {
     let f = setup();
     fake(&f)
