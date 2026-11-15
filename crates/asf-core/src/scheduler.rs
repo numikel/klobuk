@@ -1004,5 +1004,45 @@ mod tests {
             let p2 = plan(&input(&issues, &[], &[], &tracked, max, &[]), ".worktrees").unwrap();
             prop_assert_eq!(p, p2);
         }
+
+        /// Second guard behind `dep add` demotion: whatever the stored status says, an issue with a
+        /// dependency that is not `done` never gets a slot, and a ready one is deferred as `DepsOpen`.
+        #[test]
+        fn no_slot_for_an_issue_with_an_open_dependency(
+            statuses in proptest::collection::vec(
+                prop_oneof![
+                    Just(Status::Backlog), Just(Status::Ready), Just(Status::InProgress), Just(Status::Blocked),
+                    Just(Status::InReview), Just(Status::Validating), Just(Status::Done), Just(Status::Cancelled)
+                ],
+                2..8,
+            ),
+            edges in proptest::collection::vec((0usize..8, 0usize..8), 0..14),
+            max in 1usize..5,
+        ) {
+            let n = statuses.len();
+            let issues: Vec<Issue> = statuses.iter().enumerate()
+                .map(|(i, s)| mk(&format!("asf-{}", i + 1), *s, &[&format!("f{i}.rs")]))
+                .collect();
+            let tracked: Vec<String> = (0..n).map(|i| format!("f{i}.rs")).collect();
+            // an edge always points at a lower index, so the graph stays acyclic
+            let deps: Vec<Dep> = edges.iter()
+                .map(|&(a, b)| (a % n, b % n))
+                .filter(|(a, b)| a > b)
+                .map(|(a, b)| dep(&format!("asf-{}", a + 1), &format!("asf-{}", b + 1)))
+                .collect();
+            let p = plan(&input(&issues, &deps, &[], &tracked, max, &[]), ".worktrees").unwrap();
+            let open = |who: &IssueId| deps.iter().any(|d| {
+                &d.issue_id == who && issues.iter().any(|i| i.id == d.depends_on && i.status != Status::Done)
+            });
+            for s in &p.slots {
+                prop_assert!(!open(&s.issue), "{} was planned with an open dependency", s.issue);
+            }
+            for i in issues.iter().filter(|i| i.status == Status::Ready && open(&i.id)) {
+                prop_assert!(
+                    p.deferred.iter().any(|d| d.issue == i.id && matches!(d.reason, DeferReason::DepsOpen(_))),
+                    "{} should be deferred as DepsOpen", i.id
+                );
+            }
+        }
     }
 }

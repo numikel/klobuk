@@ -435,6 +435,33 @@ impl IssueStore for SqliteStore {
                 tx,
                 &event("dep.added", issue, None, serde_json::json!({ "on": on.as_str() })),
             )?;
+            // a ready issue must not wait on open work: send it back so no tick can dispatch it
+            let on_open = issues.iter().any(|i| &i.id == on && i.status != Status::Done);
+            if on_open && issues.iter().any(|i| &i.id == issue && i.status == Status::Ready) {
+                let mut waits_for: Vec<&str> = Vec::new();
+                for d in deps.iter().filter(|d| &d.issue_id == issue) {
+                    let open = issues
+                        .iter()
+                        .any(|i| i.id == d.depends_on && i.status != Status::Done);
+                    if open && !waits_for.contains(&d.depends_on.as_str()) {
+                        waits_for.push(d.depends_on.as_str());
+                    }
+                }
+                tx.execute(
+                    "UPDATE issues SET status='backlog', updated_at=?2 WHERE id=?1 AND status='ready'",
+                    params![issue.as_str(), now_rfc3339()],
+                )
+                .map_err(backend)?;
+                append_event_tx(
+                    tx,
+                    &event(
+                        "issue.demoted",
+                        issue,
+                        None,
+                        serde_json::json!({ "from": "ready", "to": "backlog", "waits_for": waits_for }),
+                    ),
+                )?;
+            }
             Ok(())
         })
     }

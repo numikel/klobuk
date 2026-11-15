@@ -289,13 +289,35 @@ fn set_status(ctx: &Ctx, id: &IssueId, status: Status) -> Result<Rendered, AppEr
 fn dep(ctx: &Ctx, cmd: &DepCmd) -> Result<Rendered, AppError> {
     match cmd {
         DepCmd::Add { id, on } => {
+            let before = ctx.store.get_issue(id)?.map(|i| i.status);
             ctx.store.add_dep(id, on)?;
+            let mut text = format!("{id} depends on {on}");
+            // the store demotes a ready issue that now waits on open work; say so and why
+            if before == Some(Status::Ready)
+                && ctx.store.get_issue(id)?.map(|i| i.status) == Some(Status::Backlog)
+            {
+                let waits: Vec<String> = ctx
+                    .store
+                    .deps()?
+                    .into_iter()
+                    .filter(|d| &d.issue_id == id)
+                    .filter(|d| {
+                        ctx.store
+                            .get_issue(&d.depends_on)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|i| i.status != Status::Done)
+                    })
+                    .map(|d| d.depends_on.to_string())
+                    .collect();
+                text.push_str(&format!("\n{id} -> backlog (waits for {})", waits.join(", ")));
+            }
             Rendered::new(
                 &Dep {
                     issue_id: id.clone(),
                     depends_on: on.clone(),
                 },
-                format!("{id} depends on {on}"),
+                text,
             )
         }
         DepCmd::Rm { id, on } => {

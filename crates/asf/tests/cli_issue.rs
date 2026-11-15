@@ -204,6 +204,109 @@ fn deps_add_rm_cycle_and_ready_promotion() {
     assert_eq!(ecode, "not_found");
 }
 
+fn status_of(r: &Repo, id: &str) -> String {
+    r.ok(&["issue", "show", id])["issue"]["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn demoted_events(r: &Repo) -> Vec<asf_core::Event> {
+    use asf_core::IssueStore;
+    asf_store::SqliteStore::open(&r.path().join(".factory/factory.db"))
+        .unwrap()
+        .events_since(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "issue.demoted")
+        .collect()
+}
+
+#[test]
+fn dep_add_on_a_ready_issue_with_an_open_dep_demotes_it_to_backlog() {
+    let r = Repo::initialised();
+    let blocker = r.create_issue("blocker", &[]);
+    let waiter = r.create_issue("waiter", &["--ready"]);
+    assert_eq!(status_of(&r, &waiter), "ready");
+
+    let out = r
+        .asf()
+        .args(["issue", "dep", "add", &waiter, &blocker])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&format!("{waiter} depends on {blocker}")), "{text}");
+    assert!(
+        text.contains(&format!("{waiter} -> backlog (waits for {blocker})")),
+        "{text}"
+    );
+
+    assert_eq!(status_of(&r, &waiter), "backlog");
+    assert_eq!(r.ok(&["issue", "list", "--ready"]), serde_json::json!([]));
+    let ev = demoted_events(&r);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].issue_id.as_ref().unwrap().to_string(), waiter);
+    assert_eq!(ev[0].payload["from"], "ready");
+    assert_eq!(ev[0].payload["to"], "backlog");
+    assert_eq!(ev[0].payload["waits_for"], serde_json::json!([blocker]));
+
+    // re-adding the same dependency changes nothing and prints no second demotion line
+    let again = r
+        .asf()
+        .args(["issue", "dep", "add", &waiter, &blocker])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&again.stdout).contains("backlog"));
+    assert_eq!(demoted_events(&r).len(), 1);
+
+    // once the dependency is done the issue is promoted again on the next tick
+    r.ok(&["issue", "status", &blocker, "done"]);
+    assert_eq!(r.ok(&["issue", "ready"]), serde_json::json!([waiter]));
+}
+
+#[test]
+fn dep_add_keeps_a_ready_issue_ready_when_the_dep_is_done_and_leaves_other_states_alone() {
+    let r = Repo::initialised();
+    let done = r.create_issue("done", &[]);
+    r.ok(&["issue", "status", &done, "done"]);
+    let ready = r.create_issue("ready", &["--ready"]);
+    let out = r
+        .asf()
+        .args(["issue", "dep", "add", &ready, &done])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("backlog"));
+    assert_eq!(status_of(&r, &ready), "ready");
+
+    // only `ready` is demoted: a backlog issue stays backlog, an in-progress one keeps its status
+    let open = r.create_issue("open", &[]);
+    let backlog = r.create_issue("backlog", &[]);
+    let busy = r.create_issue("busy", &[]);
+    r.ok(&["issue", "status", &busy, "in-progress"]);
+    r.ok(&["issue", "dep", "add", &backlog, &open]);
+    r.ok(&["issue", "dep", "add", &busy, &open]);
+    assert_eq!(status_of(&r, &backlog), "backlog");
+    assert_eq!(status_of(&r, &busy), "in-progress");
+    assert!(demoted_events(&r).is_empty());
+}
+
+#[test]
+fn dep_add_demotion_lists_every_open_dependency() {
+    let r = Repo::initialised();
+    let a = r.create_issue("a", &[]);
+    let b = r.create_issue("b", &[]);
+    let w = r.create_issue("w", &[]);
+    r.ok(&["issue", "dep", "add", &w, &a]); // w stays backlog, it was never ready
+    r.ok(&["issue", "status", &w, "ready"]);
+    let out = r.asf().args(["issue", "dep", "add", &w, &b]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("{w} -> backlog (waits for {a}, {b})")),
+        "{text}"
+    );
+}
+
 // ---- `asf issue finish` guard -----------------------------------------------------------------
 
 fn report_file(r: &Repo, name: &str) -> String {
