@@ -3154,9 +3154,11 @@ mod gate_slot_tests {
         })
     }
 
-    /// Polls the slot until its run is over (15 s at most).
+    /// Polls the slot until its run is over. The limit is generous on purpose: each gate starts a
+    /// `python` process, and a merge queue gate run executes the whole suite on a loaded machine
+    /// (15 s was not enough there, asf-167); a broken slot still fails, only later.
     fn wait(slot: &mut GateSlot) -> Finished {
-        let until = Instant::now() + Duration::from_secs(15);
+        let until = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(f) = slot.take_finished() {
                 return f;
