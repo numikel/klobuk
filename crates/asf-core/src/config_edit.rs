@@ -62,6 +62,10 @@ const EDITABLE: &[(&str, &str)] = &[
         "worker and reviewer sessions join Remote Control (claude.ai/code, mobile app)",
     ),
     (
+        "worker.self_test",
+        "what a worker runs before `finish`: targeted (the fast gates and only the tests of what it changed) or full (every gate); verification runs the full gates right after `finish` either way",
+    ),
+    (
         "serve.interval_s",
         "seconds between ticks of `asf serve` (the --interval flag overrides it)",
     ),
@@ -155,6 +159,9 @@ const APPLIES: &[(&str, Applies)] = &[
     ("merge.reuse_verification", Applies::NextTick),
     ("merge.clean_after", Applies::NextTick),
     ("worker.remote_control", Applies::NextTick),
+    // `write_brief_files` reads it from the refreshed `ctx.config` when a worker is dispatched; a brief
+    // already written keeps the wording it was given
+    ("worker.self_test", Applies::NextTick),
     // `serve::serve_loop` takes both from the refreshed config every tick, unless a flag sets them
     ("serve.interval_s", Applies::NextTick),
     ("serve.max_ticks", Applies::NextTick),
@@ -381,6 +388,13 @@ const FIELDS: &[ConfigField] = &[
         group: ConfigGroup::Flow,
         kind: FieldKind::Bool,
         help: "sessions show up in claude.ai/code and mobile app",
+    },
+    ConfigField {
+        key: "worker.self_test",
+        label: "Worker self-test",
+        group: ConfigGroup::Flow,
+        kind: FieldKind::Choice(&["targeted", "full"]),
+        help: "fast gates + own tests, or every gate",
     },
     ConfigField {
         key: "serve.interval_s",

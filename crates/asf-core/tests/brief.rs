@@ -1,4 +1,5 @@
 use asf_core::brief::{parse_verdict, render_brief, render_review_brief, BriefInput, ReviewInput, Verdict};
+use asf_core::config::{GateCfg, GateWhen, SelfTest};
 use asf_core::model::*;
 
 fn issue() -> Issue {
@@ -31,7 +32,37 @@ fn issue() -> Issue {
     }
 }
 
-fn worker_brief() -> String {
+fn gate(name: &str, cmd: &[&str], when: &[GateWhen]) -> GateCfg {
+    GateCfg {
+        name: name.into(),
+        cmd: cmd.iter().map(|s| s.to_string()).collect(),
+        when: when.to_vec(),
+        ..GateCfg::default()
+    }
+}
+
+/// The dogfooding gates: format, lint, the whole test suite.
+fn cargo_gates() -> Vec<GateCfg> {
+    vec![
+        gate("fmt", &["cargo", "fmt", "--all", "--", "--check"], &GateWhen::ALL),
+        gate(
+            "clippy",
+            &[
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &GateWhen::ALL,
+        ),
+        gate("test", &["cargo", "test", "--workspace"], &GateWhen::ALL),
+    ]
+}
+
+fn brief_for(self_test: SelfTest, gates: &[GateCfg]) -> String {
     let me = issue();
     render_brief(&BriefInput {
         issue: &me,
@@ -43,7 +74,13 @@ fn worker_brief() -> String {
         report_path: ".factory/runs/asf-9/report.md",
         budget_usd: 5.0,
         asf_bin: "D:/bin/asf.exe",
+        self_test,
+        gates,
     })
+}
+
+fn worker_brief() -> String {
+    brief_for(SelfTest::default(), &cargo_gates())
 }
 
 fn review_brief() -> String {
@@ -70,6 +107,139 @@ fn protocol(b: &str) -> &str {
     let from = b.find("## Protocol").expect("protocol section");
     let to = b.find("## Finish ritual").expect("finish ritual section");
     &b[from..to]
+}
+
+// ---- worker.self_test ------------------------------------------------------------------------
+
+/// The "Self-check" bullet of the Protocol, up to the next bullet.
+fn self_check(b: &str) -> &str {
+    let p = protocol(b);
+    let from = p.find("- Self-check before `finish`").expect("self-check bullet");
+    let rest = &p[from..];
+    let to = rest[1..].find("\n- ").map_or(rest.len(), |n| n + 1);
+    &rest[..to]
+}
+
+#[test]
+fn targeted_is_the_default_self_test() {
+    assert_eq!(SelfTest::default(), SelfTest::Targeted);
+    assert_eq!(worker_brief(), brief_for(SelfTest::Targeted, &cargo_gates()));
+}
+
+#[test]
+fn targeted_brief_asks_for_fast_gates_and_the_tests_of_what_changed_only() {
+    let b = brief_for(SelfTest::Targeted, &cargo_gates());
+    let s = self_check(&b);
+    assert!(s.contains("(targeted)"), "{s}");
+    assert!(s.contains("fast gates"), "{s}");
+    assert!(s.contains("format, lint"), "{s}");
+    assert!(s.contains("only the tests that cover what you changed"), "{s}");
+    assert!(s.contains("the test files in your file scope"), "{s}");
+    assert!(s.contains("the package you touched"), "{s}");
+    assert!(s.contains("Do NOT run the full test suite"), "{s}");
+    assert!(
+        s.contains("verification runs the full gates right after `finish` and sends a failure back"),
+        "{s}"
+    );
+    assert!(!s.contains("run every gate"), "{s}");
+}
+
+#[test]
+fn full_brief_asks_for_every_configured_gate_before_finish() {
+    let b = brief_for(SelfTest::Full, &cargo_gates());
+    let s = self_check(&b);
+    assert!(s.contains("(full)"), "{s}");
+    assert!(s.contains("run every gate listed below before `finish`"), "{s}");
+    assert!(!s.contains("Do NOT run the full test suite"), "{s}");
+    assert!(!s.contains("fast gates"), "{s}");
+}
+
+#[test]
+fn the_two_values_differ_only_where_the_self_check_and_the_rerun_say_so() {
+    let t = brief_for(SelfTest::Targeted, &cargo_gates());
+    let f = brief_for(SelfTest::Full, &cargo_gates());
+    assert_ne!(t, f);
+    // everything outside the self-check bullet and the review-round line is shared
+    for needle in [
+        "## Acceptance criteria",
+        "## File scope",
+        "## Finish ritual",
+        "never force-push",
+    ] {
+        assert!(t.contains(needle) && f.contains(needle), "{needle}");
+    }
+    assert!(
+        f.contains("fix the findings test-first, run the gates, commit"),
+        "{f}"
+    );
+    assert!(
+        t.contains("fix the findings test-first, run the checks from the self-check bullet, commit"),
+        "{t}"
+    );
+}
+
+#[test]
+fn gate_commands_come_from_the_config_and_only_those_that_run_in_verification() {
+    let gates = vec![
+        gate(
+            "lint",
+            &["ruff", "check", "."],
+            &[GateWhen::Verify, GateWhen::Merge],
+        ),
+        gate("unit", &["pytest", "-q"], &[GateWhen::Verify]),
+        gate("e2e", &["playwright", "test"], &[GateWhen::Merge, GateWhen::Main]),
+    ];
+    for mode in [SelfTest::Targeted, SelfTest::Full] {
+        let b = brief_for(mode, &gates);
+        let s = self_check(&b);
+        assert!(s.contains("- `lint`: `ruff check .`"), "{s}");
+        assert!(s.contains("- `unit`: `pytest -q`"), "{s}");
+        assert!(
+            !s.contains("playwright"),
+            "a gate verification skips is not listed:\n{s}"
+        );
+        assert!(
+            !b.contains("cargo fmt"),
+            "no gate of another project leaks in:\n{b}"
+        );
+    }
+}
+
+#[test]
+fn the_wording_is_language_neutral() {
+    let gates = vec![gate("test", &["npm", "test"], &GateWhen::ALL)];
+    for mode in [SelfTest::Targeted, SelfTest::Full] {
+        let b = brief_for(mode, &gates);
+        let s = self_check(&b);
+        assert!(s.contains("`.factory/config.toml`"), "{s}");
+        for cargo in ["cargo test", "cargo fmt", "cargo clippy", "--workspace"] {
+            assert!(!s.contains(cargo), "{cargo} in the self-check:\n{s}");
+        }
+    }
+}
+
+#[test]
+fn no_gates_configured_is_said_instead_of_an_empty_list() {
+    for mode in [SelfTest::Targeted, SelfTest::Full] {
+        let s = brief_for(mode, &[]);
+        assert!(self_check(&s).contains("(no gates configured)"), "{s}");
+    }
+}
+
+#[test]
+fn both_modes_say_how_to_wait_for_the_workers_own_long_command() {
+    for mode in [SelfTest::Targeted, SelfTest::Full] {
+        let b = brief_for(mode, &cargo_gates());
+        let p = protocol(&b);
+        assert!(p.contains("run it in the foreground"), "{p}");
+        assert!(p.contains("wait for that one process"), "{p}");
+        assert!(p.contains("never poll for 'any cargo process'"), "{p}");
+        assert!(
+            p.contains("gates and other workers run the same tools at the same time"),
+            "{p}"
+        );
+        assert!(p.contains("permission prompt (PowerShell)"), "{p}");
+    }
 }
 
 #[test]

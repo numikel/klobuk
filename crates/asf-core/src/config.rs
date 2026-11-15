@@ -80,6 +80,18 @@ impl Default for UiCfg {
     }
 }
 
+/// How much a worker tests on its own before `asf issue finish` (`[worker] self_test`). Verification
+/// runs the full gates right after `finish` either way, so this only decides who pays for the first run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelfTest {
+    /// The fast gates (format, lint) and only the tests that cover what the worker changed.
+    #[default]
+    Targeted,
+    /// Every gate that verification runs, before `finish`.
+    Full,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerCfg {
@@ -103,6 +115,8 @@ pub struct WorkerCfg {
     /// Start worker and reviewer sessions with `claude --remote-control <session name>`, so they show
     /// up in claude.ai/code and the mobile app. Planner calls (headless `claude -p`) are not affected.
     pub remote_control: bool,
+    /// What the brief tells the worker to run before `finish`: see [`SelfTest`].
+    pub self_test: SelfTest,
     pub start_timeout_ms: u64,
     pub prompt_timeout_ms: u64,
     pub heartbeat_s: u64,
@@ -130,6 +144,7 @@ impl Default for WorkerCfg {
             auto_trust: true,
             pre_trust: false,
             remote_control: false,
+            self_test: SelfTest::default(),
             start_timeout_ms: 90_000,
             prompt_timeout_ms: 15_000,
             heartbeat_s: 30,
@@ -428,6 +443,7 @@ permission_mode = "auto"  # auto | acceptEdits | dontAsk | bypassPermissions (de
 auto_trust = true         # answer Claude's trust dialog for worktrees of this repo
 pre_trust = false         # write hasTrustDialogAccepted into ~/.claude.json before launch
 # remote_control = false  # true: worker and reviewer sessions join Remote Control (claude.ai/code, mobile app)
+self_test = "targeted"    # targeted | full: what the worker runs before `finish`. targeted: the fast gates (format, lint) and only the tests of what it changed; full: every gate. Verification runs the full gates right after `finish` either way
 
 # Gates run in the worktree before merge, in order; first failure stops.
 # [[gate]]

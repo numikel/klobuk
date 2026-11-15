@@ -51,6 +51,12 @@ fn show_lists_every_editable_key_with_current_values() {
         "{res}"
     );
     assert_eq!(entry(rows, "worker.remote_control")["value"], false);
+    assert_eq!(entry(rows, "worker.self_test")["value"], "targeted");
+    let described = entry(rows, "worker.self_test")["description"].as_str().unwrap();
+    assert!(
+        described.contains("targeted") && described.contains("full") && described.contains("verification"),
+        "{described}"
+    );
     assert_eq!(entry(rows, "notify.on_new")["value"], true);
     assert_eq!(entry(rows, "notify.after_minutes")["value"], 15);
     assert_eq!(entry(rows, "notify.every_minutes")["value"], 30);
@@ -141,6 +147,7 @@ fn every_key_a_serve_tick_reloads_says_so_and_never_hints_at_a_restart() {
         ("merge.reuse_verification", "false"),
         ("merge.clean_after", "[\"worktree\", \"branch\"]"),
         ("worker.remote_control", "true"),
+        ("worker.self_test", "full"),
         ("notify.on_new", "false"),
         ("notify.after_minutes", "10"),
         ("notify.every_minutes", "0"),
@@ -148,6 +155,25 @@ fn every_key_a_serve_tick_reloads_says_so_and_never_hints_at_a_restart() {
         let res = r.ok(&["config", "set", key, value]);
         assert_eq!(res["note"], NEXT_TICK, "{key}: {res}");
     }
+}
+
+#[test]
+fn self_test_takes_targeted_and_full_and_refuses_anything_else_without_touching_the_file() {
+    let r = Repo::initialised();
+    let res = r.ok(&["config", "set", "worker.self_test", "full"]);
+    assert_eq!(
+        (res["old"].as_str(), res["new"].as_str()),
+        (Some("targeted"), Some("full"))
+    );
+    let res = r.ok(&["config", "set", "worker.self_test", "targeted"]);
+    assert_eq!(
+        (res["old"].as_str(), res["new"].as_str()),
+        (Some("full"), Some("targeted"))
+    );
+    let before = config_bytes(&r);
+    let (code, _, _) = r.err(&["config", "set", "worker.self_test", "everything"]);
+    assert_ne!(code, 0);
+    assert_eq!(config_bytes(&r), before, "a refused value writes nothing");
 }
 
 #[test]

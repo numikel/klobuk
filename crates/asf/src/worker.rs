@@ -825,6 +825,8 @@ impl<'a> Worker<'a> {
             report_path: &report_rel,
             budget_usd: run.budget_usd.unwrap_or(0.0),
             asf_bin: &asf_bin,
+            self_test: self.ctx.config.worker.self_test,
+            gates: &self.ctx.config.gates,
         });
         std::fs::write(runs_dir.join("brief.md"), brief)?;
         let w = &self.ctx.config.worker;

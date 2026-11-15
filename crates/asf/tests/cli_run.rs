@@ -228,6 +228,42 @@ fn start_adds_remote_control_with_the_session_name_when_the_worker_switch_is_on(
     );
 }
 
+/// The brief a started run leaves in its worktree.
+fn written_brief(f: &F) -> String {
+    let path = wt(f).join(".factory/runs").join(&f.issue).join("brief.md");
+    std::fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn start_writes_a_targeted_self_check_by_default_with_the_gates_of_the_config() {
+    let f = setup();
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("self_test = \"targeted\""), "{s}");
+    s.push_str("\n[[gate]]\nname = \"lint\"\ncmd = [\"ruff\", \"check\", \".\"]\n");
+    std::fs::write(&cfg, s).unwrap();
+    f.repo.ok(&["run", "start", &f.issue]);
+    let brief = written_brief(&f);
+    assert!(brief.contains("Self-check before `finish` (targeted)"), "{brief}");
+    assert!(brief.contains("Do NOT run the full test suite"), "{brief}");
+    assert!(brief.contains("- `lint`: `ruff check .`"), "{brief}");
+}
+
+#[test]
+fn start_writes_the_full_self_check_when_the_worker_option_says_full() {
+    let f = setup();
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let out = f.repo.ok(&["config", "set", "worker.self_test", "full"]);
+    assert_eq!(out["new"], "full", "{out}");
+    assert!(std::fs::read_to_string(&cfg)
+        .unwrap()
+        .contains("self_test = \"full\""));
+    f.repo.ok(&["run", "start", &f.issue]);
+    let brief = written_brief(&f);
+    assert!(brief.contains("Self-check before `finish` (full)"), "{brief}");
+    assert!(!brief.contains("Do NOT run the full test suite"), "{brief}");
+}
+
 #[test]
 fn start_twice_is_conflict_and_touches_nothing() {
     let f = setup();

@@ -1,6 +1,7 @@
-use asf_core::config::{CleanKind, GateWhen};
+use asf_core::config::{CleanKind, GateWhen, SelfTest};
 use asf_core::config_edit::{
-    applies, apply_note, editable_keys, fields, lookup, set_key, unset_key, Applies, ConfigGroup, FieldKind,
+    applies, apply_note, editable_keys, fields, lookup, set_key, unset_key, unsettable_keys, Applies,
+    ConfigGroup, FieldKind,
 };
 use asf_core::{Config, ConfigError};
 
@@ -218,6 +219,7 @@ fn fields_carry_the_labels_and_groups_of_the_view() {
         ),
         ("merge.clean_after", "Clean up after merge", ConfigGroup::Flow),
         ("worker.remote_control", "Remote control", ConfigGroup::Flow),
+        ("worker.self_test", "Worker self-test", ConfigGroup::Flow),
         ("serve.interval_s", "Loop interval (s)", ConfigGroup::Flow),
         ("serve.max_ticks", "Loop tick limit", ConfigGroup::Flow),
         ("gate.slow_tests", "Slow tests to stop", ConfigGroup::Flow),
@@ -251,6 +253,10 @@ fn field_kinds_are_choice_bool_number_or_text() {
         );
     }
     assert_eq!(get("merge.target").kind, FieldKind::Choice(&["local", "github"]));
+    assert_eq!(
+        get("worker.self_test").kind,
+        FieldKind::Choice(&["targeted", "full"])
+    );
     assert_eq!(
         get("merge.clean_after").kind,
         FieldKind::Text,
@@ -311,6 +317,10 @@ fn field_defaults_are_read_from_config_default() {
         get("worker.remote_control").default_value().as_deref(),
         Some("false")
     );
+    assert_eq!(
+        get("worker.self_test").default_value().as_deref(),
+        Some("targeted")
+    );
     assert_eq!(get("serve.interval_s").default_value().as_deref(), Some("10"));
     assert_eq!(get("gate.max_rounds").default_value().as_deref(), Some("2"));
     // an optional key that is absent by default has no default value to write
@@ -351,6 +361,7 @@ fn every_editable_key_accepts_its_default_value() {
         ("merge.reuse_verification", "true"),
         ("merge.clean_after", "[\"worktree\", \"review_worktrees\"]"),
         ("worker.remote_control", "false"),
+        ("worker.self_test", "targeted"),
         ("notify.on_new", "true"),
         ("notify.after_minutes", "15"),
         ("notify.every_minutes", "30"),
@@ -505,6 +516,7 @@ fn a_key_the_serve_loop_reloads_says_it_applies_on_the_next_tick() {
         "merge.reuse_verification",
         "merge.clean_after",
         "worker.remote_control",
+        "worker.self_test",
         "gate.slow_tests",
         "gate.slow_after_s",
         "notify.on_new",
@@ -529,6 +541,58 @@ fn the_two_gate_run_keys_say_what_they_cost_and_when_they_save_it() {
     let reuse = describe("merge.reuse_verification");
     assert!(reuse.contains("one more full gate run"), "{reuse}");
     assert!(reuse.contains("rebase changed nothing"), "{reuse}");
+}
+
+#[test]
+fn self_test_defaults_to_targeted_parses_both_values_and_refuses_the_rest() {
+    assert_eq!(Config::default().worker.self_test, SelfTest::Targeted);
+    assert_eq!(
+        Config::from_toml("").unwrap().worker.self_test,
+        SelfTest::Targeted
+    );
+    for (text, want) in [("targeted", SelfTest::Targeted), ("full", SelfTest::Full)] {
+        let c = Config::from_toml(&format!("[worker]\nself_test = \"{text}\"\n")).unwrap();
+        assert_eq!(c.worker.self_test, want, "{text}");
+        assert_eq!(c.worker.permission_mode, "auto", "other worker defaults survive");
+    }
+    for bad in ["partial", "Full", ""] {
+        let e = Config::from_toml(&format!("[worker]\nself_test = \"{bad}\"\n")).unwrap_err();
+        assert!(
+            e.to_string().contains("self_test") || e.to_string().contains("variant"),
+            "{bad}: {e}"
+        );
+    }
+}
+
+#[test]
+fn self_test_is_set_through_the_editor_and_the_description_names_both_values() {
+    let out = set_key("", "worker.self_test", "full").unwrap();
+    assert_eq!(Config::from_toml(&out).unwrap().worker.self_test, SelfTest::Full);
+    let back = set_key(&out, "worker.self_test", "targeted").unwrap();
+    assert_eq!(
+        Config::from_toml(&back).unwrap().worker.self_test,
+        SelfTest::Targeted
+    );
+    assert!(set_key("", "worker.self_test", "everything").is_err());
+    let described = editable_keys()
+        .iter()
+        .find(|(k, _)| *k == "worker.self_test")
+        .unwrap()
+        .1;
+    for word in ["targeted", "full", "verification"] {
+        assert!(described.contains(word), "{described}");
+    }
+    assert!(
+        !unsettable_keys().contains(&"worker.self_test"),
+        "it has a default, so it is reset with set_key"
+    );
+}
+
+#[test]
+fn the_template_documents_self_test_and_still_parses() {
+    let t = Config::default_toml();
+    assert!(t.contains("self_test = \"targeted\""), "{t}");
+    assert_eq!(Config::from_toml(t).unwrap().worker.self_test, SelfTest::Targeted);
 }
 
 #[test]
