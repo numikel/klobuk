@@ -727,6 +727,49 @@ pub(crate) const SUBMIT_KEY: &str = "submit";
 const SUBMIT_WAIT: Duration = Duration::from_secs(5);
 const SUBMIT_POLL: Duration = Duration::from_millis(100);
 
+/// The longest reply `reply` types into a dialog, in characters.
+const TYPED_REPLY_MAX: usize = 300;
+
+/// The key Herdr's `send-keys` takes for one typed character: the character itself (punctuation and
+/// accented letters verified live), `space` for any blank.
+fn key_for_char(c: char) -> String {
+    if c.is_whitespace() {
+        "space".to_string()
+    } else {
+        c.to_string()
+    }
+}
+
+/// The option `plain` keys pick on the dialog shown: the digit's option, or the highlighted one for Enter.
+fn chosen_option(screen: &str, plain: &[String]) -> Option<Opt> {
+    let opts = options(screen);
+    plain.iter().find_map(|k| match k.as_str() {
+        "enter" => opts.iter().find(|o| o.cursor).cloned(),
+        digit => digit
+            .parse::<u32>()
+            .ok()
+            .and_then(|n| opts.iter().find(|o| o.n == n).cloned()),
+    })
+}
+
+/// The body of the ANSWER that settles a question answered in the pane. A multi-question dialog's
+/// answer is the review page (what each tab holds); the keys named are only the last ones, because the
+/// earlier tabs were answered by earlier calls (each left an FYI note). Without a readable review page it
+/// says exactly that instead of presenting the last keys as the whole answer.
+fn answer_text(review: Option<&str>, sent: &str, tabbed: bool) -> String {
+    let trail = review.map(review_trail).unwrap_or_default();
+    if !trail.is_empty() {
+        format!(
+            "answered in the worker pane: {} (last keys: {sent})",
+            trail.join("; ")
+        )
+    } else if tabbed {
+        format!("answered in the worker pane: last keys: {sent} (the answer of each tab is in its FYI note)")
+    } else {
+        format!("answered in the worker pane: sent {sent}")
+    }
+}
+
 /// One question tab of the tab row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Tab {
@@ -775,6 +818,53 @@ fn tab_row(screen: &str) -> Option<Vec<Tab>> {
                 .collect()
         })
     })
+}
+
+/// One numbered option of the dialog on the pane.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Opt {
+    pub n: u32,
+    pub text: String,
+    /// The selection cursor (`❯`) is on it: Enter would pick it.
+    pub cursor: bool,
+}
+
+fn parse_option(line: &str) -> Option<Opt> {
+    let l = line.trim_start();
+    let cursor = l.starts_with(['❯', '>']);
+    let l = l.trim_start_matches(['❯', '>']).trim_start();
+    let digits: String = l.chars().take_while(char::is_ascii_digit).collect();
+    let text = l[digits.len()..].strip_prefix(". ")?;
+    Some(Opt {
+        n: digits.parse().ok()?,
+        text: text.trim().to_string(),
+        cursor,
+    })
+}
+
+/// The options of the newest dialog on the pane: from its last `1.` line down (older dialogs and
+/// numbered prose higher up do not count), skipping the description lines in between.
+pub(crate) fn options(screen: &str) -> Vec<Opt> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(first) = lines
+        .iter()
+        .rposition(|l| parse_option(l).is_some_and(|o| o.n == 1))
+    else {
+        return Vec::new();
+    };
+    lines[first..].iter().filter_map(|l| parse_option(l)).collect()
+}
+
+/// The two options Claude Code adds to every question: they open a text box instead of answering.
+pub(crate) fn is_free_text(o: &Opt) -> bool {
+    o.text.starts_with("Type something") || o.text.starts_with("Chat about this")
+}
+
+/// The option a question's free-text field is: the one just above `Chat about this`. Its text is the
+/// placeholder `Type something.` until something is typed, so it cannot be found by that text alone.
+fn free_text_field(opts: &[Opt]) -> Option<&Opt> {
+    let chat = opts.iter().position(|o| o.text.starts_with("Chat about this"))?;
+    opts.get(chat.checked_sub(1)?)
 }
 
 /// True for the review page's first option (`❯ 1. Submit answers`).
@@ -1685,8 +1775,15 @@ impl<'a> Worker<'a> {
     /// A human reply typed to the worker. Besides sending the text it settles the wait the reply ends
     /// (see [`Worker::settle_answer`]); [`Worker::nudge`] sends text without that.
     pub fn reply(&self, id: &IssueId, text: &str) -> Result<Run, AppError> {
+        self.reply_with(id, text, SUBMIT_WAIT)
+    }
+
+    fn reply_with(&self, id: &IssueId, text: &str, wait: Duration) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
         let asked = self.newest_open_question(&run.issue_id)?;
+        if let Some(done) = self.reply_on_tab(&run, asked.as_ref(), text, wait)? {
+            return Ok(done);
+        }
         self.send_text(&run, text)?;
         self.settle_answer(&run, asked.as_ref(), text)?;
         self.unblock(&run)
@@ -1970,6 +2067,20 @@ impl<'a> Worker<'a> {
             let ks: Vec<&str> = plain.iter().map(String::as_str).collect();
             self.rt.send_keys(&h, &ks).map_err(rt_err)?;
         }
+        // Every tab's key is noted when it goes out: the final ANSWER only knows the last keys, and the
+        // review page may not parse (a reworded heading), so it cannot be the only record.
+        if let (DialogStep::Question { tabs, index, .. }, true) = (&step, answering) {
+            let sent = plain.join(" ");
+            let picked = chosen_option(&before, plain);
+            // The digit of a free-text option only puts the cursor in its field: no answer yet.
+            if !picked.as_ref().is_some_and(is_free_text) {
+                let what = match picked {
+                    Some(o) => format!("sent {sent} ({})", o.text),
+                    None => format!("sent {sent}"),
+                };
+                self.note_tab(&run, tabs, *index, &what)?;
+            }
+        }
         let mut review = matches!(step, DialogStep::Review { .. }).then_some(before);
         if submit {
             review = Some(self.submit_review(&h, SUBMIT_WAIT)?);
@@ -1982,14 +2093,88 @@ impl<'a> Worker<'a> {
                 .map(String::as_str)
                 .chain(submit.then_some("enter"))
                 .collect();
-            let mut how = format!("answered in the worker pane: sent {}", sent.join(" "));
-            for line in review.iter().flat_map(|screen| review_trail(screen)) {
-                how.push_str("; ");
-                how.push_str(&line);
-            }
+            let tabbed = submit || !matches!(step, DialogStep::Single);
+            let how = answer_text(review.as_deref(), &sent.join(" "), tabbed);
             self.settle_answer(&run, asked.as_ref(), &how)?;
         }
         self.unblock(&run)
+    }
+
+    /// An FYI note on the issue for one answered tab (`dialog tab 1 of 2 (First): sent 1 (A)`), so the
+    /// dossier shows what the human chose per tab, not only the last keys.
+    fn note_tab(&self, run: &Run, tabs: &[Tab], index: usize, what: &str) -> Result<(), AppError> {
+        let label = tabs.get(index).map_or("", |t| t.label.as_str());
+        self.ctx.store.add_comment(&NewComment {
+            issue_id: run.issue_id.clone(),
+            // not the human: the human's inbox lists every comment `human` wrote, so their own note
+            // would count as unread for them
+            author: LANE_ORCHESTRATOR.to_string(),
+            kind: CommentType::Fyi,
+            to_lane: run.issue_id.to_string(),
+            body: format!("dialog tab {} of {} ({label}): {what}", index + 1, tabs.len()),
+            reply_to: None,
+        })?;
+        Ok(())
+    }
+
+    /// A typed reply on a question tab of a multi-question dialog. `agent prompt` is refused while the
+    /// agent is blocked on a dialog, and the reply would end the wait with tab 2 and the review page
+    /// still open, so the text goes into the tab's own free-text option as keys instead: the option's
+    /// digit (unless the cursor is already on it, where a digit would be typed into the field), one key
+    /// per character, then Enter. A tab that is not the last stays open for the walk (the question is
+    /// not settled); the last one goes on to the Submit step like `keys ... submit` and settles the
+    /// question. `None` when the pane shows no such dialog: the plain reply applies.
+    fn reply_on_tab(
+        &self,
+        run: &Run,
+        asked: Option<&Comment>,
+        text: &str,
+        wait: Duration,
+    ) -> Result<Option<Run>, AppError> {
+        if !matches!(run.state, RunState::Blocked | RunState::Stalled) {
+            return Ok(None);
+        }
+        let Ok(h) = Self::handle(run) else {
+            return Ok(None);
+        };
+        let before = self.rt.read(&h, SCOPE_LIVE_LINES).unwrap_or_default();
+        let DialogStep::Question {
+            tabs,
+            index,
+            answered,
+        } = dialog_step(&before)
+        else {
+            return Ok(None);
+        };
+        let opts = options(&before);
+        let Some(field) = free_text_field(&opts) else {
+            return Err(AppError::conflict(
+                "this question has no free-text option to type into; answer it with `asf run keys`",
+            ));
+        };
+        // shortcut: one send-keys call carries the whole text, so a very long reply meets the command
+        // line limit; upgrade when replies of more than a paragraph are wanted (chunk the call).
+        if text.chars().count() > TYPED_REPLY_MAX {
+            return Err(AppError::conflict(format!(
+                "a reply typed into a dialog is at most {TYPED_REPLY_MAX} characters"
+            )));
+        }
+        let mut keys: Vec<String> = Vec::new();
+        if !field.cursor {
+            keys.push(field.n.to_string());
+        }
+        keys.extend(text.chars().map(key_for_char));
+        keys.push("enter".into());
+        let ks: Vec<&str> = keys.iter().map(String::as_str).collect();
+        self.rt.send_keys(&h, &ks).map_err(rt_err)?;
+        self.note_tab(run, &tabs, index, &format!("typed \"{text}\""))?;
+        if answered + 1 != tabs.len() {
+            return Ok(Some(run.clone()));
+        }
+        let review = self.submit_review(&h, wait)?;
+        let how = answer_text(Some(&review), "a typed reply, enter", true);
+        self.settle_answer(run, asked, &how)?;
+        self.unblock(run).map(Some)
     }
 
     /// Waits up to `wait` for the review page of a multi-question dialog, presses Enter on its first
@@ -3429,6 +3614,128 @@ mod tests {
         assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
     }
 
+    /// The FYI notes a dialog walk leaves, one per answered tab.
+    fn tab_notes(fx: &Fx) -> Vec<String> {
+        fx.ctx
+            .store
+            .comments(&fx.issue.id)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.kind == CommentType::Fyi)
+            .map(|c| c.body)
+            .collect()
+    }
+
+    #[test]
+    fn every_tab_answer_leaves_a_note_with_its_key_and_the_option_it_picked() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Which?");
+        show(&fx, TABS_FIRST);
+        worker(&fx).keys(&fx.issue.id, &["1".to_string()]).unwrap();
+        show(&fx, TABS_SECOND);
+        worker(&fx).keys(&fx.issue.id, &["enter".to_string()]).unwrap();
+        // a key that only moves the cursor is no answer
+        worker(&fx).keys(&fx.issue.id, &["down".to_string()]).unwrap();
+
+        assert_eq!(
+            tab_notes(&fx),
+            [
+                "dialog tab 1 of 2 (First): sent 1 (A)",
+                "dialog tab 2 of 2 (Second): sent enter (X)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typed_reply_on_a_tab_types_into_the_free_text_option_and_is_no_final_answer() {
+        let fx = fixture();
+        let run = run_in(&fx, RunState::Blocked);
+        let (blocker, q) = announce(&fx, "Which?");
+        show(&fx, TABS_FIRST);
+
+        let after = worker(&fx).reply(&fx.issue.id, "hi, there!").unwrap();
+
+        // option 3 is `Type something`; every character goes out as a key, Enter ends the answer
+        let typed = ["3", "h", "i", ",", "space", "t", "h", "e", "r", "e", "!", "enter"];
+        assert_eq!(keys_sent(&fx), [json!(typed)]);
+        assert_eq!(
+            after.state,
+            RunState::Blocked,
+            "tab 2 and the review page are still open"
+        );
+        assert_eq!(
+            fx.ctx.store.get_run(&run.id).unwrap().unwrap().state,
+            RunState::Blocked
+        );
+        assert_eq!(unread(&fx), [blocker.id, q.id]);
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
+        assert_eq!(
+            tab_notes(&fx),
+            ["dialog tab 1 of 2 (First): typed \"hi, there!\""]
+        );
+    }
+
+    #[test]
+    fn a_typed_reply_does_not_press_the_free_text_digit_when_the_cursor_is_already_there() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Which?");
+        // the human pressed 3 in the overlay: the cursor sits on the field, which still reads `Type something.`
+        show(
+            &fx,
+            &TABS_FIRST
+                .replace("❯ 1. A", "  1. A")
+                .replace("  3. Type", "❯ 3. Type"),
+        );
+
+        worker(&fx).reply(&fx.issue.id, "ok").unwrap();
+
+        assert_eq!(
+            keys_sent(&fx),
+            [json!(["o", "k", "enter"])],
+            "a second 3 would be typed into the field"
+        );
+    }
+
+    #[test]
+    fn a_typed_reply_on_the_last_tab_goes_on_to_the_submit_step() {
+        let fx = fixture();
+        let run = run_in(&fx, RunState::Blocked);
+        let (blocker, q) = announce(&fx, "Which?");
+        show(&fx, TABS_SECOND);
+
+        // the pane never reaches the review page here (the fake screen is static): no wait, an error
+        let err = worker(&fx)
+            .reply_with(&fx.issue.id, "why", Duration::ZERO)
+            .unwrap_err();
+
+        assert!(err.message.contains("did not show the review page"), "{err:?}");
+        assert_eq!(keys_sent(&fx), [json!(["3", "w", "h", "y", "enter"])]);
+        assert_eq!(
+            fx.ctx.store.get_run(&run.id).unwrap().unwrap().state,
+            RunState::Blocked
+        );
+        assert_eq!(
+            unread(&fx),
+            [blocker.id, q.id],
+            "nothing is settled before the Submit"
+        );
+    }
+
+    #[test]
+    fn a_reply_on_a_question_without_a_free_text_option_is_refused() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Which?");
+        show(&fx, "←  ☐ First  ☐ Second  ✔ Submit  →\nPick?\n❯ 1. A\n  2. B");
+
+        let err = worker(&fx).reply(&fx.issue.id, "x").unwrap_err();
+
+        assert!(err.message.contains("free-text"), "{err:?}");
+        assert!(keys_sent(&fx).is_empty());
+    }
+
     #[test]
     fn submit_presses_enter_on_the_review_page_and_answers_with_what_the_human_chose() {
         let fx = fixture();
@@ -3449,8 +3756,27 @@ mod tests {
             (
                 CommentType::Answer,
                 Some(q.id),
-                "answered in the worker pane: sent 2 enter; First: Pick A or B? → A; Second: Pick X or Y? → Y"
+                "answered in the worker pane: First: Pick A or B? → A; Second: Pick X or Y? → Y (last keys: 2 enter)"
             )
+        );
+    }
+
+    #[test]
+    fn without_a_review_block_the_answer_states_only_the_keys_it_really_sent() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Which?");
+        // the heading is reworded: no trail can be read, and "sent 2 enter" must not pose as every tab's key
+        show(&fx, &TABS_REVIEW.replace("Review your answers", "Your answers"));
+
+        worker(&fx)
+            .keys(&fx.issue.id, &["2".to_string(), SUBMIT_KEY.to_string()])
+            .unwrap();
+
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert_eq!(
+            answer.body,
+            "answered in the worker pane: last keys: 2 enter (the answer of each tab is in its FYI note)"
         );
     }
 
@@ -3468,7 +3794,7 @@ mod tests {
         assert!(
             answer
                 .body
-                .ends_with("First: Pick A or B? → A; Second: Pick X or Y? → Y"),
+                .ends_with("First: Pick A or B? → A; Second: Pick X or Y? → Y (last keys: enter)"),
             "{}",
             answer.body
         );

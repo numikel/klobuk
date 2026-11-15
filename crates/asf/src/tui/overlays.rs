@@ -19,7 +19,7 @@ use super::bindings::{b, footer_hints, Binding, Group, ModeKind, Slot, ANY};
 use super::chrome;
 use super::snapshot::{text_width, trunc, wrap_text, Snapshot};
 use super::theme::{Mark, Theme};
-use crate::worker::{dialog_step, DialogStep, SUBMIT_KEY};
+use crate::worker::{dialog_step, is_free_text, options, DialogStep, SUBMIT_KEY};
 
 /// What the input line is typing for.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,46 +112,6 @@ pub fn take_screen(screen: &mut String, walk: &mut Walk, text: String) {
         }
     }
     *screen = text;
-}
-
-/// One numbered option of the dialog on the pane.
-#[derive(Debug, Clone, PartialEq)]
-struct Opt {
-    n: u32,
-    text: String,
-    /// The selection cursor (`❯`) is on it: Enter would pick it.
-    cursor: bool,
-}
-
-fn parse_option(line: &str) -> Option<Opt> {
-    let l = line.trim_start();
-    let cursor = l.starts_with(['❯', '>']);
-    let l = l.trim_start_matches(['❯', '>']).trim_start();
-    let digits: String = l.chars().take_while(char::is_ascii_digit).collect();
-    let text = l[digits.len()..].strip_prefix(". ")?;
-    Some(Opt {
-        n: digits.parse().ok()?,
-        text: text.trim().to_string(),
-        cursor,
-    })
-}
-
-/// The options of the newest dialog on the pane: from its last `1.` line down (older dialogs and
-/// numbered prose higher up do not count), skipping the description lines in between.
-fn options(screen: &str) -> Vec<Opt> {
-    let lines: Vec<&str> = screen.lines().collect();
-    let Some(first) = lines
-        .iter()
-        .rposition(|l| parse_option(l).is_some_and(|o| o.n == 1))
-    else {
-        return Vec::new();
-    };
-    lines[first..].iter().filter_map(|l| parse_option(l)).collect()
-}
-
-/// The two options Claude Code adds to every question: they open a text box instead of answering.
-fn is_free_text(o: &Opt) -> bool {
-    o.text.starts_with("Type something") || o.text.starts_with("Chat about this")
 }
 
 impl Mode {
@@ -503,7 +463,31 @@ fn handle_answer_key(
     if let Some(mut buf) = text {
         return match key.code {
             KeyCode::Esc => (None, Action::None),
-            KeyCode::Enter if !buf.trim().is_empty() => (None, Action::Reply(id, buf.trim().to_string())),
+            KeyCode::Enter if !buf.trim().is_empty() => {
+                let reply = buf.trim().to_string();
+                match dialog_step(&screen) {
+                    // A typed answer on a question tab that is not the last: the worker types it into the
+                    // tab's free-text option and the walk goes on with the next question. On the last tab
+                    // the worker also submits, so the overlay closes like it does for a digit.
+                    DialogStep::Question {
+                        tabs,
+                        index,
+                        answered,
+                    } if answered + 1 != tabs.len() => {
+                        let label = tabs.get(index).map_or("", |t| t.label.as_str());
+                        walk.picked.push(format!("{label}: typed {reply}"));
+                        walk.wait = Some(Wait::new(&screen, answered + 1));
+                        let mode = Mode::Answer {
+                            id: id.clone(),
+                            screen,
+                            text: None,
+                            walk,
+                        };
+                        (Some(mode), Action::Reply(id, reply))
+                    }
+                    _ => (None, Action::Reply(id, reply)),
+                }
+            }
             _ => {
                 edit_line(&mut buf, &key);
                 let text = Some(buf);

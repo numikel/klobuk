@@ -421,6 +421,60 @@ fn the_overlay_takes_the_pane_text_from_the_preview_feed_too() {
     assert!(t.contains("question 2 of 2"), "{t}");
 }
 
+/// Types `text` in the open overlay and presses Enter.
+fn type_reply(a: &mut App, text: &str) -> Action {
+    assert_eq!(a.handle_key(key('t')), Action::None);
+    for c in text.chars() {
+        a.handle_key(key(c));
+    }
+    a.handle_key(code(KeyCode::Enter))
+}
+
+#[test]
+fn a_typed_reply_on_a_tab_is_a_tab_answer_and_the_walk_goes_on() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_FIRST.into());
+    assert_eq!(type_reply(&mut a, "hi"), Action::Reply(id("asf-2"), "hi".into()));
+    assert!(
+        matches!(a.mode(), Mode::Answer { text: None, .. }),
+        "the walk stays open for the next question"
+    );
+    assert!(waiting(&a));
+    assert_eq!(
+        a.handle_key(key('1')),
+        Action::None,
+        "the pane has not moved on yet"
+    );
+    a.set_screen(TABS_SECOND.into());
+    assert!(!waiting(&a));
+    let t = render_to_text(&a, 120, 30);
+    assert!(
+        t.contains("question 2 of 2") && t.contains("picked First: typed hi"),
+        "{t}"
+    );
+}
+
+#[test]
+fn a_typed_reply_on_the_last_tab_closes_the_overlay_and_asf_submits() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_SECOND.into());
+    assert_eq!(
+        type_reply(&mut a, "why"),
+        Action::Reply(id("asf-2"), "why".into())
+    );
+    assert!(matches!(a.mode(), Mode::Normal));
+}
+
+#[test]
+fn a_typed_reply_outside_a_tabbed_dialog_closes_the_overlay_as_before() {
+    for shown in ["Do you want to proceed?\n 1. Yes\n 2. No", "", TABS_REVIEW] {
+        let mut a = open_overlay();
+        a.set_screen(shown.into());
+        assert_eq!(type_reply(&mut a, "ok"), Action::Reply(id("asf-2"), "ok".into()));
+        assert!(matches!(a.mode(), Mode::Normal), "{shown:?}");
+    }
+}
+
 #[test]
 fn a_typed_reply_survives_a_pane_refresh_during_a_walk() {
     let mut a = open_overlay();
