@@ -2081,7 +2081,16 @@ impl<'a> Worker<'a> {
                 self.note_tab(&run, tabs, *index, &what)?;
             }
         }
-        let mut review = matches!(step, DialogStep::Review { .. }).then_some(before);
+        // On the review page only `Submit answers` sends the answers; any other pick (`Cancel`) makes
+        // Claude Code throw them away, so the review trail must not be recorded as the human's answer.
+        let on_review = matches!(step, DialogStep::Review { .. });
+        let picked_on_review = on_review.then(|| chosen_option(&before, plain)).flatten();
+        // `submit` means the keys answered the last tab and the review page comes after them
+        let cancelled = !submit
+            && picked_on_review
+                .as_ref()
+                .is_some_and(|o| !o.text.starts_with("Submit answers"));
+        let mut review = (on_review && !cancelled).then_some(before);
         if submit {
             review = Some(self.submit_review(&h, SUBMIT_WAIT)?);
         } else if matches!(step, DialogStep::Question { .. }) {
@@ -2094,7 +2103,11 @@ impl<'a> Worker<'a> {
                 .chain(submit.then_some("enter"))
                 .collect();
             let tabbed = submit || !matches!(step, DialogStep::Single);
-            let how = answer_text(review.as_deref(), &sent.join(" "), tabbed);
+            let how = if cancelled {
+                format!("cancelled the dialog in the worker pane: sent {}", sent.join(" "))
+            } else {
+                answer_text(review.as_deref(), &sent.join(" "), tabbed)
+            };
             self.settle_answer(&run, asked.as_ref(), &how)?;
         }
         self.unblock(&run)
@@ -3798,6 +3811,37 @@ mod tests {
             "{}",
             answer.body
         );
+    }
+
+    #[test]
+    fn cancel_on_the_review_page_is_recorded_as_a_cancel_not_as_the_answers() {
+        let cancel_cursor = TABS_REVIEW
+            .replace("❯ 1. Submit", "  1. Submit")
+            .replace("  2. Cancel", "❯ 2. Cancel");
+        for (screen, keys, sent) in [
+            (TABS_REVIEW.to_string(), vec!["2"], "2"),
+            (cancel_cursor, vec!["enter"], "enter"),
+        ] {
+            let fx = fixture();
+            run_in(&fx, RunState::Blocked);
+            announce(&fx, "Which?");
+            show(&fx, &screen);
+
+            let after = worker(&fx)
+                .keys(
+                    &fx.issue.id,
+                    &keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                )
+                .unwrap();
+
+            assert_eq!(after.state, RunState::Working, "the dialog is gone: {keys:?}");
+            let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+            assert_eq!(
+                answer.body,
+                format!("cancelled the dialog in the worker pane: sent {sent}"),
+                "{keys:?}"
+            );
+        }
     }
 
     #[test]
