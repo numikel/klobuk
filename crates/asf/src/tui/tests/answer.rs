@@ -203,6 +203,8 @@ fn a_two_question_dialog_is_answered_tab_by_tab_and_asf_sends_the_submit_step() 
         "stays open for the next question"
     );
     assert!(waiting(&a));
+    // whatever view is behind the overlay (the Board asks for no pane by itself)
+    a.view = View::Board;
     assert_eq!(
         a.peek_wanted(),
         Some(id("asf-2")),
@@ -214,8 +216,13 @@ fn a_two_question_dialog_is_answered_tab_by_tab_and_asf_sends_the_submit_step() 
 
     a.set_screen(TABS_FIRST.into()); // a peek that still shows the old tab does not end the wait
     assert!(waiting(&a));
+    // a half-drawn frame differs from the old one but still has tab 1 open: the wait goes on
+    a.set_screen(TABS_FIRST.replace("Pick A or B?", "Pick A or B? (redrawing)"));
+    assert!(waiting(&a));
+    assert_eq!(a.handle_key(key('2')), Action::None);
     a.set_screen(TABS_SECOND.into());
     assert!(!waiting(&a));
+    assert_eq!(a.peek_wanted(), None, "nothing to wait for any more");
     let t = render_to_text(&a, 120, 30);
     assert!(
         t.contains("question 2 of 2") && t.contains("picked First: 1 A"),
