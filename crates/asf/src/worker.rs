@@ -711,6 +711,129 @@ fn answers_dialog(keys: &[String]) -> bool {
     })
 }
 
+// ---- dialogs with several questions (AskUserQuestion asked for more than one) ---------------------
+//
+// Verified live against Claude Code 2.1.325: the dialog shows a tab row `←  ☐ First  ☐ Second  ✔ Submit  →`;
+// a digit picks an option AND moves to the next tab by itself (`☒ First`); after the last question the
+// pane shows "Review your answers" with `1. Submit answers / 2. Cancel` and Enter submits. So the keys
+// are `1`, `2`, `enter`, with no Right between the digits (an extra Right would skip a tab).
+
+/// The pseudo-key that ends a tabbed dialog: [`Worker::keys`] waits until the pane shows the review page,
+/// then presses Enter on `Submit answers`. A caller cannot know when the page has rendered, so it never
+/// sends the Enter itself.
+pub(crate) const SUBMIT_KEY: &str = "submit";
+
+/// How long `submit` waits for the review page, and how often it looks.
+const SUBMIT_WAIT: Duration = Duration::from_secs(5);
+const SUBMIT_POLL: Duration = Duration::from_millis(100);
+
+/// One question tab of the tab row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Tab {
+    pub label: String,
+    pub answered: bool,
+}
+
+/// Where the dialog on a pane stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DialogStep {
+    /// No tab row: a one-question dialog, a permission prompt or anything else. One key answers it.
+    Single,
+    /// A question tab is open: the first unanswered one (`index`), with `answered` tabs done.
+    Question {
+        tabs: Vec<Tab>,
+        index: usize,
+        answered: usize,
+    },
+    /// Every question is answered and the pane asks `Submit answers / Cancel`.
+    Review { tabs: Vec<Tab> },
+}
+
+/// The tab row of a multi-question dialog: the question tabs (`☐` open, `☒` answered) followed by the
+/// `✔ Submit` tab. A one-question dialog has no such row (its `☐ header` chip has no Submit after it).
+fn tab_row(screen: &str) -> Option<Vec<Tab>> {
+    let is_mark = |c: char| matches!(c, '☐' | '☒' | '☑' | '✔' | '✓');
+    screen.lines().rev().find_map(|line| {
+        let mut parts: Vec<(char, String)> = Vec::new();
+        for c in line.chars() {
+            if is_mark(c) {
+                parts.push((c, String::new()));
+            } else if let Some((_, text)) = parts.last_mut() {
+                text.push(c);
+            }
+        }
+        let (mark, tail) = parts.pop()?;
+        let submit = tail.trim_matches(|c: char| c.is_whitespace() || c == '←' || c == '→');
+        let one_submit = !parts.iter().any(|(m, _)| matches!(m, '✔' | '✓'));
+        (matches!(mark, '✔' | '✓') && submit == "Submit" && !parts.is_empty() && one_submit).then(|| {
+            parts
+                .into_iter()
+                .map(|(m, text)| Tab {
+                    label: text.trim().to_string(),
+                    answered: matches!(m, '☒' | '☑'),
+                })
+                .collect()
+        })
+    })
+}
+
+/// True for the review page's first option (`❯ 1. Submit answers`).
+fn is_submit_option(line: &str) -> bool {
+    let l = after_marker(line);
+    l.starts_with("1.") && l.contains("Submit answers")
+}
+
+/// Reads where a multi-question dialog stands from the pane text. Anything without a tab row (or with
+/// every tab answered but no review page below it) is [`DialogStep::Single`]: the one-key flow.
+pub(crate) fn dialog_step(screen: &str) -> DialogStep {
+    let Some(tabs) = tab_row(screen) else {
+        return DialogStep::Single;
+    };
+    match tabs.iter().position(|t| !t.answered) {
+        Some(index) => {
+            let answered = tabs.iter().filter(|t| t.answered).count();
+            DialogStep::Question {
+                tabs,
+                index,
+                answered,
+            }
+        }
+        None if screen.lines().any(is_submit_option) => DialogStep::Review { tabs },
+        None => DialogStep::Single,
+    }
+}
+
+/// What the review page lists, one entry per question: `First: Pick A or B? → A`. Only the block under
+/// "Review your answers" counts, so a `●` tool line higher up the pane is never read as a question.
+pub(crate) fn review_trail(screen: &str) -> Vec<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(head) = lines.iter().rposition(|l| l.contains("Review your answers")) else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut question: Option<String> = None;
+    for line in &lines[head + 1..] {
+        let l = line.trim();
+        if let Some(q) = l.strip_prefix('●') {
+            question = Some(q.trim().to_string());
+        } else if let (Some(a), Some(q)) = (l.strip_prefix('→'), question.take()) {
+            pairs.push((q, a.trim().to_string()));
+        }
+    }
+    let labels: Vec<String> = tab_row(screen)
+        .map(|tabs| tabs.into_iter().map(|t| t.label).collect())
+        .filter(|l: &Vec<String>| l.len() == pairs.len())
+        .unwrap_or_default();
+    pairs
+        .into_iter()
+        .enumerate()
+        .map(|(i, (q, a))| match labels.get(i) {
+            Some(label) => format!("{label}: {q} → {a}"),
+            None => format!("{q} → {a}"),
+        })
+        .collect()
+}
+
 /// The paths of a scope request in a BLOCKER body that quotes a worker's AskUserQuestion screen: the
 /// question starts with `SCOPE: <path> because <reason>` (it may wrap onto the next lines) and option 1
 /// reads `Grant <path>`. Only the dialog block counts: option 1 is the last `1.` line of the screen and
@@ -1812,6 +1935,12 @@ impl<'a> Worker<'a> {
     ///
     /// Keys that choose an option or confirm one ([`answers_dialog`]) also settle the wait like a typed
     /// [`Worker::reply`] does; `up`, `down` and `esc` only move the cursor, so the question stays open.
+    ///
+    /// A dialog with several questions (tabs) is answered one digit at a time, and a digit on a tab is
+    /// not the answer yet: the question stays open and the run stays blocked until the review page is
+    /// submitted. The trailing pseudo-key [`SUBMIT_KEY`] does that: it waits for the review page, presses
+    /// Enter on `Submit answers` and settles the question with the review page (every question and the
+    /// option picked for it) in the ANSWER, so the dossier shows the whole answer.
     pub fn keys(&self, id: &IssueId, keys: &[String]) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
         let h = Self::handle(&run)?;
@@ -1825,13 +1954,67 @@ impl<'a> Worker<'a> {
                 },
             )?;
         }
-        let ks: Vec<&str> = keys.iter().map(String::as_str).collect();
-        self.rt.send_keys(&h, &ks).map_err(rt_err)?;
-        if answers_dialog(keys) {
-            let how = format!("answered in the worker pane: sent {}", keys.join(" "));
+        let (plain, submit) = match keys.split_last() {
+            Some((k, rest)) if k.eq_ignore_ascii_case(SUBMIT_KEY) => (rest, true),
+            _ => (keys, false),
+        };
+        let answering = submit || answers_dialog(plain);
+        // Where the dialog stands before the keys go out: a digit on a tab, or Enter on the review page.
+        let before = if answering {
+            self.rt.read(&h, SCOPE_LIVE_LINES).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let step = dialog_step(&before);
+        if !plain.is_empty() {
+            let ks: Vec<&str> = plain.iter().map(String::as_str).collect();
+            self.rt.send_keys(&h, &ks).map_err(rt_err)?;
+        }
+        let mut review = matches!(step, DialogStep::Review { .. }).then_some(before);
+        if submit {
+            review = Some(self.submit_review(&h, SUBMIT_WAIT)?);
+        } else if matches!(step, DialogStep::Question { .. }) {
+            return Ok(run);
+        }
+        if answering {
+            let sent: Vec<&str> = plain
+                .iter()
+                .map(String::as_str)
+                .chain(submit.then_some("enter"))
+                .collect();
+            let mut how = format!("answered in the worker pane: sent {}", sent.join(" "));
+            for line in review.iter().flat_map(|screen| review_trail(screen)) {
+                how.push_str("; ");
+                how.push_str(&line);
+            }
             self.settle_answer(&run, asked.as_ref(), &how)?;
         }
         self.unblock(&run)
+    }
+
+    /// Waits up to `wait` for the review page of a multi-question dialog, presses Enter on its first
+    /// option (`Submit answers`) and returns the page that was submitted. Enter is refused while the
+    /// cursor is not on that option: it would pick `Cancel` and throw the answers away.
+    fn submit_review(&self, h: &AgentHandle, wait: Duration) -> Result<String, AppError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let screen = self.rt.read(h, SCOPE_LIVE_LINES).unwrap_or_default();
+            if matches!(dialog_step(&screen), DialogStep::Review { .. }) {
+                if !first_option_has_cursor(&screen) {
+                    return Err(AppError::conflict(
+                        "the review page is open but its cursor is not on `Submit answers`; Enter was not sent",
+                    ));
+                }
+                self.rt.send_keys(h, &["enter"]).map_err(rt_err)?;
+                return Ok(screen);
+            }
+            if Instant::now() >= deadline {
+                return Err(AppError::conflict(
+                    "the pane did not show the review page (`Submit answers`) in time; the answers were not submitted",
+                ));
+            }
+            thread::sleep(SUBMIT_POLL);
+        }
     }
 
     /// The paths a `SCOPE:` dialog asks for when `keys` answers it with the grant and the run is blocked
@@ -3137,6 +3320,181 @@ mod tests {
             .keys(&fx.issue.id, &["down".to_string(), "enter".to_string()])
             .unwrap();
         assert!(unread(&fx).is_empty());
+    }
+
+    // ---- a dialog with several questions (asf-124) ------------------------------------------------
+    // The three screens below are captures of Claude Code 2.1.325 (AskUserQuestion, two questions).
+
+    const TABS_FIRST: &str = "←  ☐ First  ☐ Second  ✔ Submit  →\nPick A or B?\n❯ 1. A\n     Wybór A\n  2. B\n     Wybór B\n  3. Type something.\n──────────\n  4. Chat about this\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
+    const TABS_SECOND: &str = "←  ☒ First  ☐ Second  ✔ Submit  →\nPick X or Y?\n❯ 1. X\n     Wybór X\n  2. Y\n     Wybór Y\n  3. Type something.\n──────────\n  4. Chat about this\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
+    const TABS_REVIEW: &str = "←  ☒ First  ☒ Second  ✔ Submit  →\nReview your answers\n ● Pick A or B?\n   → A\n ● Pick X or Y?\n   → Y\nReady to submit your answers?\n❯ 1. Submit answers\n  2. Cancel";
+
+    fn show(fx: &Fx, screen: &str) {
+        FakeRuntime::new(fake_path(fx))
+            .script(json!({ "screen": screen }))
+            .unwrap();
+    }
+
+    fn keys_sent(fx: &Fx) -> Vec<serde_json::Value> {
+        FakeRuntime::new(fake_path(fx))
+            .log()
+            .into_iter()
+            .filter(|e| e.op == "send_keys")
+            .map(|e| e.args["keys"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_tab_row_lists_the_questions_and_marks_the_answered_ones() {
+        let tab = |label: &str, answered| Tab {
+            label: label.into(),
+            answered,
+        };
+        assert_eq!(
+            tab_row(TABS_SECOND),
+            Some(vec![tab("First", true), tab("Second", false)])
+        );
+        // a label with a space, and a row that is not the last line of the capture
+        assert_eq!(
+            tab_row("x\n← ☐ cli tui  ☒ mod.rs  ✔ Submit →\nPick?"),
+            Some(vec![tab("cli tui", false), tab("mod.rs", true)])
+        );
+        // the header chip of a one-question dialog has no Submit tab
+        assert_eq!(tab_row("☐ Scope alias\n\nKeep it?\n❯ 1. Yes\n  2. No"), None);
+        assert_eq!(tab_row("✔ Submit"), None, "Submit alone is no tab row");
+        assert_eq!(tab_row("no dialog here"), None);
+    }
+
+    #[test]
+    fn a_dialog_is_a_question_tab_the_review_page_or_a_single_dialog() {
+        assert!(matches!(
+            dialog_step(TABS_FIRST),
+            DialogStep::Question { index: 0, answered: 0, ref tabs } if tabs.len() == 2
+        ));
+        assert!(matches!(
+            dialog_step(TABS_SECOND),
+            DialogStep::Question {
+                index: 1,
+                answered: 1,
+                ..
+            }
+        ));
+        assert!(matches!(dialog_step(TABS_REVIEW), DialogStep::Review { .. }));
+        for single in [
+            "Do you want to proceed?\n ❯ 1. Yes\n   2. No",
+            "☐ Scope alias\nKeep it?\n❯ 1. Yes\n  2. No",
+            "",
+        ] {
+            assert_eq!(dialog_step(single), DialogStep::Single, "{single:?}");
+        }
+        // every tab answered but the review page is not on the screen: the one-key flow
+        let answered = TABS_REVIEW.replace("1. Submit answers", "1. Something else");
+        assert_eq!(dialog_step(&answered), DialogStep::Single);
+    }
+
+    #[test]
+    fn the_review_trail_pairs_each_question_with_its_answer_and_ignores_tool_lines() {
+        let screen = format!("● Bash(ls)\n   → not a question\n{TABS_REVIEW}");
+        assert_eq!(
+            review_trail(&screen),
+            [
+                "First: Pick A or B? → A".to_string(),
+                "Second: Pick X or Y? → Y".to_string()
+            ]
+        );
+        assert!(review_trail(TABS_FIRST).is_empty());
+        assert!(review_trail("● Pick?\n  → A").is_empty(), "no review heading");
+    }
+
+    #[test]
+    fn a_digit_on_a_tab_is_not_the_answer_yet() {
+        let fx = fixture();
+        let run = run_in(&fx, RunState::Blocked);
+        let (blocker, q) = announce(&fx, "Which?");
+        show(&fx, TABS_FIRST);
+
+        let after = worker(&fx).keys(&fx.issue.id, &["1".to_string()]).unwrap();
+
+        assert_eq!(keys_sent(&fx), [json!(["1"])]);
+        assert_eq!(
+            after.state,
+            RunState::Blocked,
+            "the dialog still waits for Submit"
+        );
+        assert_eq!(
+            fx.ctx.store.get_run(&run.id).unwrap().unwrap().state,
+            RunState::Blocked
+        );
+        assert_eq!(unread(&fx), [blocker.id, q.id]);
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
+    }
+
+    #[test]
+    fn submit_presses_enter_on_the_review_page_and_answers_with_what_the_human_chose() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let (_, q) = announce(&fx, "Which?");
+        show(&fx, TABS_REVIEW);
+
+        let after = worker(&fx)
+            .keys(&fx.issue.id, &["2".to_string(), SUBMIT_KEY.to_string()])
+            .unwrap();
+
+        assert_eq!(keys_sent(&fx), [json!(["2"]), json!(["enter"])]);
+        assert_eq!(after.state, RunState::Working);
+        assert!(unread(&fx).is_empty());
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert_eq!(
+            (answer.kind, answer.reply_to, answer.body.as_str()),
+            (
+                CommentType::Answer,
+                Some(q.id),
+                "answered in the worker pane: sent 2 enter; First: Pick A or B? → A; Second: Pick X or Y? → Y"
+            )
+        );
+    }
+
+    #[test]
+    fn enter_on_the_review_page_settles_the_question_with_the_review_too() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Which?");
+        show(&fx, TABS_REVIEW);
+
+        worker(&fx).keys(&fx.issue.id, &["enter".to_string()]).unwrap();
+
+        assert_eq!(keys_sent(&fx), [json!(["enter"])]);
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert!(
+            answer
+                .body
+                .ends_with("First: Pick A or B? → A; Second: Pick X or Y? → Y"),
+            "{}",
+            answer.body
+        );
+    }
+
+    #[test]
+    fn submit_never_presses_enter_without_the_review_page_or_with_the_cursor_on_cancel() {
+        let fx = fixture();
+        let run = run_in(&fx, RunState::Blocked);
+        let h = Worker::handle(&run).unwrap();
+        let w = worker(&fx);
+
+        show(&fx, TABS_SECOND);
+        let err = w.submit_review(&h, Duration::ZERO).unwrap_err();
+        assert!(err.message.contains("did not show the review page"), "{err:?}");
+
+        show(
+            &fx,
+            &TABS_REVIEW
+                .replace("❯ 1. Submit", "  1. Submit")
+                .replace("  2. Cancel", "❯ 2. Cancel"),
+        );
+        let err = w.submit_review(&h, Duration::ZERO).unwrap_err();
+        assert!(err.message.contains("cursor is not on"), "{err:?}");
+
+        assert!(keys_sent(&fx).is_empty(), "no Enter went out");
     }
 
     #[test]
