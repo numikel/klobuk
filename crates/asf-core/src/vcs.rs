@@ -53,6 +53,10 @@ pub trait Vcs {
     fn rebase(&self, dir: &Path, onto: &str) -> Result<RebaseOutcome, VcsError>;
     /// Fast-forwards the current branch of `root` to `branch`; returns the new head.
     fn ff_merge(&self, root: &Path, branch: &str) -> Result<String, VcsError>;
+    /// Tracked files of `root` with uncommitted changes (staged or not, the factory's own files
+    /// included) that `branch` also changes relative to `base` (`base...branch`): the files that stop
+    /// a fast-forward of `branch`. Sorted, forward slashes; untracked files are not counted.
+    fn dirty_overlap(&self, root: &Path, base: &str, branch: &str) -> Result<Vec<String>, VcsError>;
     fn ls_files(&self, root: &Path) -> Result<Vec<String>, VcsError>;
     /// `git push -u <remote> <branch>`; `force_with_lease` for rebased feature branches only.
     fn push(&self, dir: &Path, remote: &str, branch: &str, force_with_lease: bool) -> Result<(), VcsError>;

@@ -291,6 +291,55 @@ fn ff_merge_ignores_modified_factory_state_but_not_other_files() {
     }
 }
 
+/// A repo whose `main` tracks `.factory/config.toml`, with a branch worktree that changes `a.txt`,
+/// `.factory/config.toml` and adds `new.txt`.
+fn repo_with_branch(branch: &str) -> (TempDir, PathBuf, PathBuf) {
+    let (d, root) = repo();
+    std::fs::create_dir_all(root.join(".factory")).unwrap();
+    commit_file(&root, ".factory/config.toml", "[a]\n", "config");
+    let wt = root.join(".worktrees").join("wt");
+    GitCli.worktree_add(&root, &wt, branch, "main").unwrap();
+    commit_file(&wt, "a.txt", "branch\n", "a");
+    commit_file(&wt, ".factory/config.toml", "[b]\n", "config");
+    commit_file(&wt, "new.txt", "n\n", "new");
+    (d, root, wt)
+}
+
+#[test]
+fn dirty_overlap_names_only_the_tracked_dirty_files_the_branch_changes() {
+    let (_d, root, _wt) = repo_with_branch("feat/asf-8");
+    let v = GitCli;
+    assert!(v.dirty_overlap(&root, "main", "feat/asf-8").unwrap().is_empty());
+
+    std::fs::write(root.join("b.txt"), "dirty, the branch leaves it alone\n").unwrap();
+    std::fs::write(root.join(".factory/config.toml"), "[local]\n").unwrap();
+    std::fs::write(root.join("a.txt"), "staged\n").unwrap();
+    git(&root, &["add", "a.txt"]);
+    assert_eq!(
+        v.dirty_overlap(&root, "main", "feat/asf-8").unwrap(),
+        vec![".factory/config.toml".to_string(), "a.txt".to_string()],
+        "unstaged and staged changes both count, b.txt does not"
+    );
+}
+
+/// The incident of 2026-11-13: `ff_merge` ignores the factory's own files, so a dirty
+/// `.factory/config.toml` slipped past its check and `git merge` refused with a plain git error.
+#[test]
+fn ff_merge_reports_a_dirty_factory_file_the_branch_changes_as_dirty() {
+    let (_d, root, wt) = repo_with_branch("feat/asf-9");
+    let v = GitCli;
+    let before = v.head(&root).unwrap();
+    std::fs::write(root.join(".factory/config.toml"), "[local]\n").unwrap();
+    match v.ff_merge(&root, "feat/asf-9").unwrap_err() {
+        VcsError::Dirty(files) => assert_eq!(files, vec![".factory/config.toml".to_string()]),
+        other => panic!("{other}"),
+    }
+    assert_eq!(v.head(&root).unwrap(), before, "nothing was touched");
+
+    git(&root, &["checkout", "--", ".factory/config.toml"]);
+    assert_eq!(v.ff_merge(&root, "feat/asf-9").unwrap(), v.head(&wt).unwrap());
+}
+
 #[test]
 fn ls_files_lists_tracked_with_forward_slashes() {
     let (_d, root) = repo();

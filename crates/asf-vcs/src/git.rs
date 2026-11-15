@@ -51,6 +51,20 @@ fn blocking_dirty(dir: &Path) -> Result<Vec<String>, VcsError> {
     )
 }
 
+/// Sorted paths `git diff` reports for `range` (a tree-ish or `a...b`; no renames, so both sides of a
+/// rename are listed). NUL-separated, so a path is never quoted or split.
+fn changed_paths(dir: &Path, range: &[&str]) -> Result<Vec<String>, VcsError> {
+    let mut args = vec!["diff", "--name-only", "--no-renames", "-z"];
+    args.extend_from_slice(range);
+    let mut paths: Vec<String> = run(dir, &args)?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.replace('\\', "/"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 fn ref_exists(dir: &Path, r: &str) -> bool {
     run(dir, &["rev-parse", "--verify", "--quiet", r]).is_ok()
 }
@@ -150,12 +164,27 @@ impl Vcs for GitCli {
         }
     }
 
+    fn dirty_overlap(&self, root: &Path, base: &str, branch: &str) -> Result<Vec<String>, VcsError> {
+        let dirty = changed_paths(root, &["HEAD"])?;
+        if dirty.is_empty() {
+            return Ok(dirty);
+        }
+        let branch_files = changed_paths(root, &[&format!("{base}...{branch}")])?;
+        Ok(dirty.into_iter().filter(|f| branch_files.contains(f)).collect())
+    }
+
     fn ff_merge(&self, root: &Path, branch: &str) -> Result<String, VcsError> {
         // Untracked files do not block a fast-forward; modified or staged tracked files do,
-        // except the factory's own state files.
+        // except the factory's own state files...
         let dirty = blocking_dirty(root)?;
         if !dirty.is_empty() {
             return Err(VcsError::Dirty(dirty));
+        }
+        // ...unless the branch changes the very file: then git refuses the merge (2026-11-13: a
+        // dirty `.factory/config.toml`), and that is a dirty main, not a failure of the branch.
+        let overlap = self.dirty_overlap(root, "HEAD", branch)?;
+        if !overlap.is_empty() {
+            return Err(VcsError::Dirty(overlap));
         }
         run(root, &["merge", "--ff-only", branch])?;
         self.head(root)

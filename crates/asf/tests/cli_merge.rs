@@ -3101,3 +3101,224 @@ fn reused_gates_go_on_to_the_review_as_usual() {
     assert_eq!(reviews_of(&f, &f.issue).len(), 1, "the reviewer was started");
     assert_eq!(store(&f).merge_queue().unwrap()[0].gate_results.len(), 1);
 }
+
+// ---- a dirty tracked file of the repository root that the branch also changes (asf-166) ----------
+
+/// A queue-only gate that logs each run and, while `flag` exists, appends a line to `target` (a
+/// tracked file of the repository root): main turns dirty in the middle of the merge, after the
+/// check that runs before the gates.
+struct Dirtier {
+    _dir: tempfile::TempDir,
+    log: std::path::PathBuf,
+    flag: std::path::PathBuf,
+}
+
+impl Dirtier {
+    fn runs(&self) -> usize {
+        counted_runs(&self.log)
+    }
+    fn dirty_main_from_now_on(&self) {
+        std::fs::write(&self.flag, "").unwrap();
+    }
+    fn clean_main_from_now_on(&self) {
+        std::fs::remove_file(&self.flag).unwrap();
+    }
+}
+
+fn dirtying_gate(f: &F, target: &str) -> Dirtier {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\n\
+         open(sys.argv[1], 'a').write('ran\\n')\n\
+         if os.path.exists(sys.argv[2]):\n    open(sys.argv[3], 'a').write('# local\\n')\n",
+    )
+    .unwrap();
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let (log, flag) = (dir.path().join("gate.log"), dir.path().join("dirty.flag"));
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"dirtier\"\nwhen = [\"merge\"]\ncmd = ['python', '{}', '{}', '{}', '{}']\n",
+        fwd(&script),
+        fwd(&log),
+        fwd(&flag),
+        fwd(&f.repo.path().join(target))
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    git(f.repo.path(), &["add", ".factory/config.toml"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "dirtying gate"]);
+    Dirtier { _dir: dir, log, flag }
+}
+
+#[test]
+fn a_dirty_file_the_branch_changes_blocks_the_item_before_the_gates_and_the_review() {
+    let f = setup();
+    require_review(&f);
+    let gate = dirtying_gate(&f, "src/lib.rs");
+    finished_run(&f, &[("src/lib.rs", "pub fn a() { /* worker */ }\n")]);
+    let agents = start_agents(&f);
+    std::fs::write(f.repo.path().join("src/lib.rs"), "dirty\n").unwrap();
+
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "blocked", "{res}");
+    let item = &store(&f).merge_queue().unwrap()[0];
+    let error = item.last_error.as_deref().unwrap();
+    assert!(
+        error.contains("src/lib.rs") && error.contains("uncommitted"),
+        "{error}"
+    );
+    assert!(item.gate_results.is_empty(), "no gate result: {item:?}");
+    assert_eq!(gate.runs(), 0, "no gate run");
+    assert_eq!(start_agents(&f), agents, "no reviewer started");
+    assert!(events_of(&f, "merge.review_started").is_empty());
+    let blockers: Vec<String> = store(&f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind == CommentType::Blocker)
+        .map(|c| c.body)
+        .collect();
+    let blocker = blockers.last().expect("a BLOCKER for the human");
+    assert!(
+        blocker.contains("src/lib.rs") && blocker.contains(&format!("asf merge retry {}", f.issue)),
+        "{blocker}"
+    );
+    let tui =
+        String::from_utf8_lossy(&f.repo.asf().args(["tui", "--once"]).output().unwrap().stdout).to_string();
+    assert!(
+        tui.contains("NEEDS YOU") && tui.contains(&format!("{} ", f.issue)) && tui.contains("merge blocked"),
+        "{tui}"
+    );
+
+    // still dirty: the retry blocks again, without a gate; restored: the item goes on to its gates and review
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "blocked", "{res}");
+    assert_eq!(gate.runs(), 0);
+    git(f.repo.path(), &["checkout", "--", "src/lib.rs"]);
+    f.repo.ok(&["merge", "retry", &f.issue]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(gate.runs(), 1);
+    assert_eq!(start_agents(&f), agents + 1);
+}
+
+#[test]
+fn a_dirty_factory_config_the_branch_changes_parks_the_approved_item_and_it_merges_once_clean() {
+    let f = setup();
+    require_review(&f);
+    let gate = dirtying_gate(&f, ".factory/config.toml");
+    let issue = f.repo.create_issue(
+        "config",
+        &["--ready", "--scope", "src/**", "--scope", ".factory/config.toml"],
+    );
+    let f = F { issue, ..f };
+    f.repo.ok(&["run", "start", &f.issue]);
+    let wt = f.repo.path().join(".worktrees").join(&f.issue);
+    let cfg = std::fs::read_to_string(wt.join(".factory/config.toml")).unwrap();
+    commit_in(&wt, ".factory/config.toml", &format!("{cfg}# worker\n"));
+    let report = wt.join(".factory").join("runs").join(&f.issue).join("report.md");
+    std::fs::write(&report, "# done\n").unwrap();
+    f.repo.ok(&[
+        "--lane",
+        &f.issue,
+        "issue",
+        "finish",
+        &f.issue,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        f.repo.ok(&["run", "watch", "--once"])["transitions"][0]["to"],
+        "succeeded"
+    );
+
+    // main is clean when the item is looked at, and turns dirty while its gates run
+    gate.dirty_main_from_now_on();
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(gate.runs(), 1);
+    decide_as(&f, &review_id(&f), "approve");
+
+    // the review is approved, the fast-forward meets the dirty `.factory/config.toml`: parked, not failed
+    gate.clean_main_from_now_on();
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["processed"], 0, "parked, nothing to report: {res}");
+    let item = &store(&f).merge_queue().unwrap()[0];
+    assert_eq!(item.state, MergeState::Reviewing, "{item:?}");
+    assert!(item.last_error.is_none(), "{item:?}");
+    assert_eq!(status_of(&f, &f.issue), "validating");
+
+    git(f.repo.path(), &["checkout", "--", ".factory/config.toml"]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(gate.runs(), 1, "no new gate run for the retried fast-forward");
+    assert!(
+        std::fs::read_to_string(f.repo.path().join(".factory/config.toml"))
+            .unwrap()
+            .contains("# worker")
+    );
+}
+
+#[test]
+fn a_review_skipped_as_already_approved_parks_on_a_dirty_main_instead_of_failing() {
+    let f = setup();
+    require_review(&f);
+    let gate = dirtying_gate(&f, "src/lib.rs");
+    finished_run(&f, &[("src/lib.rs", "pub fn a() { /* worker */ }\n")]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    decide_as(&f, &review_id(&f), "approve");
+    commit_in(f.repo.path(), "README.txt", "main moved\n");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(
+        res["items"][0]["state"], "queued",
+        "approved, but main moved: {res}"
+    );
+    assert_eq!(gate.runs(), 1);
+    let agents = start_agents(&f);
+
+    // the rebased patch is the approved one, so the review is skipped; main turns dirty during the gates
+    gate.dirty_main_from_now_on();
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "parked: {res}");
+    assert_eq!(gate.runs(), 2);
+    assert_eq!(events_of(&f, "merge.review_skipped").len(), 1);
+    gate.clean_main_from_now_on();
+    for _ in 0..2 {
+        let res = f.repo.ok(&["merge", "tick", "--once"]);
+        assert_eq!(res["processed"], 0, "still parked, nothing to report: {res}");
+    }
+    let item = &store(&f).merge_queue().unwrap()[0];
+    assert_eq!(item.state, MergeState::Reviewing, "{item:?}");
+    assert!(item.last_error.is_none(), "{item:?}");
+
+    git(f.repo.path(), &["checkout", "--", "src/lib.rs"]);
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(gate.runs(), 2, "no new gate run");
+    assert_eq!(start_agents(&f), agents, "no new reviewer");
+    assert_eq!(events_of(&f, "merge.review_skipped").len(), 1);
+}
+
+#[test]
+fn uncommitted_files_the_branch_does_not_touch_block_nothing() {
+    let f = setup();
+    let gate = dirtying_gate(&f, "src/lib.rs");
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    // a dirty tracked file of the factory and an untracked scratch file, neither of them in the branch
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{s}# local\n")).unwrap();
+    std::fs::write(f.repo.path().join("scratch.txt"), "wip\n").unwrap();
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert_eq!(gate.runs(), 1, "the gates ran");
+    assert!(main_has(&f, "src/greet.rs"));
+    assert!(
+        std::fs::read_to_string(&cfg).unwrap().ends_with("# local\n"),
+        "left alone"
+    );
+}

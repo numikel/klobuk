@@ -831,6 +831,35 @@ fn prepare(ctx: &Ctx, item: &MergeItem) -> Result<Prepared, AppError> {
         }
     }
 
+    // 2b. a tracked file of the repository root that is uncommitted and that the branch also changes
+    // would stop the fast-forward after the gates and the review: wait for the operator before
+    // spending them (the GitHub target never fast-forwards the root)
+    if ctx.config.merge.target != "github" {
+        let overlap = vcs
+            .dirty_overlap(&ctx.root, &default_branch, &item.branch)
+            .map_err(|e| AppError::new(ErrorCode::Backend, e.to_string()))?;
+        if !overlap.is_empty() {
+            let msg = format!(
+                "{} changes files with uncommitted changes in the {default_branch} checkout: {}",
+                item.branch,
+                overlap.join(", ")
+            );
+            let updated = fail(ctx, item, MergeState::Blocked, msg.clone(), None)?;
+            comment(
+                ctx,
+                &item.issue_id,
+                CommentType::Blocker,
+                LANE_HUMAN,
+                format!(
+                    "{msg}\n\nNo gate or review was started. Commit or restore them in the repository root \
+                     (`git checkout -- <file>` drops the change), then `asf merge retry {}`.",
+                    item.issue_id
+                ),
+            )?;
+            return Ok(Prepared::ended(updated));
+        }
+    }
+
     // 3. the gates come next, in this thread or on the gate slot
     set(
         ctx,
@@ -957,6 +986,7 @@ fn conclude(
     )?;
 
     // 4. a review required by config or by label parks the item until the reviewer's verdict
+    let mut approved = false;
     if review_wanted(ctx, &item.issue_id)? {
         match approved_patch(ctx, item)? {
             Some(patch_id) => {
@@ -967,13 +997,14 @@ fn conclude(
                     actor: Some(LANE_ORCHESTRATOR.into()),
                     payload: serde_json::json!({ "patch_id": patch_id, "branch": item.branch }),
                 })?;
+                approved = true;
             }
             None => return enter_review(ctx, item, &run).map(Some),
         }
     }
 
-    // 5. integrate
-    integrate(ctx, item, &run, &wt, false, mode).map(Some)
+    // 5. integrate; an approved item (reviewed, or skipped as already approved) never fails on a dirty main
+    integrate(ctx, item, &run, &wt, approved, mode).map(Some)
 }
 
 /// A gate that fails only on tests outside the branch's diff (see `foreign_tests`) is not the worker's
@@ -1535,6 +1566,9 @@ fn restart_reviewer(ctx: &Ctx, item: &MergeItem) -> Result<Option<MergeItem>, Ap
 struct ReviewRound {
     boundary: i64,
     start_failed: bool,
+    /// The last thing that happened was a skipped review (the patch was approved before): there is no
+    /// verdict to wait for, the approval of the earlier round stands.
+    skipped: bool,
 }
 
 /// One scan of the event log for `id`; see `ReviewRound`.
@@ -1542,6 +1576,7 @@ fn review_round(ctx: &Ctx, id: &IssueId) -> Result<ReviewRound, AppError> {
     let mut round = ReviewRound {
         boundary: 0,
         start_failed: false,
+        skipped: false,
     };
     let mut seq = 0;
     loop {
@@ -1553,8 +1588,13 @@ fn review_round(ctx: &Ctx, id: &IssueId) -> Result<ReviewRound, AppError> {
                 REVIEW_STARTED => {
                     round.boundary = e.payload["after_comment"].as_i64().unwrap_or(round.boundary);
                     round.start_failed = false;
+                    round.skipped = false;
                 }
-                REVIEW_START_FAILED => round.start_failed = true,
+                REVIEW_START_FAILED => {
+                    round.start_failed = true;
+                    round.skipped = false;
+                }
+                REVIEW_SKIPPED => round.skipped = true,
                 _ => {}
             }
         }
@@ -1562,7 +1602,8 @@ fn review_round(ctx: &Ctx, id: &IssueId) -> Result<ReviewRound, AppError> {
     Ok(round)
 }
 
-/// One look at an item waiting for its reviewer. `None` when there is no verdict of the current
+/// One look at an item waiting for its reviewer (or parked behind a dirty main with its approval).
+/// `None` when there is no verdict of the current
 /// round yet (nothing is written), the approved item is parked behind a dirty main, or the reviewer
 /// that failed to start has to wait for a free slot. An item whose reviewer failed to start gets a
 /// fresh one here (`restart_reviewer`).
@@ -1573,26 +1614,33 @@ fn poll_review(
     park_approved: bool,
 ) -> Result<Option<MergeItem>, AppError> {
     let round = review_round(ctx, &item.issue_id)?;
-    let Some((_, verdict)) = verdicts(ctx, &item.issue_id)?
-        .into_iter()
-        .rfind(|(id, _)| *id > round.boundary)
-    else {
-        return if round.start_failed {
-            restart_reviewer(ctx, item)
-        } else {
-            Ok(None)
+    let verdict = if round.skipped {
+        // parked behind a dirty main after its review was skipped as already approved: no reviewer
+        // runs, and the approval of the earlier round stands
+        Verdict::Approve
+    } else {
+        let Some((_, verdict)) = verdicts(ctx, &item.issue_id)?
+            .into_iter()
+            .rfind(|(id, _)| *id > round.boundary)
+        else {
+            return if round.start_failed {
+                restart_reviewer(ctx, item)
+            } else {
+                Ok(None)
+            };
         };
+        // the reviewer is done once its verdict is read, whatever happens to the item next: free its
+        // claim, run and reviewer slot now, not after a merge that may never come
+        close_reviews(
+            ctx,
+            &item.issue_id,
+            match verdict {
+                Verdict::Approve => "review verdict read: approve",
+                Verdict::Changes(_) => "review verdict read: changes",
+            },
+        );
+        verdict
     };
-    // the reviewer is done once its verdict is read, whatever happens to the item next: free its
-    // claim, run and reviewer slot now, not after a merge that may never come
-    close_reviews(
-        ctx,
-        &item.issue_id,
-        match verdict {
-            Verdict::Approve => "review verdict read: approve",
-            Verdict::Changes(_) => "review verdict read: changes",
-        },
-    );
     match verdict {
         Verdict::Approve => {
             // not merged now, but not lost: the verdict stays in the comments and is read again
