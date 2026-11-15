@@ -165,3 +165,264 @@ fn footer_lists_a_answer_and_no_longer_y_n_keys() {
     let t = render_to_text(&app(), 200, 30);
     assert!(t.contains("a answer") && !t.contains("y/n keys"), "{t}");
 }
+
+// ---- a dialog with several questions (asf-124) ----------------------------------------------------
+// Captures of Claude Code 2.1.325 (AskUserQuestion, two questions). A digit answers the open tab and
+// moves to the next one by itself, the last digit lands on the review page, Enter there submits.
+
+const TABS_FIRST: &str = "←  ☐ First  ☐ Second  ✔ Submit  →\nPick A or B?\n❯ 1. A\n     Wybór A\n  2. B\n     Wybór B\n  3. Type something.\n──────────\n  4. Chat about this\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
+const TABS_SECOND: &str = "←  ☒ First  ☐ Second  ✔ Submit  →\nPick X or Y?\n❯ 1. X\n     Wybór X\n  2. Y\n     Wybór Y\n  3. Type something.\n──────────\n  4. Chat about this\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
+const TABS_REVIEW: &str = "←  ☒ First  ☒ Second  ✔ Submit  →\nReview your answers\n ● Pick A or B?\n   → A\n ● Pick X or Y?\n   → Y\nReady to submit your answers?\n❯ 1. Submit answers\n  2. Cancel";
+
+fn keys_of(a: Action) -> Vec<String> {
+    match a {
+        Action::Keys(i, keys) => {
+            assert_eq!(i, id("asf-2"));
+            keys
+        }
+        other => panic!("expected keys, got {other:?}"),
+    }
+}
+
+fn waiting(a: &App) -> bool {
+    matches!(a.mode(), Mode::Answer { walk, .. } if walk.wait.is_some())
+}
+
+#[test]
+fn a_two_question_dialog_is_answered_tab_by_tab_and_asf_sends_the_submit_step() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_FIRST.into());
+    let t = render_to_text(&a, 120, 30);
+    assert!(t.contains("question 1 of 2"), "{t}");
+    assert!(t.contains("Pick A or B?") && t.contains("1-4 choose"), "{t}");
+    assert!(t.contains("k raw keys"), "{t}");
+
+    let mut sent = keys_of(a.handle_key(key('1')));
+    assert!(
+        matches!(a.mode(), Mode::Answer { .. }),
+        "stays open for the next question"
+    );
+    assert!(waiting(&a));
+    assert_eq!(
+        a.peek_wanted(),
+        Some(id("asf-2")),
+        "the pane is read again until it moves on"
+    );
+    // the pane has not moved yet: a digit now would land on the tab that is going away
+    assert_eq!(a.handle_key(key('2')), Action::None);
+    assert_eq!(a.handle_key(code(KeyCode::Enter)), Action::None);
+
+    a.set_screen(TABS_FIRST.into()); // a peek that still shows the old tab does not end the wait
+    assert!(waiting(&a));
+    a.set_screen(TABS_SECOND.into());
+    assert!(!waiting(&a));
+    let t = render_to_text(&a, 120, 30);
+    assert!(
+        t.contains("question 2 of 2") && t.contains("picked First: 1 A"),
+        "{t}"
+    );
+    assert!(t.contains("Pick X or Y?"), "{t}");
+
+    sent.extend(keys_of(a.handle_key(key('2'))));
+    assert!(
+        matches!(a.mode(), Mode::Normal),
+        "the last answer carries the Submit step and closes"
+    );
+    // Claude Code moves on by itself after a digit, so there is no Right between the keys
+    assert_eq!(sent, ["1", "2", "submit"]);
+}
+
+#[test]
+fn enter_on_a_tab_answers_the_highlighted_option_and_the_last_one_submits() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_FIRST.into());
+    assert_eq!(keys_of(a.handle_key(code(KeyCode::Enter))), ["enter"]);
+    a.set_screen(TABS_SECOND.into());
+    // the cursor moves to option 2 first
+    assert_eq!(keys_of(a.handle_key(code(KeyCode::Down))), ["down"]);
+    assert!(waiting(&a) && matches!(a.mode(), Mode::Answer { .. }));
+    a.set_screen(
+        TABS_SECOND
+            .replace("❯ 1. X", "  1. X")
+            .replace("  2. Y", "❯ 2. Y"),
+    );
+    assert!(!waiting(&a), "a moved cursor is a new screen");
+    assert_eq!(keys_of(a.handle_key(code(KeyCode::Enter))), ["enter", "submit"]);
+    assert!(matches!(a.mode(), Mode::Normal));
+}
+
+#[test]
+fn a_digit_beyond_the_options_and_the_free_text_options_never_submit() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_SECOND.into());
+    assert_eq!(a.handle_key(key('9')), Action::None, "no option 9");
+    assert_eq!(
+        a.handle_key(key('y')),
+        Action::None,
+        "y/n mean nothing on a question"
+    );
+    // option 3 opens a text box instead of answering: only the digit goes out, no Submit
+    assert_eq!(keys_of(a.handle_key(key('3'))), ["3"]);
+    assert!(matches!(a.mode(), Mode::Answer { .. }));
+    assert!(
+        matches!(a.mode(), Mode::Answer { walk, .. } if walk.picked.is_empty()),
+        "nothing was picked"
+    );
+}
+
+#[test]
+fn a_one_question_dialog_keeps_the_one_key_flow() {
+    // the header chip of a single question has no Submit tab behind it
+    let single = "☐ Scope alias\n\nKeep the old --scope flag as an alias?\n\n❯ 1. Yes, keep it\n  2. No, remove it\n  3. Type something.\n  4. Chat about this";
+    for (k, expected) in [
+        (key('1'), "1"),
+        (code(KeyCode::Enter), "enter"),
+        (code(KeyCode::Down), "down"),
+    ] {
+        let mut a = open_overlay();
+        a.set_screen(single.into());
+        let t = render_to_text(&a, 120, 30);
+        assert!(!t.contains("question 1 of"), "{t}");
+        assert_eq!(keys_of(a.handle_key(k)), [expected]);
+        assert!(
+            matches!(a.mode(), Mode::Normal),
+            "closes after the key, as before"
+        );
+        assert!(!waiting(&a));
+    }
+}
+
+#[test]
+fn the_review_page_takes_one_key_like_any_dialog() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_REVIEW.into());
+    let t = render_to_text(&a, 120, 30);
+    assert!(t.contains("review page"), "{t}");
+    assert_eq!(keys_of(a.handle_key(code(KeyCode::Enter))), ["enter"]);
+    assert!(matches!(a.mode(), Mode::Normal));
+}
+
+#[test]
+fn an_unknown_dialog_shape_says_so_and_offers_key_mode_and_a_typed_reply() {
+    for shown in [
+        "The agent is thinking about something else",
+        "(cannot read the pane: x)",
+    ] {
+        let mut a = open_overlay();
+        a.set_screen(shown.into());
+        let t = render_to_text(&a, 120, 30);
+        assert!(t.contains("not a known dialog shape"), "{t}");
+        assert!(t.contains("k key mode") && t.contains("t type a reply"), "{t}");
+        // raw keys as before
+        assert_eq!(keys_of(a.handle_key(key('2'))), ["2"]);
+        assert!(matches!(a.mode(), Mode::Normal));
+        // and the typed reply as before
+        let mut a = open_overlay();
+        a.set_screen(shown.into());
+        a.handle_key(key('t'));
+        for c in "ok".chars() {
+            a.handle_key(key(c));
+        }
+        assert_eq!(
+            a.handle_key(code(KeyCode::Enter)),
+            Action::Reply(id("asf-2"), "ok".into())
+        );
+    }
+    // a pane that has not arrived yet is not an unknown shape
+    let a = open_overlay();
+    let t = render_to_text(&a, 120, 30);
+    assert!(
+        t.contains("reading the pane") && !t.contains("not a known dialog shape"),
+        "{t}"
+    );
+}
+
+#[test]
+fn key_mode_sends_every_key_to_the_pane_and_stays_open() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_FIRST.into());
+    assert_eq!(a.handle_key(key('k')), Action::None);
+    let t = render_to_text(&a, 120, 30);
+    assert!(t.contains("key mode") && t.contains("←/→/Tab"), "{t}");
+    for (k, name) in [
+        (code(KeyCode::Right), "right"),
+        (code(KeyCode::Left), "left"),
+        (code(KeyCode::Tab), "tab"),
+        (key('2'), "2"),
+        (code(KeyCode::Enter), "enter"),
+    ] {
+        assert_eq!(keys_of(a.handle_key(k)), [name], "{name}");
+        assert!(
+            matches!(a.mode(), Mode::Answer { .. }),
+            "{name} keeps key mode open"
+        );
+    }
+    // k again goes back to the walk: a digit is a tab answer again
+    a.handle_key(key('k'));
+    a.set_screen(TABS_FIRST.into());
+    assert_eq!(keys_of(a.handle_key(key('1'))), ["1"]);
+    assert!(waiting(&a), "a tab answer waits for the next question");
+    assert_eq!(a.handle_key(code(KeyCode::Esc)), Action::None);
+    assert!(matches!(a.mode(), Mode::Normal));
+}
+
+#[test]
+fn left_right_and_tab_are_not_keys_of_the_one_key_flow() {
+    let mut a = open_overlay();
+    a.set_screen("Do you want to proceed?\n 1. Yes\n 2. No".into());
+    for k in [KeyCode::Left, KeyCode::Right, KeyCode::Tab] {
+        assert_eq!(a.handle_key(code(k)), Action::None);
+        assert!(matches!(a.mode(), Mode::Answer { .. }));
+    }
+}
+
+#[test]
+fn a_wait_the_pane_never_answers_runs_out_and_the_overlay_takes_keys_again() {
+    use std::time::Duration;
+    let mut a = open_overlay();
+    a.set_screen(TABS_FIRST.into());
+    keys_of(a.handle_key(key('1')));
+    a.advance(Duration::from_secs(10));
+    assert!(waiting(&a), "the wait starts when the app first sees it");
+    a.advance(Duration::from_secs(12));
+    assert!(waiting(&a));
+    a.advance(Duration::from_secs(14));
+    assert!(!waiting(&a));
+    assert!(
+        a.status.as_deref().unwrap_or("").contains("did not change"),
+        "{:?}",
+        a.status
+    );
+    assert_eq!(
+        keys_of(a.handle_key(key('2'))),
+        ["2"],
+        "keys work again (the pane still shows tab 1)"
+    );
+}
+
+#[test]
+fn the_overlay_takes_the_pane_text_from_the_preview_feed_too() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_FIRST.into());
+    keys_of(a.handle_key(key('1')));
+    // the event loop reads the pane for `peek_wanted` and stores it as the preview
+    a.set_pane_preview(id("asf-9"), TABS_SECOND.into());
+    assert!(waiting(&a), "another issue's pane is not the overlay's");
+    a.set_pane_preview(id("asf-2"), TABS_SECOND.into());
+    assert!(!waiting(&a));
+    let t = render_to_text(&a, 120, 30);
+    assert!(t.contains("question 2 of 2"), "{t}");
+}
+
+#[test]
+fn a_typed_reply_survives_a_pane_refresh_during_a_walk() {
+    let mut a = open_overlay();
+    a.set_screen(TABS_FIRST.into());
+    a.handle_key(key('t'));
+    a.handle_key(key('x'));
+    a.set_pane_preview(id("asf-2"), TABS_SECOND.into());
+    assert_eq!(
+        a.handle_key(code(KeyCode::Enter)),
+        Action::Reply(id("asf-2"), "x".into())
+    );
+}

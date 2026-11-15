@@ -5,6 +5,7 @@
 //! Confirmation and text input have no box: their prompt is the footer line, which `chrome.rs` draws.
 
 use std::cell::Cell;
+use std::time::Duration;
 
 use asf_core::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -18,6 +19,7 @@ use super::bindings::{b, footer_hints, Binding, Group, ModeKind, Slot, ANY};
 use super::chrome;
 use super::snapshot::{text_width, trunc, wrap_text, Snapshot};
 use super::theme::{Mark, Theme};
+use crate::worker::{dialog_step, DialogStep, SUBMIT_KEY};
 
 /// What the input line is typing for.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +50,8 @@ pub enum Mode {
         /// Last lines of the worker pane (empty until the peek arrives).
         screen: String,
         text: Option<String>,
+        /// Where the overlay is in a dialog with several questions.
+        walk: Walk,
     },
     /// The Inbox modal with one comment in full, scrolled `scroll` lines down.
     Comment {
@@ -58,6 +62,96 @@ pub enum Mode {
     Help {
         scroll: u16,
     },
+}
+
+/// How long the overlay waits for the pane to move on after a key before it takes keys again.
+pub const WAIT_TTL: Duration = Duration::from_secs(3);
+
+/// What the answer overlay remembers while it walks through a dialog with several questions (tabs).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Walk {
+    /// Key mode (`k`): every key goes straight to the pane and the overlay stays open.
+    pub raw: bool,
+    /// What the human picked so far, one entry per answered tab (`First: 1 A`).
+    pub picked: Vec<String>,
+    /// Set while a key just went out: the pane has to show the next step before the overlay takes another.
+    pub wait: Option<Wait>,
+}
+
+/// A key is on its way: the pane text before it, and how far the dialog has to get.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wait {
+    before: String,
+    /// Tabs that have to read as answered (the same count as before for a key that only moves the cursor).
+    answered: usize,
+    /// When the overlay first saw the wait (the app stamps it in `advance`), for the [`WAIT_TTL`].
+    pub since: Option<Duration>,
+}
+
+impl Wait {
+    fn new(screen: &str, answered: usize) -> Wait {
+        Wait {
+            before: screen.to_string(),
+            answered,
+            since: None,
+        }
+    }
+}
+
+/// Stores a freshly read pane and ends the wait when it shows what the wait was for: the text changed
+/// and, in a tabbed dialog, as many tabs are answered as the key should have answered.
+pub fn take_screen(screen: &mut String, walk: &mut Walk, text: String) {
+    if let Some(w) = &walk.wait {
+        let moved = text != w.before
+            && match dialog_step(&text) {
+                DialogStep::Question { answered, .. } => answered >= w.answered,
+                DialogStep::Review { .. } | DialogStep::Single => true,
+            };
+        if moved {
+            walk.wait = None;
+        }
+    }
+    *screen = text;
+}
+
+/// One numbered option of the dialog on the pane.
+#[derive(Debug, Clone, PartialEq)]
+struct Opt {
+    n: u32,
+    text: String,
+    /// The selection cursor (`❯`) is on it: Enter would pick it.
+    cursor: bool,
+}
+
+fn parse_option(line: &str) -> Option<Opt> {
+    let l = line.trim_start();
+    let cursor = l.starts_with(['❯', '>']);
+    let l = l.trim_start_matches(['❯', '>']).trim_start();
+    let digits: String = l.chars().take_while(char::is_ascii_digit).collect();
+    let text = l[digits.len()..].strip_prefix(". ")?;
+    Some(Opt {
+        n: digits.parse().ok()?,
+        text: text.trim().to_string(),
+        cursor,
+    })
+}
+
+/// The options of the newest dialog on the pane: from its last `1.` line down (older dialogs and
+/// numbered prose higher up do not count), skipping the description lines in between.
+fn options(screen: &str) -> Vec<Opt> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(first) = lines
+        .iter()
+        .rposition(|l| parse_option(l).is_some_and(|o| o.n == 1))
+    else {
+        return Vec::new();
+    };
+    lines[first..].iter().filter_map(|l| parse_option(l)).collect()
+}
+
+/// The two options Claude Code adds to every question: they open a text box instead of answering.
+fn is_free_text(o: &Opt) -> bool {
+    o.text.starts_with("Type something") || o.text.starts_with("Chat about this")
 }
 
 impl Mode {
@@ -219,6 +313,15 @@ pub const BINDINGS: &[Binding] = &[
         Slot::Hint,
     ),
     b(
+        "k",
+        "key mode",
+        "send every key straight to the pane, Left/Right/Tab too, and stay open (k again leaves it); a dialog with several questions is otherwise answered tab by tab and submitted by asf",
+        Group::Window,
+        ANY,
+        &[M::Answer],
+        Slot::None,
+    ),
+    b(
         "Esc",
         "close",
         "close the overlay without sending anything",
@@ -340,7 +443,12 @@ pub fn handle_key(mode: Mode, key: KeyEvent, scroll_max: u16) -> (Option<Mode>, 
             KeyCode::Char('y') | KeyCode::Char('Y') if !is_chord(&key) => (None, *action),
             _ => (None, Action::None),
         },
-        Mode::Answer { id, screen, text } => handle_answer_key(key, id, screen, text),
+        Mode::Answer {
+            id,
+            screen,
+            text,
+            walk,
+        } => handle_answer_key(key, id, screen, text, walk),
         Mode::Comment { comment, scroll } => {
             if key.code == KeyCode::Esc && !is_chord(&key) {
                 (None, Action::None)
@@ -361,44 +469,147 @@ pub fn handle_key(mode: Mode, key: KeyEvent, scroll_max: u16) -> (Option<Mode>, 
     }
 }
 
-/// Keys inside the answer overlay: nothing else is bound while it is open. Digits, Enter, Up, Down,
-/// `y` and `n` go to the worker pane as keys and close the overlay; `t` types a reply; Esc closes
-/// without sending.
+/// The key name Herdr's `send-keys` takes for `code`, for the keys the overlay forwards as they are.
+fn key_name(code: KeyCode, raw: bool) -> Option<String> {
+    match code {
+        KeyCode::Char(c @ ('1'..='9' | 'y' | 'n')) => Some(c.to_string()),
+        KeyCode::Enter => Some("enter".into()),
+        KeyCode::Up => Some("up".into()),
+        KeyCode::Down => Some("down".into()),
+        // Moving between tabs by hand is what key mode is for; the one-key flow never needed it.
+        KeyCode::Left if raw => Some("left".into()),
+        KeyCode::Right if raw => Some("right".into()),
+        KeyCode::Tab if raw => Some("tab".into()),
+        _ => None,
+    }
+}
+
+/// Keys inside the answer overlay: nothing else is bound while it is open.
+///
+/// A dialog with one question (or none the overlay knows): digits, Enter, Up, Down, `y` and `n` go to
+/// the worker pane as keys and close the overlay, as they always did. A dialog with several questions
+/// (a tab row `☐ First  ☐ Second  ✔ Submit`) is walked one question at a time: a digit (or Enter on the
+/// highlighted option) answers the open tab and the overlay waits for the pane to show the next one;
+/// the answer to the last tab also sends the Submit step ([`SUBMIT_KEY`]) and closes. `k` switches to
+/// key mode (every key goes to the pane, Left/Right/Tab too, the overlay stays open), `t` types a
+/// reply, Esc closes without sending.
 fn handle_answer_key(
     key: KeyEvent,
     id: IssueId,
     screen: String,
     text: Option<String>,
+    mut walk: Walk,
 ) -> (Option<Mode>, Action) {
-    let keys = |name: &str, id: IssueId| (None, Action::Keys(id, vec![name.to_string()]));
     if let Some(mut buf) = text {
         return match key.code {
             KeyCode::Esc => (None, Action::None),
             KeyCode::Enter if !buf.trim().is_empty() => (None, Action::Reply(id, buf.trim().to_string())),
             _ => {
                 edit_line(&mut buf, &key);
+                let text = Some(buf);
                 (
                     Some(Mode::Answer {
                         id,
                         screen,
-                        text: Some(buf),
+                        text,
+                        walk,
                     }),
                     Action::None,
                 )
             }
         };
     }
-    let stay = |id, screen, text| (Some(Mode::Answer { id, screen, text }), Action::None);
+    let keep = |id, screen, walk| {
+        (
+            Some(Mode::Answer {
+                id,
+                screen,
+                text: None,
+                walk,
+            }),
+            Action::None,
+        )
+    };
+    // The overlay stays open while the keys go out.
+    let stay_and_send = |id: IssueId, screen, walk, keys| {
+        let (mode, _) = keep(id.clone(), screen, walk);
+        (mode, Action::Keys(id, keys))
+    };
     match key.code {
         // A chord is never an answer: Ctrl+3 must not send "3" to the worker.
-        _ if is_chord(&key) => stay(id, screen, None),
-        KeyCode::Esc => (None, Action::None),
-        KeyCode::Char(c @ ('1'..='9' | 'y' | 'n')) => keys(&c.to_string(), id),
-        KeyCode::Enter => keys("enter", id),
-        KeyCode::Up => keys("up", id),
-        KeyCode::Down => keys("down", id),
-        KeyCode::Char('t') => stay(id, screen, Some(String::new())),
-        _ => stay(id, screen, None),
+        _ if is_chord(&key) => return keep(id, screen, walk),
+        KeyCode::Esc => return (None, Action::None),
+        KeyCode::Char('t') => {
+            let mode = Mode::Answer {
+                id,
+                screen,
+                text: Some(String::new()),
+                walk,
+            };
+            return (Some(mode), Action::None);
+        }
+        KeyCode::Char('k') => {
+            walk.raw = !walk.raw;
+            // A key sent in key mode may have left the pane as it was: do not make the next step wait for it.
+            walk.wait = None;
+            return keep(id, screen, walk);
+        }
+        _ => {}
+    }
+    let Some(name) = key_name(key.code, walk.raw) else {
+        return keep(id, screen, walk);
+    };
+    if walk.raw {
+        // Key mode: the key goes out and the overlay stays, re-reading the pane to show what it did.
+        walk.wait = Some(Wait::new(&screen, 0));
+        return stay_and_send(id, screen, walk, vec![name]);
+    }
+    match dialog_step(&screen) {
+        DialogStep::Question {
+            tabs,
+            index,
+            answered,
+        } => {
+            if walk.wait.is_some() {
+                // The pane is still moving: a digit now would land on the tab that is going away.
+                return keep(id, screen, walk);
+            }
+            let opts = options(&screen);
+            let found = match name.as_str() {
+                "enter" => opts.iter().find(|o| o.cursor),
+                digits => digits
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|n| opts.iter().find(|o| o.n == n)),
+            };
+            match (name.as_str(), found) {
+                // Up/Down, or an option that opens a text box: only the key goes out and the tab stays
+                // open; the next peek shows what the pane did.
+                ("up" | "down", _) => {
+                    walk.wait = Some(Wait::new(&screen, answered));
+                    stay_and_send(id, screen, walk, vec![name])
+                }
+                (_, Some(o)) if is_free_text(o) => {
+                    walk.wait = Some(Wait::new(&screen, answered));
+                    stay_and_send(id, screen, walk, vec![name])
+                }
+                // A digit beyond the options, y/n, Enter with no cursor on the pane: nothing to answer.
+                (_, None) => keep(id, screen, walk),
+                (_, Some(o)) => {
+                    let label = tabs.get(index).map_or("", |t| t.label.as_str());
+                    walk.picked.push(format!("{label}: {} {}", o.n, o.text));
+                    walk.wait = Some(Wait::new(&screen, answered + 1));
+                    if answered + 1 == tabs.len() {
+                        // The last question: the Submit step goes with it, and the dialog is done.
+                        (None, Action::Keys(id, vec![name, SUBMIT_KEY.to_string()]))
+                    } else {
+                        stay_and_send(id, screen, walk, vec![name])
+                    }
+                }
+            }
+        }
+        // One question, the review page, or a screen the overlay does not know: the one-key flow.
+        DialogStep::Single | DialogStep::Review { .. } => (None, Action::Keys(id, vec![name])),
     }
 }
 
@@ -431,8 +642,13 @@ pub struct Screen<'a> {
 /// Draws the open window `mode`.
 pub fn render(frame: &mut Frame, s: &Screen, mode: &Mode) {
     match mode {
-        Mode::Answer { id, screen, text } => {
-            answer_overlay(frame, s.body, id, screen, text.as_deref(), s.snap, s.theme);
+        Mode::Answer {
+            id,
+            screen,
+            text,
+            walk,
+        } => {
+            answer_overlay(frame, s.body, id, screen, text.as_deref(), walk, s.snap, s.theme);
         }
         Mode::Comment { comment, scroll } => {
             comment_modal(frame, s.body, comment, *scroll, s.theme, s.scroll_max);
@@ -479,18 +695,39 @@ fn comment_modal(
 
 /// The largest option number the pane shows (`  2. No, remove it`), 9 when it shows none.
 fn option_count(screen: &str) -> u32 {
-    screen
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim_start_matches(|c: char| c.is_whitespace() || c == '❯' || c == '>');
-            let digits: String = l.chars().take_while(char::is_ascii_digit).collect();
-            (!digits.is_empty() && l[digits.len()..].starts_with(". "))
-                .then(|| digits.parse::<u32>().ok())
-                .flatten()
-        })
-        .max()
-        .unwrap_or(9)
-        .clamp(1, 9)
+    options(screen).iter().map(|o| o.n).max().unwrap_or(9).clamp(1, 9)
+}
+
+/// The line above the pane text that says where the overlay is in the dialog, or `None` for the plain
+/// one-key flow (one question, nothing to add).
+fn dialog_note(screen: &str, walk: &Walk, theme: &Theme) -> Option<Line<'static>> {
+    if walk.raw {
+        return Some(Line::styled(
+            "key mode: every key goes straight to the pane, ←/→/Tab too · k leaves it",
+            theme.warn(),
+        ));
+    }
+    match dialog_step(screen) {
+        DialogStep::Question { tabs, index, .. } => {
+            let mut note = format!("question {} of {}", index + 1, tabs.len());
+            if !walk.picked.is_empty() {
+                note.push_str(&format!(" · picked {}", walk.picked.join(", ")));
+            }
+            if walk.wait.is_some() {
+                note.push_str(" · waiting for Claude Code...");
+            }
+            Some(Line::styled(note, theme.bold()))
+        }
+        DialogStep::Review { .. } => Some(Line::styled(
+            "review page: 1 or Enter submits the answers, 2 cancels",
+            theme.bold(),
+        )),
+        DialogStep::Single if !screen.trim().is_empty() && options(screen).is_empty() => Some(Line::styled(
+            "not a known dialog shape: keys go straight to the pane · k key mode · t type a reply",
+            theme.warn(),
+        )),
+        DialogStep::Single => None,
+    }
 }
 
 /// `key text` pairs for the hint row of a window: key letters accent + bold, the words dim.
@@ -508,12 +745,14 @@ fn hint_row(theme: &Theme, pairs: &[(String, &str)]) -> Line<'static> {
 
 /// The centred answer box: the worker's own screen, the last lines of its pane (that is where its
 /// question and numbered choices are), and one row of key hints (or the reply being typed) under it.
+#[allow(clippy::too_many_arguments)]
 fn answer_overlay(
     frame: &mut Frame,
     area: Rect,
     id: &IssueId,
     screen: &str,
     text: Option<&str>,
+    walk: &Walk,
     snap: &Snapshot,
     theme: &Theme,
 ) {
@@ -532,6 +771,15 @@ fn answer_overlay(
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
     let [body, hints] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let tabbed = !walk.raw && matches!(dialog_step(screen), DialogStep::Question { .. });
+    let body = match text.is_none().then(|| dialog_note(screen, walk, theme)).flatten() {
+        Some(note) => {
+            let [note_row, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+            frame.render_widget(Paragraph::new(note), note_row);
+            rest
+        }
+        None => body,
+    };
     let lines: Vec<&str> = screen.lines().collect();
     let tail = &lines[lines.len().saturating_sub(body.height as usize)..];
     let shown: Vec<Line> = if tail.is_empty() {
@@ -542,6 +790,38 @@ fn answer_overlay(
     frame.render_widget(Paragraph::new(shown), body);
     let choose = format!("1-{}", option_count(screen));
     let row = match text {
+        None if walk.raw => hint_row(
+            theme,
+            &[
+                ("1-9 y n Enter ↑/↓ ←/→ Tab".into(), "send"),
+                ("k".into(), "back"),
+                ("Esc".into(), "close"),
+            ],
+        ),
+        // A dialog with several questions offers `k` (key mode) too; the box is at most 104 wide, so the
+        // wording is shorter than the one-question row to fit its 88 columns.
+        None if tabbed && hints.width >= 88 => hint_row(
+            theme,
+            &[
+                (choose, "choose"),
+                ("Enter".into(), "send highlighted"),
+                ("↑/↓".into(), "move"),
+                ("k".into(), "raw keys"),
+                ("t".into(), "type a reply"),
+                ("Esc".into(), "close"),
+            ],
+        ),
+        None if tabbed => hint_row(
+            theme,
+            &[
+                (choose, "choose"),
+                ("Enter".into(), "send"),
+                ("↑/↓".into(), "move"),
+                ("k".into(), "keys"),
+                ("t".into(), "type"),
+                ("Esc".into(), "close"),
+            ],
+        ),
         // The long wording needs 97 columns; a narrower box gets the short one rather than a cut-off line.
         None if hints.width >= 97 => hint_row(
             theme,

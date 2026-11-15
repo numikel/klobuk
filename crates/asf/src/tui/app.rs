@@ -202,6 +202,19 @@ impl App {
     /// A message is stamped the first time it is seen here, so setting `status` needs no clock.
     pub fn advance(&mut self, now: Duration) {
         self.clock = now;
+        // A key the answer overlay waits on that the pane never reflects (the dialog moved on without
+        // it, or the key did nothing): give up and say so, so the overlay takes keys again.
+        if let Some(Mode::Answer { walk, .. }) = self.overlays.last_mut() {
+            if let Some(wait) = &mut walk.wait {
+                let since = *wait.since.get_or_insert(now);
+                if now.saturating_sub(since) >= overlays::WAIT_TTL {
+                    walk.wait = None;
+                    self.status = Some(
+                        "the pane did not change after the key; check it, or press k for key mode".into(),
+                    );
+                }
+            }
+        }
         let Some(text) = &self.status else {
             self.status_stamp = None;
             return;
@@ -264,7 +277,17 @@ impl App {
     /// runtime is down (the read would fail and be asked for again on every pass). The event loop
     /// turns it into a read.
     pub fn peek_wanted(&self) -> Option<IssueId> {
-        if self.view != View::Agents || self.snap.runtime_ok == Some(false) {
+        if self.snap.runtime_ok == Some(false) {
+            return None;
+        }
+        // The answer overlay sent a key and waits for the pane to move on: read it again on every pass
+        // until it does (or the wait runs out, see `advance`), whatever view is behind the overlay.
+        if let Some(Mode::Answer { id, walk, .. }) = self.overlays.last() {
+            if walk.wait.is_some() {
+                return Some(id.clone());
+            }
+        }
+        if self.view != View::Agents {
             return None;
         }
         agents::selected_issue(&self.snap, &self.agents)
@@ -284,17 +307,26 @@ impl App {
         self.detail_stale = false;
     }
 
-    /// Feeds the pane text read for the open answer overlay; anything else ignores it.
+    /// Feeds the pane text read for the open answer overlay; anything else ignores it. A key the overlay
+    /// is waiting on (the next question of a tabbed dialog) is settled by the first text that shows it.
     pub fn set_screen(&mut self, text: String) {
-        if let Some(Mode::Answer { screen, .. }) = self.overlays.last_mut() {
-            *screen = text;
-        }
+        self.feed_answer(None, text);
     }
 
-    /// Keeps the last lines read from `issue`'s pane for the views (`Snapshot::pane_preview`).
+    /// Keeps the last lines read from `issue`'s pane for the views (`Snapshot::pane_preview`), and shows
+    /// them in the answer overlay when it is open for the same issue.
     pub fn set_pane_preview(&mut self, issue: IssueId, text: String) {
+        self.feed_answer(Some(&issue), text.clone());
         self.snap.pane_preview = Some(PanePreview { issue, text });
         self.pane_stale = false;
+    }
+
+    fn feed_answer(&mut self, issue: Option<&IssueId>, text: String) {
+        if let Some(Mode::Answer { id, screen, walk, .. }) = self.overlays.last_mut() {
+            if issue.is_none_or(|i| i == id) {
+                overlays::take_screen(screen, walk, text);
+            }
+        }
     }
 
     /// Next (`step == 1`) or previous (`step == -1`) view, wrapping around.
@@ -328,6 +360,7 @@ impl App {
                     id: id.clone(),
                     screen: String::new(),
                     text: None,
+                    walk: overlays::Walk::default(),
                 });
                 Action::Peek(id)
             }
