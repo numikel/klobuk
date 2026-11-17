@@ -711,6 +711,18 @@ fn answers_dialog(keys: &[String]) -> bool {
     })
 }
 
+/// Keys that only move the cursor or the tab: they neither answer nor dismiss the dialog, so the run
+/// keeps waiting on it (`esc` dismisses, so it is not one of them).
+fn moves_cursor_only(keys: &[String]) -> bool {
+    !keys.is_empty()
+        && keys.iter().all(|k| {
+            matches!(
+                k.to_ascii_lowercase().as_str(),
+                "up" | "down" | "left" | "right" | "tab"
+            )
+        })
+}
+
 // ---- dialogs with several questions (AskUserQuestion asked for more than one) ---------------------
 //
 // Verified live against Claude Code 2.1.325: the dialog shows a tab row `←  ☐ First  ☐ Second  ✔ Submit  →`;
@@ -2091,6 +2103,11 @@ impl<'a> Worker<'a> {
                 .as_ref()
                 .is_some_and(|o| !o.text.starts_with("Submit answers"));
         let mut review = (on_review && !cancelled).then_some(before);
+        // a cursor move leaves the dialog open: the run stays blocked and the question open, or the next
+        // call (`enter`, `submit`, a typed reply) would find a working run and settle nothing
+        if !submit && moves_cursor_only(plain) {
+            return Ok(run);
+        }
         if submit {
             review = Some(self.submit_review(&h, SUBMIT_WAIT)?);
         } else if matches!(step, DialogStep::Question { .. }) {
@@ -3811,6 +3828,56 @@ mod tests {
             "{}",
             answer.body
         );
+    }
+
+    #[test]
+    fn a_cursor_move_on_a_tab_keeps_the_run_blocked_and_the_walk_can_still_be_answered() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let (blocker, q) = announce(&fx, "Which?");
+        show(&fx, TABS_FIRST);
+
+        let after = worker(&fx).keys(&fx.issue.id, &["down".to_string()]).unwrap();
+
+        assert_eq!(keys_sent(&fx), [json!(["down"])]);
+        assert_eq!(after.state, RunState::Blocked, "the dialog is still open");
+        assert_eq!(unread(&fx), [blocker.id, q.id]);
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
+
+        // the next call sees a blocked run, so the review page still settles the question
+        show(&fx, TABS_REVIEW);
+        let done = worker(&fx).keys(&fx.issue.id, &["enter".to_string()]).unwrap();
+
+        assert_eq!(done.state, RunState::Working);
+        assert!(unread(&fx).is_empty());
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert_eq!((answer.kind, answer.reply_to), (CommentType::Answer, Some(q.id)));
+        assert!(
+            answer.body.contains("Second: Pick X or Y? → Y"),
+            "{}",
+            answer.body
+        );
+    }
+
+    #[test]
+    fn keys_that_only_move_the_cursor_leave_a_blocked_run_alone_but_esc_still_unblocks() {
+        for key in ["up", "down", "left", "right", "tab"] {
+            let fx = fixture();
+            run_in(&fx, RunState::Blocked);
+            announce(&fx, "Which?");
+            show(&fx, TABS_FIRST);
+
+            let after = worker(&fx).keys(&fx.issue.id, &[key.to_string()]).unwrap();
+
+            assert_eq!(after.state, RunState::Blocked, "{key}");
+        }
+
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Which?");
+        show(&fx, TABS_FIRST);
+        let after = worker(&fx).keys(&fx.issue.id, &["esc".to_string()]).unwrap();
+        assert_eq!(after.state, RunState::Working, "esc dismisses the dialog");
     }
 
     #[test]
