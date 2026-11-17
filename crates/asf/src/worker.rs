@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use asf_core::config::GateWhen;
+use asf_core::config::{GateWhen, SelfTest};
 use asf_core::*;
 use asf_vcs::gates::stage_specs;
 use asf_vcs::{run_gates, GitCli};
@@ -201,20 +201,47 @@ fn gate_rounds_used_up(ctx: &Ctx, id: &IssueId, rounds: usize) -> Option<String>
     })
 }
 
+/// How a sent-back worker checks its fix, the way its brief's self-check bullet says: every gate in
+/// `full`, the fast gates plus its own tests in `targeted` (verification runs the full gates again).
+fn recheck(self_test: SelfTest) -> &'static str {
+    match self_test {
+        SelfTest::Full => "run the gates",
+        SelfTest::Targeted => "run the checks from the self-check bullet of your brief",
+    }
+}
+
+/// The to-do half of the one line a sent-back worker gets.
+fn fix_todo(fix: Fix, self_test: SelfTest) -> String {
+    let check = recheck(self_test);
+    match fix {
+        Fix::Gate => format!("fix on what is checked out, {check}, commit"),
+        Fix::Conflict => format!(
+            "rebase onto the default branch in your worktree, resolve keeping both sides' intent, {check}, commit"
+        ),
+    }
+}
+
 /// What a worker sent back to fix a gate or a conflict reads first: the evidence as data, then the way
 /// back to `asf issue finish`. UTF-8, LF.
 fn fix_file_text(ctx: &Ctx, id: &IssueId, round: usize, failure: &Failure) -> String {
     let asf = crate::ctx::asf_bin();
     let report = format!("{FACTORY_DIR}/{RUNS_DIR}/{id}/report.md");
     let main = &ctx.config.repo.default_branch;
+    let check = match ctx.config.worker.self_test {
+        SelfTest::Full => "Run the gates from the project CLAUDE.md and make them pass.".to_string(),
+        SelfTest::Targeted => "Run the checks from the self-check bullet of your brief and make them pass; \
+                               verification runs the full gates again after you finish."
+            .to_string(),
+    };
     let (title, what, steps) = match failure.fix {
         Fix::Gate => (
             format!("Gate failure {round} for {id}"),
             "Gate output",
-            "1. Fix it on what is checked out: the branch already sits on the current main, do not rebase again.\n\
-             2. Run the gates from the project CLAUDE.md and make them pass.\n\
-             3. Commit with explicit paths; leave the working tree clean.\n"
-                .to_string(),
+            format!(
+                "1. Fix it on what is checked out: the branch already sits on the current main, do not rebase again.\n\
+                 2. {check}\n\
+                 3. Commit with explicit paths; leave the working tree clean.\n"
+            ),
         ),
         Fix::Conflict => (
             format!("Rebase conflict {round} for {id}"),
@@ -222,7 +249,7 @@ fn fix_file_text(ctx: &Ctx, id: &IssueId, round: usize, failure: &Failure) -> St
             format!(
                 "1. Rebase onto {main} in this worktree and resolve each conflict keeping the intent of both sides: \
                  what {main} gained and what your branch adds.\n\
-                 2. Run the gates from the project CLAUDE.md and make them pass.\n\
+                 2. {check}\n\
                  3. Commit with explicit paths; leave the working tree clean.\n"
             ),
         ),
@@ -1671,12 +1698,7 @@ impl<'a> Worker<'a> {
         if let Err(e) = written {
             return Ok(Err(format!("cannot write {file_rel}: {e}")));
         }
-        let todo = match failure.fix {
-            Fix::Gate => "fix on what is checked out, run the gates, commit",
-            Fix::Conflict => {
-                "rebase onto the default branch in your worktree, resolve keeping both sides' intent, run the gates, commit"
-            }
-        };
+        let todo = fix_todo(failure.fix, self.ctx.config.worker.self_test);
         let prompt = format!(
             "{id}: {}. Read {file_rel}, {todo} and finish again the way your brief says.",
             failure.headline
@@ -2436,6 +2458,58 @@ mod tests {
             text.contains("src/a.rs\nsrc/b.rs") && text.contains("Rebase onto main"),
             "{text}"
         );
+    }
+
+    /// The one line a sent-back worker gets and the steps in its fix file follow `worker.self_test`:
+    /// a targeted worker is never told to run every gate (that is the parallel full runs the option removes).
+    #[test]
+    fn a_sent_back_worker_is_told_to_check_the_way_its_brief_says() {
+        let mut fx = fixture();
+        let id: IssueId = "asf-7".parse().unwrap();
+        let gate = Failure {
+            fix: Fix::Gate,
+            headline: "the gate `clippy` failed".into(),
+            evidence: "error".into(),
+        };
+        let conflict = Failure {
+            fix: Fix::Conflict,
+            headline: "the rebase of feat/asf-7 onto main conflicts".into(),
+            evidence: "src/a.rs".into(),
+        };
+        let targeted = "checks from the self-check bullet of your brief";
+
+        assert_eq!(fx.ctx.config.worker.self_test, SelfTest::Targeted, "the default");
+        for f in [&gate, &conflict] {
+            let todo = fix_todo(f.fix, fx.ctx.config.worker.self_test);
+            assert!(
+                todo.contains(targeted) && !todo.contains("run the gates"),
+                "{todo}"
+            );
+            let text = fix_file_text(&fx.ctx, &id, 1, f);
+            assert!(text.contains(targeted), "{text}");
+            assert!(
+                !text.contains("Run the gates from the project CLAUDE.md"),
+                "{text}"
+            );
+        }
+
+        fx.ctx.config.worker.self_test = SelfTest::Full;
+        assert_eq!(
+            fix_todo(Fix::Gate, SelfTest::Full),
+            "fix on what is checked out, run the gates, commit"
+        );
+        assert_eq!(
+            fix_todo(Fix::Conflict, SelfTest::Full),
+            "rebase onto the default branch in your worktree, resolve keeping both sides' intent, run the gates, commit"
+        );
+        for f in [&gate, &conflict] {
+            let text = fix_file_text(&fx.ctx, &id, 1, f);
+            assert!(
+                text.contains("Run the gates from the project CLAUDE.md and make them pass."),
+                "{text}"
+            );
+            assert!(!text.contains(targeted), "{text}");
+        }
     }
 
     #[test]

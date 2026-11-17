@@ -45,7 +45,7 @@ same gates again right after `finish` and sends a failure back to you. The gates
             .to_string(),
     };
     let mut any = false;
-    for g in b.gates.iter().filter(|g| g.when.contains(&GateWhen::Verify)) {
+    for g in b.gates.iter().filter(|g| g.runs_in(GateWhen::Verify)) {
         any = true;
         let _ = writeln!(s, "  - `{}`: `{}`", g.name, g.cmd.join(" "));
     }
