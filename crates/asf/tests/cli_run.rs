@@ -1979,6 +1979,63 @@ fn a_run_stopped_by_the_tool_call_cap_stays_denied() {
 }
 
 #[test]
+fn raising_the_budget_of_a_cap_tripped_run_keeps_it_over_budget_and_adds_no_second_blocker() {
+    let f = setup();
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(
+        s.contains("max_tool_calls = 400"),
+        "config template lacks the cap"
+    );
+    std::fs::write(&cfg, s.replace("max_tool_calls = 400", "max_tool_calls = 2")).unwrap();
+    f.repo.ok(&["run", "start", &f.issue]);
+    let post_tool = serde_json::json!({
+        "session_id": "s", "transcript_path": "C:/x.jsonl", "hook_event_name": "PostToolUse",
+        "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {"stdout": ""},
+        "tool_use_id": "t", "duration_ms": 1
+    });
+    for _ in 0..3 {
+        hook_call(&f, "post-tool", &post_tool);
+    }
+    let blockers = |f: &F| {
+        store(f)
+            .comments(&f.issue.parse().unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.kind == CommentType::Blocker)
+            .count()
+    };
+    assert_eq!(active_run(&f).state, RunState::OverBudget);
+    assert_eq!(blockers(&f), 1);
+    assert!(!edit_allowed(&f));
+
+    // the budget is not what stopped it: the run stays stopped and the answer says so
+    let out = f
+        .repo
+        .asf()
+        .args(["run", "budget", &f.issue, "14"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("still over_budget"), "{text}");
+    assert!(!text.contains("over_budget -> working"), "{text}");
+    let run = active_run(&f);
+    assert_eq!((run.state, run.budget_usd), (RunState::OverBudget, Some(14.0)));
+    assert!(run
+        .exit_reason
+        .as_deref()
+        .is_some_and(|r| r.contains("max_tool_calls")));
+    assert!(
+        !edit_allowed(&f),
+        "the cap still holds after the budget is raised"
+    );
+    hook_call(&f, "post-tool", &post_tool);
+    assert_eq!(blockers(&f), 1, "no second BLOCKER");
+    assert_eq!(budget_events(&f).len(), 1);
+}
+
+#[test]
 fn reply_with_budget_raises_and_sends_in_one_step() {
     let f = setup();
     f.repo.ok(&["run", "start", &f.issue]);

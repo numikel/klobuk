@@ -63,7 +63,7 @@ pub const BINDINGS: &[Binding] = &[
     b(
         "b",
         "budget",
-        "set a new budget for the agent;\nan over-budget one goes back to work",
+        "set a new budget; an over-budget run\nresumes unless the tool cap stopped it",
         Group::NeedsYou,
         AGENTS,
         NORMAL,

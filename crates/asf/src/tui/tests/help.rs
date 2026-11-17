@@ -221,7 +221,7 @@ fn when_an_agent_needs_you_lists_a_b_f_r_v_x_in_the_mockup_order_and_r_says_both
     };
     let order = [
         at("answer: shows"),
-        at("set a new budget for the agent"),
+        at("set a new budget"),
         at("focus the agent's own"),
         at("send the agent a message"),
         at("check a failed run again"),

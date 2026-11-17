@@ -137,10 +137,17 @@ impl SqliteStore {
     ///
     /// One IMMEDIATE transaction: the budget, the event `run.budget_raised` (old/new/actor) and, for a
     /// run in `over_budget`, the move back to `working` with `exit_reason` cleared (plus the usual
-    /// `run.state` event). A value below the run's cost is refused (`Validation`): the hook would
-    /// trip it again on the next status line.
+    /// `run.state` event). A run that the tool-call cap stopped (`tool_cap > 0` and `tool_calls` past it;
+    /// `over_budget` too, but no budget fixes it) keeps its state and reason. A value below the run's
+    /// cost is refused (`Validation`): the hook would trip it again on the next status line.
     // An inherent method, not an `IssueStore` one: the port lives in `asf-core`, outside this change.
-    pub fn raise_run_budget(&self, id: &str, usd: f64, actor: &str) -> Result<(Run, Run), StoreError> {
+    pub fn raise_run_budget(
+        &self,
+        id: &str,
+        usd: f64,
+        tool_cap: i64,
+        actor: &str,
+    ) -> Result<(Run, Run), StoreError> {
         self.with_tx(|tx| {
             let before = require_run(tx, id)?;
             if !usd.is_finite() || usd < before.cost_usd {
@@ -149,7 +156,8 @@ impl SqliteStore {
                     before.cost_usd
                 )));
             }
-            let back = before.state == RunState::OverBudget;
+            let cap_tripped = tool_cap > 0 && before.tool_calls > tool_cap;
+            let back = before.state == RunState::OverBudget && !cap_tripped;
             let state = if back { RunState::Working } else { before.state };
             tx.execute(
                 "UPDATE runs SET budget_usd=?2, state=?3, exit_reason=CASE WHEN ?4 THEN NULL ELSE exit_reason END WHERE id=?1",

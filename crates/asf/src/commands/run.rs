@@ -130,10 +130,13 @@ pub struct BudgetRaised {
 impl BudgetRaised {
     pub fn text(&self) -> String {
         let usd = |v: f64| format!("${v:.2}");
-        let moved = if self.state_before == self.state {
-            String::new()
-        } else {
+        let moved = if self.state_before != self.state {
             format!("; {} -> {}", self.state_before, self.state)
+        } else if self.state == RunState::OverBudget {
+            // only the tool-call cap can leave a run here after the raise: no budget fixes that
+            "; still over_budget, the tool-call cap holds".to_string()
+        } else {
+            String::new()
         };
         format!(
             "{} budget {} -> {} (cost {}{moved})",
@@ -164,7 +167,8 @@ pub fn raise_budget(ctx: &Ctx, id: &IssueId, usd: f64) -> Result<BudgetRaised, A
             run.cost_usd
         )));
     }
-    let (before, after) = ctx.store.raise_run_budget(&run.id, usd, &ctx.author())?;
+    let cap = ctx.config.worker.max_tool_calls as i64;
+    let (before, after) = ctx.store.raise_run_budget(&run.id, usd, cap, &ctx.author())?;
     Ok(BudgetRaised {
         issue_id: after.issue_id,
         run_id: after.id,
