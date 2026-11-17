@@ -78,6 +78,8 @@ pub enum Action {
     Keys(IssueId, Vec<String>),
     Enqueue(IssueId),
     Abort(IssueId),
+    /// Set the budget (USD, as typed) of the issue's run: `asf run budget <id> <usd>`.
+    RaiseBudget(IssueId, String),
     /// Mark the human's unread comments on one issue as read.
     MarkRead(IssueId),
     /// Mark the whole human inbox as read (confirmed with `y` first).

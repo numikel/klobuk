@@ -601,6 +601,77 @@ fn x_asks_before_aborting_an_over_budget_run_and_is_refused_on_every_other_row()
 }
 
 #[test]
+fn b_on_an_over_budget_row_opens_the_amount_input_and_enter_returns_the_budget_action() {
+    let mut a = App::new(busy_desk());
+    select_need(&mut a, "asf-5");
+    assert_eq!(a.handle_key(key('b')), Action::None);
+    match a.mode() {
+        Mode::Input { prompt, buf, target } => {
+            assert!(prompt.contains("asf-5") && prompt.contains("USD"), "{prompt}");
+            assert_eq!(buf, "10", "prefilled with the current budget");
+            assert_eq!(*target, InputTarget::Budget(id("asf-5")));
+        }
+        other => panic!("expected the input line, got {other:?}"),
+    }
+    for _ in 0..2 {
+        a.handle_key(code(KeyCode::Backspace));
+    }
+    for c in "14".chars() {
+        a.handle_key(key(c));
+    }
+    assert_eq!(
+        a.handle_key(code(KeyCode::Enter)),
+        Action::RaiseBudget(id("asf-5"), "14".into())
+    );
+    assert!(matches!(a.mode(), Mode::Normal));
+}
+
+#[test]
+fn b_on_a_running_row_opens_the_input_too_and_on_a_row_without_a_run_says_so() {
+    let mut r = App::new(full_desk());
+    r.handle_key(key('G'));
+    assert_eq!(r.handle_key(key('b')), Action::None);
+    assert!(
+        matches!(
+            r.mode(),
+            Mode::Input {
+                target: InputTarget::Budget(_),
+                ..
+            }
+        ),
+        "{:?}",
+        r.mode()
+    );
+    // a failed run is not active: nothing to raise
+    let mut a = App::new(busy_desk());
+    select_need(&mut a, "asf-3");
+    assert_eq!(a.handle_key(key('b')), Action::None);
+    assert!(matches!(a.mode(), Mode::Normal));
+    assert_eq!(a.status.as_deref(), Some("asf-3 has no active run"));
+}
+
+#[test]
+fn the_typed_amount_is_a_number_with_an_optional_dollar_sign() {
+    for (typed, usd) in [("14", 14.0), (" 14.5 ", 14.5), ("$14", 14.0)] {
+        assert_eq!(parse_usd(typed).unwrap(), usd, "{typed:?}");
+    }
+    let e = parse_usd("a lot").unwrap_err();
+    assert_eq!(e.exit_code(), 2);
+    assert!(e.message.contains("`a lot`"), "{}", e.message);
+}
+
+#[test]
+fn the_help_page_lists_b_budget_for_the_now_view() {
+    let help = crate::tui::bindings::help_sections();
+    let item = help
+        .iter()
+        .flat_map(|s| s.items.iter())
+        .find(|(k, _)| *k == "b")
+        .map(|(_, text)| text.as_str());
+    assert!(item.is_some_and(|t| t.contains("budget")), "{item:?}");
+}
+
+#[test]
 fn the_key_on_a_needs_you_row_is_never_one_the_command_behind_it_refuses() {
     use RunState::*;
     let states = [

@@ -145,6 +145,15 @@ pub const BINDINGS: &[Binding] = &[
         Slot::None,
     ),
     b("x", "abort", HELP_ABORT, Group::NeedsYou, NOW, NORMAL, Slot::None),
+    b(
+        "b",
+        "budget",
+        "set a new budget for the agent;\nan over-budget one goes back to work",
+        Group::NeedsYou,
+        NOW,
+        NORMAL,
+        Slot::None,
+    ),
     // Listed under NEEDS YOU, where it works: on a merge row of this view. The Queue view's own `r`
     // sends a message (QUEUE gets this key from the Queue task, when that view retries).
     b(
@@ -591,7 +600,26 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
         KeyCode::Char('v') => verify(row),
         KeyCode::Char('r') => retry(row),
         KeyCode::Char('x') => abort(row),
+        KeyCode::Char('b') => match row {
+            Some(NowRow::Need(n)) => budget_input(snap, n.issue),
+            Some(NowRow::Running(r)) => budget_input(snap, r.issue),
+            Some(NowRow::Loop) => Action::Status("the loop has no budget; Enter explains it".into()),
+            None => Action::None,
+        },
         _ => Action::None,
+    }
+}
+
+/// `b` on a row of an issue: the input line for a new budget of its active run (an over-budget run
+/// goes back to working when it is applied), prefilled with the current one.
+pub fn budget_input(snap: &Snapshot, id: IssueId) -> Action {
+    match snap.run_for(&id) {
+        Some(run) => Action::OpenInput {
+            prompt: format!("new budget for {id} in USD (cost ${:.2})", run.cost_usd),
+            buf: run.budget_usd.map(|b| b.to_string()).unwrap_or_default(),
+            target: InputTarget::Budget(id),
+        },
+        None => Action::Status(format!("{id} has no active run")),
     }
 }
 

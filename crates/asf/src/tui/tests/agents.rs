@@ -474,6 +474,17 @@ fn x_asks_before_it_aborts() {
 }
 
 #[test]
+fn b_opens_the_budget_input_for_the_selected_run() {
+    let mut a = agents_app(agents_desk());
+    assert_eq!(a.handle_key(key('b')), Action::None);
+    assert!(
+        matches!(a.mode(), Mode::Input { target: InputTarget::Budget(i), .. } if *i == id("asf-27")),
+        "{:?}",
+        a.mode()
+    );
+}
+
+#[test]
 fn enter_opens_the_issue_on_the_board() {
     let mut a = agents_app(agents_desk());
     a.handle_key(key('G'));

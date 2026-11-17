@@ -26,6 +26,8 @@ use crate::worker::{dialog_step, is_free_text, options, DialogStep, SUBMIT_KEY};
 pub enum InputTarget {
     Reply(IssueId),
     Config(String),
+    /// The new budget in USD of the issue's run.
+    Budget(IssueId),
     /// An answer to QUESTION comment `.1` on the issue.
     Answer(IssueId, i64),
 }
@@ -390,6 +392,7 @@ pub fn handle_key(mode: Mode, key: KeyEvent, scroll_max: u16) -> (Option<Mode>, 
                 let action = match target {
                     InputTarget::Reply(id) => Action::Reply(id, text),
                     InputTarget::Config(key) => Action::SetConfig(key, text),
+                    InputTarget::Budget(id) => Action::RaiseBudget(id, text),
                     InputTarget::Answer(id, question) => Action::Answer(id, question, text),
                 };
                 (None, action)

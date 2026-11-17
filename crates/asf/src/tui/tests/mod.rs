@@ -21,7 +21,9 @@ use super::snapshot::{
 use super::theme::no_color_requested;
 use super::theme::Theme;
 use super::views::now;
-use super::{bg_outcome, config_set_status, config_unset_status, keys_status, post_answer, BgKind};
+use super::{
+    bg_outcome, config_set_status, config_unset_status, keys_status, parse_usd, post_answer, BgKind,
+};
 
 /// Selection and row queries the older tests were written against; the views own the state now.
 impl App {

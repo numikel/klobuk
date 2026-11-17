@@ -482,7 +482,15 @@ pub enum RunCmd {
     /// Latest run of an issue plus the live agent state.
     Show { id: IssueId },
     /// Send a prompt to the worker (also unblocks a `blocked` run).
-    Reply { id: IssueId, text: String },
+    Reply {
+        id: IssueId,
+        text: String,
+        /// Raise the run's budget to this many USD first (like `run budget`), then send the prompt.
+        #[arg(long, value_name = "USD")]
+        budget: Option<f64>,
+    },
+    /// Set the budget (USD) of the issue's latest run; an `over_budget` run goes back to `working`.
+    Budget { id: IssueId, usd: f64 },
     /// Send logical keys (`enter`, `esc`, `down`, `y`, `ctrl+c`, …) to the worker pane.
     Keys {
         id: IssueId,

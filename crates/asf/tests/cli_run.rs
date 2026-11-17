@@ -1767,3 +1767,245 @@ fn a_run_env_alone_pins_the_lane_to_the_run_issue() {
     let (v, code) = say(&f.issue);
     assert_eq!(code, Some(0), "{v}");
 }
+
+// ---- asf run budget / run reply --budget (asf-140) ----
+
+/// `asf hook <event>` as the worker's Claude Code would call it: from the worktree, `ASF_RUN` set.
+fn hook_call(f: &F, event: &str, stdin: &serde_json::Value) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_asf"))
+        .args(["hook", event])
+        .current_dir(wt(f))
+        .env_remove("ASF_ISSUE")
+        .env("ASF_RUN", active_run(f).id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Whether the pre-tool hook lets the worker edit `src/ok.rs`.
+fn edit_allowed(f: &F) -> bool {
+    let payload = serde_json::json!({
+        "session_id": "s", "transcript_path": "C:/x.jsonl", "hook_event_name": "PreToolUse",
+        "tool_name": "Edit", "tool_use_id": "t",
+        "tool_input": { "file_path": wt(f).join("src").join("ok.rs").to_string_lossy(), "content": "x" }
+    });
+    !hook_call(f, "pre-tool", &payload).contains("deny")
+}
+
+fn status_line(f: &F, cost: f64) -> String {
+    let payload = serde_json::json!({
+        "session_id": "s", "transcript_path": "C:/x.jsonl",
+        "cost": { "total_cost_usd": cost, "total_duration_ms": 1000 },
+        "context_window": { "total_input_tokens": 1, "total_output_tokens": 1 }
+    });
+    hook_call(f, "status", &payload)
+}
+
+fn patch_run(f: &F, p: RunPatch) {
+    store(f).update_run(&active_run(f).id, &p).unwrap();
+}
+
+fn budget_events(f: &F) -> Vec<serde_json::Value> {
+    store(f)
+        .events_since(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "run.budget_raised")
+        .map(|e| e.payload)
+        .collect()
+}
+
+#[test]
+fn budget_raises_the_latest_run_writes_the_event_and_prints_old_to_new() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    patch_run(
+        &f,
+        RunPatch {
+            cost_usd: Some(3.0),
+            ..RunPatch::default()
+        },
+    );
+    let res = f.repo.ok(&["run", "budget", &f.issue, "14"]);
+    assert_eq!(
+        (res["old"].as_f64(), res["new"].as_f64()),
+        (Some(5.0), Some(14.0))
+    );
+    assert_eq!(active_run(&f).budget_usd, Some(14.0));
+    let events = budget_events(&f);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (events[0]["old"].as_f64(), events[0]["new"].as_f64()),
+        (Some(5.0), Some(14.0))
+    );
+    let text = f
+        .repo
+        .asf()
+        .args(["run", "budget", &f.issue, "14.5"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("$14.00 -> $14.50"), "{text}");
+}
+
+#[test]
+fn budget_below_the_cost_or_not_a_number_is_refused_with_exit_2() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    patch_run(
+        &f,
+        RunPatch {
+            cost_usd: Some(3.0),
+            ..RunPatch::default()
+        },
+    );
+    let (code, ecode, msg) = f.repo.err(&["run", "budget", &f.issue, "2.5"]);
+    assert_eq!((code, ecode.as_str()), (2, "usage"), "{msg}");
+    assert!(msg.contains("$3.00"), "{msg}");
+    let (code, ecode, _) = f.repo.err(&["run", "budget", &f.issue, "nan"]);
+    assert_eq!((code, ecode.as_str()), (2, "usage"));
+    assert_eq!(
+        active_run(&f).budget_usd,
+        Some(5.0),
+        "a refused value changes nothing"
+    );
+    assert!(budget_events(&f).is_empty());
+    // the cost itself is allowed: the hook trips only above the budget
+    f.repo.ok(&["run", "budget", &f.issue, "3"]);
+    let (code, ecode, _) = f.repo.err(&["run", "budget", "asf-9", "9"]);
+    assert_eq!((code, ecode.as_str()), (1, "not_found"));
+}
+
+#[test]
+fn raising_an_over_budget_run_sets_it_working_clears_the_reason_and_lets_the_hook_allow_edits() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    assert!(edit_allowed(&f));
+    // the statusline trips the budget: BLOCKER, state, denied edits
+    assert!(status_line(&f, 6.0).contains("OVER BUDGET"));
+    let run = active_run(&f);
+    assert_eq!(run.state, RunState::OverBudget);
+    assert!(run.exit_reason.is_some());
+    let blocker = store(&f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|c| c.kind == CommentType::Blocker)
+        .unwrap();
+    assert!(
+        blocker
+            .body
+            .contains(&format!("asf run budget {} <usd>", f.issue))
+            && blocker
+                .body
+                .contains(&format!("asf run reply --budget <usd> {}", f.issue)),
+        "{}",
+        blocker.body
+    );
+    assert!(!edit_allowed(&f));
+
+    let res = f.repo.ok(&["run", "budget", &f.issue, "14"]);
+    assert_eq!(
+        (res["state_before"].as_str(), res["state"].as_str()),
+        (Some("over_budget"), Some("working"))
+    );
+    let run = active_run(&f);
+    assert_eq!((run.state, run.exit_reason.clone()), (RunState::Working, None));
+    assert!(edit_allowed(&f), "the next hook call sees the new limit");
+    // the next status line is under the new budget: no second BLOCKER, still working
+    assert!(!status_line(&f, 6.5).contains("OVER BUDGET"));
+    let blockers = store(&f)
+        .comments(&f.issue.parse().unwrap())
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.kind == CommentType::Blocker)
+        .count();
+    assert_eq!(blockers, 1);
+    assert_eq!(active_run(&f).state, RunState::Working);
+}
+
+#[test]
+fn the_hook_compares_cost_with_the_budget_and_not_the_stored_state() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    // a run left in over_budget although the cost is back under the budget (an operator edited the row)
+    patch_run(
+        &f,
+        RunPatch {
+            state: Some(RunState::OverBudget),
+            cost_usd: Some(1.0),
+            ..RunPatch::default()
+        },
+    );
+    assert!(edit_allowed(&f));
+    // the other way round: state working, cost above the budget
+    patch_run(
+        &f,
+        RunPatch {
+            state: Some(RunState::Working),
+            cost_usd: Some(5.5),
+            ..RunPatch::default()
+        },
+    );
+    assert!(!edit_allowed(&f));
+}
+
+#[test]
+fn a_run_stopped_by_the_tool_call_cap_stays_denied() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    patch_run(
+        &f,
+        RunPatch {
+            state: Some(RunState::OverBudget),
+            tool_calls: Some(100_000),
+            ..RunPatch::default()
+        },
+    );
+    assert!(!edit_allowed(&f));
+}
+
+#[test]
+fn reply_with_budget_raises_and_sends_in_one_step() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    status_line(&f, 6.0);
+    assert_eq!(active_run(&f).state, RunState::OverBudget);
+    assert!(!edit_allowed(&f));
+    f.repo.ok(&[
+        "run",
+        "reply",
+        "--budget",
+        "14",
+        &f.issue,
+        "carry on with the review fixes",
+    ]);
+    let run = active_run(&f);
+    assert_eq!((run.state, run.budget_usd), (RunState::Working, Some(14.0)));
+    assert!(fake(&f)
+        .log()
+        .iter()
+        .any(|e| e.op == "prompt" && e.args["text"] == "carry on with the review fixes"));
+    assert!(edit_allowed(&f));
+    assert_eq!(budget_events(&f).len(), 1);
+    // a refused amount sends nothing
+    let sent = fake(&f).log().iter().filter(|e| e.op == "prompt").count();
+    let (code, ecode, _) = f
+        .repo
+        .err(&["run", "reply", "--budget", "1", &f.issue, "never sent"]);
+    assert_eq!((code, ecode.as_str()), (2, "usage"));
+    assert_eq!(fake(&f).log().iter().filter(|e| e.op == "prompt").count(), sent);
+}

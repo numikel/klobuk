@@ -363,6 +363,15 @@ pub(crate) fn post_answer(
     Ok(format!("answered #{question} on {id}"))
 }
 
+/// The amount typed into the budget input: `14`, `14.5` or `$14.50`.
+pub(crate) fn parse_usd(typed: &str) -> Result<f64, AppError> {
+    typed
+        .trim()
+        .trim_start_matches('$')
+        .parse()
+        .map_err(|_| AppError::usage(format!("`{}` is not a number of USD", typed.trim())))
+}
+
 /// Executes one quick action; returns the status line to show. `Tick` and `Start` are slow and are
 /// spawned by the event loop instead (see [`Background`]).
 fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<String>, AppError> {
@@ -407,6 +416,10 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
         Action::Abort(id) => {
             worker.abort(&id)?;
             Some(format!("aborted {id}"))
+        }
+        Action::RaiseBudget(id, typed) => {
+            let usd = parse_usd(&typed)?;
+            Some(crate::commands::run::raise_budget(ctx, &id, usd)?.text())
         }
         Action::SetConfig(key, value) => Some(config_set_status(&ctx.root, &key, &value)),
         Action::UnsetConfig(key) => Some(config_unset_status(&ctx.root, &key)),

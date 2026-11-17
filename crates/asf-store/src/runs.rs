@@ -132,6 +132,58 @@ pub(crate) fn update_run(store: &SqliteStore, id: &str, p: &RunPatch) -> Result<
     })
 }
 
+impl SqliteStore {
+    /// Sets the budget of run `id` to `usd` and returns the run as it was and as it is now.
+    ///
+    /// One IMMEDIATE transaction: the budget, the event `run.budget_raised` (old/new/actor) and, for a
+    /// run in `over_budget`, the move back to `working` with `exit_reason` cleared (plus the usual
+    /// `run.state` event). A value below the run's cost is refused (`Validation`): the hook would
+    /// trip it again on the next status line.
+    // An inherent method, not an `IssueStore` one: the port lives in `asf-core`, outside this change.
+    pub fn raise_run_budget(&self, id: &str, usd: f64, actor: &str) -> Result<(Run, Run), StoreError> {
+        self.with_tx(|tx| {
+            let before = require_run(tx, id)?;
+            if !usd.is_finite() || usd < before.cost_usd {
+                return Err(StoreError::Validation(format!(
+                    "budget ${usd:.2} is below the ${:.2} the run has already cost",
+                    before.cost_usd
+                )));
+            }
+            let back = before.state == RunState::OverBudget;
+            let state = if back { RunState::Working } else { before.state };
+            tx.execute(
+                "UPDATE runs SET budget_usd=?2, state=?3, exit_reason=CASE WHEN ?4 THEN NULL ELSE exit_reason END WHERE id=?1",
+                params![id, usd, state.as_str(), back],
+            )
+            .map_err(backend)?;
+            let event = |kind: &str, payload: serde_json::Value| NewEvent {
+                kind: kind.into(),
+                issue_id: Some(before.issue_id.clone()),
+                run_id: Some(id.to_string()),
+                actor: Some(actor.to_string()),
+                payload,
+            };
+            append_event_tx(
+                tx,
+                &event(
+                    "run.budget_raised",
+                    serde_json::json!({ "old": before.budget_usd, "new": usd, "state": state.as_str() }),
+                ),
+            )?;
+            if back {
+                append_event_tx(
+                    tx,
+                    &event(
+                        "run.state",
+                        serde_json::json!({ "from": before.state.as_str(), "to": state.as_str(), "reason": null }),
+                    ),
+                )?;
+            }
+            Ok((before, require_run(tx, id)?))
+        })
+    }
+}
+
 pub(crate) fn get_run(store: &SqliteStore, id: &str) -> Result<Option<Run>, StoreError> {
     store.read(|c| run_by_id(c, id))
 }

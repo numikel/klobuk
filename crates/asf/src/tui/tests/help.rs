@@ -191,7 +191,7 @@ fn help_page_is_the_mockup_title_two_columns_of_groups_the_legend_and_its_own_hi
 }
 
 #[test]
-fn when_an_agent_needs_you_lists_a_f_r_v_x_in_the_mockup_order_and_r_says_both_things() {
+fn when_an_agent_needs_you_lists_a_b_f_r_v_x_in_the_mockup_order_and_r_says_both_things() {
     use crate::tui::bindings::help_sections;
     let sections = help_sections();
     let needs = sections
@@ -199,9 +199,9 @@ fn when_an_agent_needs_you_lists_a_f_r_v_x_in_the_mockup_order_and_r_says_both_t
         .find(|s| s.title == "WHEN AN AGENT NEEDS YOU")
         .expect("the group is on the page");
     let keys: Vec<&str> = needs.items.iter().map(|(k, _)| *k).collect();
-    assert_eq!(keys, ["a", "f", "r", "v", "x"]);
+    assert_eq!(keys, ["a", "b", "f", "r", "v", "x"]);
     // `r` writes to the agent in four views and retries a merge in Now: one row says both
-    let r = &needs.items[2].1;
+    let r = &needs.items[3].1;
     assert!(r.starts_with("send the agent a message"), "{r:?}");
     assert!(r.contains("Now") && r.contains("merge"), "{r:?}");
     // the QUEUE heading lists the keys the Queue view has (there `r` retries, it does not reply)
@@ -221,6 +221,7 @@ fn when_an_agent_needs_you_lists_a_f_r_v_x_in_the_mockup_order_and_r_says_both_t
     };
     let order = [
         at("answer: shows"),
+        at("set a new budget for the agent"),
         at("focus the agent's own"),
         at("send the agent a message"),
         at("check a failed run again"),

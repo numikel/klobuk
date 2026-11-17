@@ -121,6 +121,23 @@ fn relative_to_worktree(root: &Path, worktree_rel: &str, file: &Path) -> Option<
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
+/// Why the run may not edit any more, `None` when it may. The budget is decided by comparing the cost
+/// with the budget row, never by the stored state: an operator can raise the budget (`asf run budget`,
+/// or SQL) without the state following, and that must be enough (asf-66, 2026-11-09). The tool-call cap
+/// has no row to compare with, so a run it tripped (`over_budget` past the cap) stays stopped.
+fn edits_stopped(ctx: &Ctx, run: &Run) -> Option<String> {
+    let cap = ctx.config.worker.max_tool_calls as i64;
+    if run.state == RunState::Aborted {
+        Some("is aborted".into())
+    } else if let Some(b) = run.budget_usd.filter(|b| run.cost_usd > *b) {
+        Some(format!("is over its budget (${:.2} of ${b:.2})", run.cost_usd))
+    } else if run.state == RunState::OverBudget && cap > 0 && run.tool_calls > cap {
+        Some(format!("exceeded max_tool_calls ({cap})"))
+    } else {
+        None
+    }
+}
+
 fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
     let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or("");
     if !matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
@@ -129,10 +146,10 @@ fn pre_tool(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
     let Some(file) = input.pointer("/tool_input/file_path").and_then(Value::as_str) else {
         return Ok(String::new());
     };
-    if matches!(run.state, RunState::OverBudget | RunState::Aborted) {
+    if let Some(why) = edits_stopped(ctx, run) {
         return Ok(deny(&format!(
-            "asf: run {} is {} (budget exhausted or aborted); stop and report via `asf issue comment`",
-            run.id, run.state
+            "asf: run {} {why}; stop and report via `asf issue comment`",
+            run.id
         )));
     }
     let issue = ctx
@@ -315,13 +332,14 @@ fn status(ctx: &Ctx, run: &Run, input: &Value) -> Result<String, AppError> {
             ctx,
             run,
             format!(
-                "Run {} for {} is over budget: ${cost_now:.2} > ${:.2}. Further edits are denied; `asf run reply {}` \
-                 to continue with a raised budget or `asf run abort {}`.",
+                "Run {} for {} is over budget: ${cost_now:.2} > ${:.2}. Further edits are denied; continue with \
+                 `asf run budget {id} <usd>` (raise it, the worker keeps its context), \
+                 `asf run reply --budget <usd> {id} \"<guidance>\"` (raise it and send guidance in one step) \
+                 or stop it with `asf run abort {id}`.",
                 run.id,
                 run.issue_id,
                 run.budget_usd.unwrap_or(0.0),
-                run.issue_id,
-                run.issue_id
+                id = run.issue_id,
             ),
         )?;
     }

@@ -1,7 +1,7 @@
 //! `asf run …` — allocation plan and worker lifecycle.
 
 use asf_core::scheduler::{self, AllocationPlan, RunCounts, SchedulerInput};
-use asf_core::{IssueFilter, IssueStore};
+use asf_core::{IssueFilter, IssueId, IssueStore, RunState};
 use serde::Serialize;
 
 use crate::cli::{Cli, RunCmd};
@@ -67,9 +67,18 @@ pub fn run(cli: &Cli, cmd: &RunCmd) -> Result<Rendered, AppError> {
             );
             Rendered::new(&s, text)
         }
-        RunCmd::Reply { id, text } => {
-            let r = Worker::new(&ctx)?.reply(id, text)?;
-            Rendered::new(&r, format!("sent to {} ({})", r.issue_id, r.state))
+        RunCmd::Reply { id, text, budget } => {
+            let w = Worker::new(&ctx)?;
+            // Raised before the prompt goes out: the worker's next hook call must already see the new limit.
+            let raised = budget.map(|usd| raise_budget(&ctx, id, usd)).transpose()?;
+            let r = w.reply(id, text)?;
+            let note = raised.map(|b| format!("; {}", b.text())).unwrap_or_default();
+            Rendered::new(&r, format!("sent to {} ({}){note}", r.issue_id, r.state))
+        }
+        RunCmd::Budget { id, usd } => {
+            let b = raise_budget(&ctx, id, *usd)?;
+            let text = b.text();
+            Rendered::new(&b, text)
         }
         RunCmd::Keys { id, keys } => {
             let r = Worker::new(&ctx)?.keys(id, keys)?;
@@ -103,6 +112,68 @@ pub fn run(cli: &Cli, cmd: &RunCmd) -> Result<Rendered, AppError> {
             Rendered::new(&w, text)
         }
     }
+}
+
+/// What `asf run budget` did to the latest run of an issue.
+#[derive(Serialize)]
+pub struct BudgetRaised {
+    pub issue_id: IssueId,
+    pub run_id: String,
+    /// `None` when the run had no budget.
+    pub old: Option<f64>,
+    pub new: f64,
+    pub cost_usd: f64,
+    pub state_before: RunState,
+    pub state: RunState,
+}
+
+impl BudgetRaised {
+    pub fn text(&self) -> String {
+        let usd = |v: f64| format!("${v:.2}");
+        let moved = if self.state_before == self.state {
+            String::new()
+        } else {
+            format!("; {} -> {}", self.state_before, self.state)
+        };
+        format!(
+            "{} budget {} -> {} (cost {}{moved})",
+            self.issue_id,
+            self.old.map_or_else(|| "none".to_string(), usd),
+            usd(self.new),
+            usd(self.cost_usd),
+        )
+    }
+}
+
+/// Sets the budget of the latest run of `id` (also for the TUI key). An `over_budget` run goes back to
+/// `working`; a value below the run's cost is a usage error, because the hook would trip it again.
+pub fn raise_budget(ctx: &Ctx, id: &IssueId, usd: f64) -> Result<BudgetRaised, AppError> {
+    if !usd.is_finite() || usd < 0.0 {
+        return Err(AppError::usage(format!(
+            "budget must be a number of USD >= 0, got {usd}"
+        )));
+    }
+    let run = ctx
+        .store
+        .runs(Some(id), false)?
+        .pop()
+        .ok_or_else(|| AppError::not_found(format!("no run for {id}")))?;
+    if usd < run.cost_usd {
+        return Err(AppError::usage(format!(
+            "budget ${usd:.2} is below the ${:.2} {id} has already cost; use at least that",
+            run.cost_usd
+        )));
+    }
+    let (before, after) = ctx.store.raise_run_budget(&run.id, usd, &ctx.author())?;
+    Ok(BudgetRaised {
+        issue_id: after.issue_id,
+        run_id: after.id,
+        old: before.budget_usd,
+        new: usd,
+        cost_usd: after.cost_usd,
+        state_before: before.state,
+        state: after.state,
+    })
 }
 
 /// Active runs of the current store snapshot, workers apart from reviewers.

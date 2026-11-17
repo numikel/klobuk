@@ -61,6 +61,15 @@ pub const BINDINGS: &[Binding] = &[
         Slot::Hint,
     ),
     b(
+        "b",
+        "budget",
+        "set a new budget for the agent;\nan over-budget one goes back to work",
+        Group::NeedsYou,
+        AGENTS,
+        NORMAL,
+        Slot::None,
+    ),
+    b(
         "Enter",
         "open issue",
         HELP_OPEN,
@@ -479,6 +488,7 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
         KeyCode::Char('a') => answer_blocked(snap, id),
         KeyCode::Char('r') => reply_input(id),
         KeyCode::Char('x') => abort_run(snap, id),
+        KeyCode::Char('b') => super::now::budget_input(snap, id),
         _ => Action::None,
     }
 }
