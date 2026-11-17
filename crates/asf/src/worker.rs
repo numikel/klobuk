@@ -2049,8 +2049,15 @@ impl<'a> Worker<'a> {
     /// not the answer yet: the question stays open and the run stays blocked until the review page is
     /// submitted. The trailing pseudo-key [`SUBMIT_KEY`] does that: it waits for the review page, presses
     /// Enter on `Submit answers` and settles the question with the review page (every question and the
-    /// option picked for it) in the ANSWER, so the dossier shows the whole answer.
+    /// option picked for it) in the ANSWER, so the dossier shows the whole answer. `submit` is checked
+    /// against the pane before any key goes out: on the last question tab the plain keys are sent, on the
+    /// review page they are dropped (a digit there picks Submit/Cancel), anywhere else it is refused.
     pub fn keys(&self, id: &IssueId, keys: &[String]) -> Result<Run, AppError> {
+        self.keys_with(id, keys, SUBMIT_WAIT)
+    }
+
+    /// [`Worker::keys`] with the wait for the review page given, so a test need not sit through it.
+    fn keys_with(&self, id: &IssueId, keys: &[String], wait: Duration) -> Result<Run, AppError> {
         let run = self.run_for(id)?;
         let h = Self::handle(&run)?;
         let asked = self.newest_open_question(&run.issue_id)?;
@@ -2075,6 +2082,24 @@ impl<'a> Worker<'a> {
             String::new()
         };
         let step = dialog_step(&before);
+        // `submit` is only sound on the last question tab (its digit answers it, the review page comes
+        // after) or on the review page itself (the digit would land on `1. Submit / 2. Cancel`, so no
+        // plain key goes out and Enter is pressed on `Submit answers` alone). Anywhere else a key would
+        // answer the wrong thing, so nothing is sent.
+        let plain: &[String] = if submit {
+            match &step {
+                DialogStep::Question { tabs, answered, .. } if answered + 1 == tabs.len() => plain,
+                DialogStep::Review { .. } => &[],
+                _ => {
+                    return Err(AppError::conflict(
+                        "`submit` needs the pane on the last question of a multi-question dialog \
+                         or on its review page; no key was sent",
+                    ))
+                }
+            }
+        } else {
+            plain
+        };
         if !plain.is_empty() {
             let ks: Vec<&str> = plain.iter().map(String::as_str).collect();
             self.rt.send_keys(&h, &ks).map_err(rt_err)?;
@@ -2109,7 +2134,7 @@ impl<'a> Worker<'a> {
             return Ok(run);
         }
         if submit {
-            review = Some(self.submit_review(&h, SUBMIT_WAIT)?);
+            review = Some(self.submit_review(&h, wait)?);
         } else if matches!(step, DialogStep::Question { .. }) {
             return Ok(run);
         }
@@ -3767,17 +3792,18 @@ mod tests {
     }
 
     #[test]
-    fn submit_presses_enter_on_the_review_page_and_answers_with_what_the_human_chose() {
+    fn submit_on_the_review_page_presses_enter_only_and_answers_with_what_the_human_chose() {
         let fx = fixture();
         run_in(&fx, RunState::Blocked);
         let (_, q) = announce(&fx, "Which?");
         show(&fx, TABS_REVIEW);
 
+        // the fresh read already shows the review page: the digit would land on `2. Cancel`, so it is dropped
         let after = worker(&fx)
             .keys(&fx.issue.id, &["2".to_string(), SUBMIT_KEY.to_string()])
             .unwrap();
 
-        assert_eq!(keys_sent(&fx), [json!(["2"]), json!(["enter"])]);
+        assert_eq!(keys_sent(&fx), [json!(["enter"])]);
         assert_eq!(after.state, RunState::Working);
         assert!(unread(&fx).is_empty());
         let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
@@ -3786,9 +3812,77 @@ mod tests {
             (
                 CommentType::Answer,
                 Some(q.id),
-                "answered in the worker pane: First: Pick A or B? → A; Second: Pick X or Y? → Y (last keys: 2 enter)"
+                "answered in the worker pane: First: Pick A or B? → A; Second: Pick X or Y? → Y (last keys: enter)"
             )
         );
+    }
+
+    #[test]
+    fn submit_after_the_last_tab_sends_its_digit_and_settles_nothing_when_the_review_page_never_shows() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        let (blocker, q) = announce(&fx, "Which?");
+        show(&fx, TABS_SECOND);
+
+        let err = worker(&fx)
+            .keys_with(
+                &fx.issue.id,
+                &["2".to_string(), SUBMIT_KEY.to_string()],
+                Duration::ZERO,
+            )
+            .unwrap_err();
+
+        assert!(err.message.contains("did not show the review page"), "{err:?}");
+        assert_eq!(keys_sent(&fx), [json!(["2"])]);
+        assert_eq!(unread(&fx), [blocker.id, q.id]);
+        assert!(comment_by_id(&fx, q.id).resolved_at.is_none());
+        let run = worker(&fx).show(&fx.issue.id).unwrap().run;
+        assert_eq!(run.state, RunState::Blocked);
+    }
+
+    #[test]
+    fn submit_is_refused_before_any_key_when_the_pane_is_not_on_the_last_tab_or_the_review_page() {
+        for screen in [TABS_FIRST, "Pick?\n❯ 1. A\n  2. B", ""] {
+            let fx = fixture();
+            run_in(&fx, RunState::Blocked);
+            announce(&fx, "Which?");
+            show(&fx, screen);
+
+            let err = worker(&fx)
+                .keys_with(
+                    &fx.issue.id,
+                    &["2".to_string(), SUBMIT_KEY.to_string()],
+                    Duration::ZERO,
+                )
+                .unwrap_err();
+
+            assert!(err.message.contains("last question"), "{screen:?}: {err:?}");
+            assert!(keys_sent(&fx).is_empty(), "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn submit_on_a_review_page_with_the_cursor_on_cancel_sends_no_key_at_all() {
+        let fx = fixture();
+        run_in(&fx, RunState::Blocked);
+        announce(&fx, "Which?");
+        show(
+            &fx,
+            &TABS_REVIEW
+                .replace("❯ 1. Submit", "  1. Submit")
+                .replace("  2. Cancel", "❯ 2. Cancel"),
+        );
+
+        let err = worker(&fx)
+            .keys_with(
+                &fx.issue.id,
+                &["1".to_string(), SUBMIT_KEY.to_string()],
+                Duration::ZERO,
+            )
+            .unwrap_err();
+
+        assert!(err.message.contains("cursor is not on"), "{err:?}");
+        assert!(keys_sent(&fx).is_empty());
     }
 
     #[test]
@@ -3806,7 +3900,7 @@ mod tests {
         let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
         assert_eq!(
             answer.body,
-            "answered in the worker pane: last keys: 2 enter (the answer of each tab is in its FYI note)"
+            "answered in the worker pane: last keys: enter (the answer of each tab is in its FYI note)"
         );
     }
 
