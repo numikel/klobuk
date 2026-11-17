@@ -3924,6 +3924,204 @@ mod tests {
         );
     }
 
+    /// A runtime whose screen changes in the middle of a call: the fake's scripted screen is static, so
+    /// this one swaps in `then` when the `at`-th `read` starts (the review page rendering a moment after
+    /// the last key). One thread, one counter: no timing, no race on the fake's file.
+    struct Flip {
+        inner: FakeRuntime,
+        path: PathBuf,
+        then: String,
+        at: u32,
+        reads: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl AgentRuntime for Flip {
+        fn health(&self) -> Result<RuntimeInfo, RuntimeError> {
+            self.inner.health()
+        }
+        fn open_workspace(&self, r: &OpenWorkspace) -> Result<WorkspaceRef, RuntimeError> {
+            self.inner.open_workspace(r)
+        }
+        fn start_agent(&self, r: &StartAgent) -> Result<AgentInfo, RuntimeError> {
+            self.inner.start_agent(r)
+        }
+        fn prompt(
+            &self,
+            h: &AgentHandle,
+            text: &str,
+            until: &[AgentState],
+            timeout_ms: u64,
+        ) -> Result<AgentInfo, RuntimeError> {
+            self.inner.prompt(h, text, until, timeout_ms)
+        }
+        fn wait(
+            &self,
+            h: &AgentHandle,
+            until: &[AgentState],
+            timeout_ms: u64,
+        ) -> Result<AgentInfo, RuntimeError> {
+            self.inner.wait(h, until, timeout_ms)
+        }
+        fn info(&self, h: &AgentHandle) -> Result<AgentInfo, RuntimeError> {
+            self.inner.info(h)
+        }
+        fn read(&self, h: &AgentHandle, lines: u32) -> Result<String, RuntimeError> {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.at {
+                FakeRuntime::new(self.path.clone())
+                    .script(json!({ "screen": self.then }))
+                    .unwrap();
+            }
+            self.inner.read(h, lines)
+        }
+        fn send_keys(&self, h: &AgentHandle, keys: &[&str]) -> Result<(), RuntimeError> {
+            self.inner.send_keys(h, keys)
+        }
+        fn focus(&self, h: &AgentHandle) -> Result<(), RuntimeError> {
+            self.inner.focus(h)
+        }
+        fn report(
+            &self,
+            pane_id: &str,
+            title: Option<&str>,
+            tokens: &[(String, String)],
+        ) -> Result<(), RuntimeError> {
+            self.inner.report(pane_id, title, tokens)
+        }
+        fn close_workspace(&self, workspace_id: &str) -> Result<(), RuntimeError> {
+            self.inner.close_workspace(workspace_id)
+        }
+        fn notify(&self, title: &str, body: &str, sound: Option<&str>) -> Result<(), RuntimeError> {
+            self.inner.notify(title, body, sound)
+        }
+    }
+
+    /// A worker whose pane shows the review page from its `at`-th read on; the counter says how many
+    /// reads happened.
+    fn worker_showing_the_review_from_read(
+        fx: &Fx,
+        at: u32,
+    ) -> (Worker<'_>, Arc<std::sync::atomic::AtomicU32>) {
+        let reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let rt = Flip {
+            inner: FakeRuntime::new(fake_path(fx)),
+            path: fake_path(fx),
+            then: TABS_REVIEW.to_string(),
+            at,
+            reads: Arc::clone(&reads),
+        };
+        let w = Worker {
+            ctx: &fx.ctx,
+            rt: Box::new(rt),
+            vcs: GitCli,
+        };
+        (w, reads)
+    }
+
+    fn fyi_bodies(fx: &Fx) -> Vec<String> {
+        fx.ctx
+            .store
+            .comments(&fx.issue.id)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.kind == CommentType::Fyi)
+            .map(|c| c.body)
+            .collect()
+    }
+
+    #[test]
+    fn a_whole_two_tab_walk_reaches_the_pane_as_1_2_enter_and_settles_with_the_review() {
+        let fx = fixture();
+        let run = run_in(&fx, RunState::Blocked);
+        let (_, q) = announce(&fx, "Which?");
+
+        // tab 1: a digit, the run stays blocked
+        show(&fx, TABS_FIRST);
+        let mid = worker(&fx).keys(&fx.issue.id, &["1".to_string()]).unwrap();
+        assert_eq!(mid.state, RunState::Blocked);
+
+        // tab 2 + submit, exactly the keys the overlay sends; the review page renders on the 3rd read:
+        // read 1 = before the keys, read 2 = the first look for the page (still the last tab), read 3 = page
+        show(&fx, TABS_SECOND);
+        let (w, reads) = worker_showing_the_review_from_read(&fx, 3);
+        let after = w
+            .keys_with(
+                &fx.issue.id,
+                &["2".to_string(), SUBMIT_KEY.to_string()],
+                Duration::from_secs(2),
+            )
+            .unwrap();
+
+        assert_eq!(keys_sent(&fx), [json!(["1"]), json!(["2"]), json!(["enter"])]);
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "it waited for the page"
+        );
+        assert_eq!(after.state, RunState::Working);
+        assert_eq!(
+            fx.ctx.store.get_run(&run.id).unwrap().unwrap().state,
+            RunState::Working
+        );
+        assert!(unread(&fx).is_empty());
+        assert_eq!(
+            fyi_bodies(&fx),
+            [
+                "dialog tab 1 of 2 (First): sent 1 (A)",
+                "dialog tab 2 of 2 (Second): sent 2 (Y)"
+            ]
+        );
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert_eq!(
+            (answer.kind, answer.reply_to, answer.body.as_str()),
+            (
+                CommentType::Answer,
+                Some(q.id),
+                "answered in the worker pane: First: Pick A or B? → A; Second: Pick X or Y? → Y (last keys: 2 enter)"
+            )
+        );
+        assert!(
+            comment_by_id(&fx, q.id).resolved_at.is_some(),
+            "the question is settled"
+        );
+    }
+
+    #[test]
+    fn a_typed_reply_on_the_last_tab_types_submits_and_settles_when_the_review_page_shows() {
+        let fx = fixture();
+        let run = run_in(&fx, RunState::Blocked);
+        let (_, q) = announce(&fx, "Which?");
+        show(&fx, TABS_SECOND);
+        // read 1 = the tab check, read 2 = still the last tab, read 3 = the review page
+        let (w, reads) = worker_showing_the_review_from_read(&fx, 3);
+
+        let after = w.reply_with(&fx.issue.id, "why", Duration::from_secs(2)).unwrap();
+
+        assert_eq!(
+            keys_sent(&fx),
+            [json!(["3", "w", "h", "y", "enter"]), json!(["enter"])]
+        );
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "it waited for the page"
+        );
+        assert_eq!(after.state, RunState::Working);
+        assert_eq!(
+            fx.ctx.store.get_run(&run.id).unwrap().unwrap().state,
+            RunState::Working
+        );
+        assert!(unread(&fx).is_empty());
+        assert_eq!(fyi_bodies(&fx), ["dialog tab 2 of 2 (Second): typed \"why\""]);
+        let answer = fx.ctx.store.comments(&fx.issue.id).unwrap().pop().unwrap();
+        assert_eq!(
+            (answer.kind, answer.reply_to, answer.body.as_str()),
+            (
+                CommentType::Answer,
+                Some(q.id),
+                "answered in the worker pane: First: Pick A or B? → A; Second: Pick X or Y? → Y (last keys: a typed reply, enter)"
+            )
+        );
+    }
+
     #[test]
     fn a_cursor_move_on_a_tab_keeps_the_run_blocked_and_the_walk_can_still_be_answered() {
         let fx = fixture();
