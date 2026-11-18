@@ -136,5 +136,8 @@ fn a_config_naming_the_old_default_methodology_is_accepted_with_one_notice() {
     let err = String::from_utf8_lossy(&out.stderr);
     let notices: Vec<&str> = err.lines().filter(|l| l.contains("asf-default")).collect();
     assert_eq!(notices.len(), 1, "{err}");
-    assert!(notices[0].contains("klobuk-default") && notices[0].contains("deprecated"), "{err}");
+    assert!(
+        notices[0].contains("klobuk-default") && notices[0].contains("deprecated"),
+        "{err}"
+    );
 }

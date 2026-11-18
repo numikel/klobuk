@@ -257,8 +257,7 @@ fn the_progress_bar_fills_a_cell_per_tenth_and_is_full_only_when_all_are_done() 
     let mut s = desk(vec![epic("asf-1", "Round", Status::Backlog)]);
     for n in 2..=31 {
         let status = if n <= 30 { Status::Done } else { Status::Backlog };
-        s.issues
-            .push(kid(&format!("klobuk-{n}"), "Child", status, "asf-1"));
+        s.issues.push(kid(&format!("asf-{n}"), "Child", status, "asf-1"));
     }
     let t = render_to_text(&board_app(s), 100, 30);
     // 29 of 30 done: nine cells, not ten, because the epic is not finished
@@ -768,7 +767,7 @@ fn cancelled_issues_and_epics_are_not_rows_so_the_selection_never_runs_past_the_
     let mut s = snapshot();
     for n in 90..93 {
         s.issues
-            .push(issue(&format!("klobuk-{n}"), "Dropped", Status::Cancelled));
+            .push(issue(&format!("asf-{n}"), "Dropped", Status::Cancelled));
     }
     s.issues.push(epic("asf-95", "Round", Status::Backlog));
     let mut a = board_app(s);
@@ -1114,7 +1113,7 @@ fn a_long_list_scrolls_to_keep_the_selection_on_screen() {
     let mut s = desk(vec![epic("asf-1", "Round", Status::Backlog)]);
     for n in 2..=60 {
         s.issues
-            .push(kid(&format!("klobuk-{n}"), "Child", Status::Backlog, "asf-1"));
+            .push(kid(&format!("asf-{n}"), "Child", Status::Backlog, "asf-1"));
     }
     let mut a = board_app(s);
     a.handle_key(key('G'));
@@ -1577,7 +1576,7 @@ fn an_empty_kanban_shows_the_columns_and_says_what_to_do() {
 fn the_done_column_shows_the_newest_cards_and_says_how_many_more() {
     let finished = || {
         let mut issues: Vec<Issue> = (1..=8)
-            .map(|n| issue(&format!("klobuk-{n}"), &format!("Finished {n}"), Status::Done))
+            .map(|n| issue(&format!("asf-{n}"), &format!("Finished {n}"), Status::Done))
             .collect();
         issues.push(issue("asf-9", "Open work", Status::Backlog));
         desk(issues)
@@ -1622,7 +1621,7 @@ fn the_done_column_shows_the_newest_cards_and_says_how_many_more() {
 #[test]
 fn a_tall_column_scrolls_to_keep_the_selected_card_on_screen() {
     let issues: Vec<Issue> = (1..=30)
-        .map(|n| issue(&format!("klobuk-{n}"), "Card", Status::Backlog))
+        .map(|n| issue(&format!("asf-{n}"), "Card", Status::Backlog))
         .collect();
     let mut a = board_app(desk(issues));
     a.handle_key(key('b'));

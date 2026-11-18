@@ -146,10 +146,10 @@ fn running_rows_show_state_title_cost_over_budget_and_elapsed_reviewers_the_mode
 fn up_next_counts_ready_and_backlog_names_the_first_ids_and_the_shared_dependency() {
     let mut issues = vec![issue("asf-24", "Running", Status::InProgress)];
     for n in 40..46 {
-        issues.push(issue(&format!("klobuk-{n}"), "Later", Status::Backlog));
+        issues.push(issue(&format!("asf-{n}"), "Later", Status::Backlog));
     }
     let mut s = desk(issues);
-    s.deps = (40..46).map(|n| dep(&format!("klobuk-{n}"), "asf-24")).collect();
+    s.deps = (40..46).map(|n| dep(&format!("asf-{n}"), "asf-24")).collect();
     let t = render_to_text(&App::new(s.clone()), 120, 30);
     assert!(
         t.contains("UP NEXT (6)   asf-40, asf-41, asf-42 … waiting for asf-24"),
@@ -184,7 +184,7 @@ fn up_next_counts_ready_and_backlog_names_the_first_ids_and_the_shared_dependenc
 #[test]
 fn done_today_lists_ids_closed_on_the_local_date_newest_first_and_truncates_with_an_ellipsis() {
     let closed = |n: u32, at: &str| {
-        let mut i = issue(&format!("klobuk-{n}"), "done", Status::Done);
+        let mut i = issue(&format!("asf-{n}"), "done", Status::Done);
         i.closed_at = Some(at.into());
         i
     };

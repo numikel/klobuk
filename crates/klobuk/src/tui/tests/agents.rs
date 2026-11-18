@@ -14,7 +14,7 @@ fn agents_desk() -> Snapshot {
     let mut s = desk(vec![
         issue("asf-27", "Add `klobuk issue scope add/rm`", Status::InProgress),
         issue("asf-29", "Reviewer approval survives retry", Status::InProgress),
-        issue("asf-28", "klobuk serve: reload config", Status::InProgress),
+        issue("asf-28", "serve: reload config", Status::InProgress),
         review,
     ]);
     let mut reviewer = run_at("asf-30", RunState::Working, "2026-11-06T11:59:00Z");
@@ -76,7 +76,7 @@ fn agents_rows_follow_the_mockup_at_120_columns() {
     );
     assert_eq!(
         words(&agents_row(&t, "asf-30")),
-        "◆ asf-30 reviewer reviewing klobuk serve: reload config · opus · r1 $0.21 / $10 ░░░░░░░░░░ 1 min 3 s ago",
+        "◆ asf-30 reviewer reviewing serve: reload config · opus · r1 $0.21 / $10 ░░░░░░░░░░ 1 min 3 s ago",
         "{t}"
     );
     let header = t.lines().find(|l| l.contains("last activity")).unwrap();
@@ -229,7 +229,7 @@ fn the_reviewer_without_a_known_round_shows_task_and_model_only() {
     s.events.retain(|e| e.kind != "merge.review_started");
     let t = render_to_text(&agents_app(s), 120, 30);
     let row = words(&agents_row(&t, "asf-30"));
-    assert!(row.contains("klobuk serve: reload config · opus $0.21"), "{row}");
+    assert!(row.contains("serve: reload config · opus $0.21"), "{row}");
 }
 
 #[test]
@@ -287,7 +287,7 @@ fn the_title_of_a_reviewer_uses_the_review_session_name() {
     a.set_pane_preview(id("asf-30"), pane_text(2));
     let t = render_to_text(&a, 120, 30);
     assert!(
-        t.contains("pane preview · asf-30 · review-asf-28-klobuk-serve-reload-config · live"),
+        t.contains("pane preview · asf-30 · review-asf-28-serve-reload-config · live"),
         "{t}"
     );
 }
@@ -388,13 +388,13 @@ fn a_run_without_a_pane_says_so() {
 fn a_long_list_scrolls_with_the_selection_and_leaves_room_for_the_preview() {
     let mut s = desk(
         (1..=14)
-            .map(|n| issue(&format!("klobuk-{n}"), "Work", Status::InProgress))
+            .map(|n| issue(&format!("asf-{n}"), "Work", Status::InProgress))
             .collect(),
     );
     s.runs = (1..=14)
         .map(|n| {
             run_at(
-                &format!("klobuk-{n}"),
+                &format!("asf-{n}"),
                 RunState::Working,
                 &format!("2026-11-06T11:{:02}:00Z", 10 + n),
             )

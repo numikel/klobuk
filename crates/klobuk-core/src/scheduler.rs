@@ -992,7 +992,7 @@ mod tests {
         fn no_two_slots_overlap(scopes in proptest::collection::vec(arb_scope(), 1..7), max in 1usize..5) {
             let tracked = strs(&["a.rs", "b.rs", "c.rs", "d/x.rs", "d/y.rs"]);
             let issues: Vec<Issue> = scopes.iter().enumerate()
-                .map(|(i, s)| { let mut it = mk(&format!("klobuk-{}", i + 1), Status::Ready, &[]); it.file_scope = s.clone(); it })
+                .map(|(i, s)| { let mut it = mk(&format!("asf-{}", i + 1), Status::Ready, &[]); it.file_scope = s.clone(); it })
                 .collect();
             let p = plan(&input(&issues, &[], &[], &tracked, max, &[]), ".worktrees").unwrap();
             prop_assert!(p.slots.len() <= max);
@@ -1021,14 +1021,14 @@ mod tests {
         ) {
             let n = statuses.len();
             let issues: Vec<Issue> = statuses.iter().enumerate()
-                .map(|(i, s)| mk(&format!("klobuk-{}", i + 1), *s, &[&format!("f{i}.rs")]))
+                .map(|(i, s)| mk(&format!("asf-{}", i + 1), *s, &[&format!("f{i}.rs")]))
                 .collect();
             let tracked: Vec<String> = (0..n).map(|i| format!("f{i}.rs")).collect();
             // an edge always points at a lower index, so the graph stays acyclic
             let deps: Vec<Dep> = edges.iter()
                 .map(|&(a, b)| (a % n, b % n))
                 .filter(|(a, b)| a > b)
-                .map(|(a, b)| dep(&format!("klobuk-{}", a + 1), &format!("klobuk-{}", b + 1)))
+                .map(|(a, b)| dep(&format!("asf-{}", a + 1), &format!("asf-{}", b + 1)))
                 .collect();
             let p = plan(&input(&issues, &deps, &[], &tracked, max, &[]), ".worktrees").unwrap();
             let open = |who: &IssueId| deps.iter().any(|d| {

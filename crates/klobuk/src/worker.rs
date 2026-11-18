@@ -4871,9 +4871,9 @@ mod gate_slot_tests {
         Job::Merge(MergeJob {
             item: MergeItem {
                 id: i64::from(id),
-                issue_id: format!("klobuk-{id}").parse().unwrap(),
+                issue_id: format!("asf-{id}").parse().unwrap(),
                 run_id: None,
-                branch: format!("feat/klobuk-{id}"),
+                branch: format!("feat/asf-{id}"),
                 state: MergeState::Gating,
                 attempts: 1,
                 head_sha: None,

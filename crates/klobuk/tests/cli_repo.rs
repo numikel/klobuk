@@ -467,7 +467,10 @@ fn a_new_repository_defaults_to_kb_and_a_config_that_says_asf_keeps_asf() {
         let _ = std::fs::remove_file(old.path().join(".factory").join(f));
     }
     let res = old.ok(&["repo", "init"]);
-    assert_eq!(res["prefix"], "asf", "prefix comes from the committed config: {res}");
+    assert_eq!(
+        res["prefix"], "asf",
+        "prefix comes from the committed config: {res}"
+    );
     assert_eq!(old.ok(&["issue", "create", "--title", "x"])["id"], "asf-1");
     old.ok(&["repo", "doctor"]);
 }

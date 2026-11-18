@@ -10,7 +10,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 fn id(n: u32) -> IssueId {
-    format!("klobuk-{n}").parse().unwrap()
+    format!("asf-{n}").parse().unwrap()
 }
 
 fn t0() -> OffsetDateTime {

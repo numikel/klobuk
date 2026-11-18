@@ -2387,9 +2387,9 @@ mod tests {
     fn item(id: i64, state: MergeState) -> MergeItem {
         MergeItem {
             id,
-            issue_id: format!("klobuk-{id}").parse().unwrap(),
+            issue_id: format!("asf-{id}").parse().unwrap(),
             run_id: None,
-            branch: format!("feat/klobuk-{id}"),
+            branch: format!("feat/asf-{id}"),
             state,
             attempts: 0,
             head_sha: None,
@@ -2407,7 +2407,7 @@ mod tests {
             seq,
             ts: String::new(),
             kind: kind.into(),
-            issue_id: Some(format!("klobuk-{issue}").parse().unwrap()),
+            issue_id: Some(format!("asf-{issue}").parse().unwrap()),
             run_id: None,
             actor: None,
             payload: serde_json::Value::Null,

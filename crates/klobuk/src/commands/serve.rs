@@ -697,7 +697,7 @@ mod tests {
     use super::*;
 
     fn id(n: u32) -> IssueId {
-        format!("klobuk-{n}").parse().unwrap()
+        format!("asf-{n}").parse().unwrap()
     }
 
     fn assessment(open: usize, busy: bool, can_start: bool) -> Assessment {

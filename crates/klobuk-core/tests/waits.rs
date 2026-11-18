@@ -4,14 +4,14 @@ use klobuk_core::remind::{screen_line, waits, Act, EventIndex, Wait, WaitInput, 
 use klobuk_core::*;
 
 fn id(n: u32) -> IssueId {
-    format!("klobuk-{n}").parse().unwrap()
+    format!("asf-{n}").parse().unwrap()
 }
 
 fn issue(n: u32, status: Status) -> Issue {
     Issue {
         id: id(n),
         uid: format!("u{n}"),
-        title: format!("Title of klobuk-{n}"),
+        title: format!("Title of asf-{n}"),
         body: String::new(),
         kind: IssueType::Task,
         status,
@@ -39,8 +39,8 @@ fn run(n: u32, attempt: i64, state: RunState, finished: &str) -> Run {
         pane_id: None,
         claude_session_id: None,
         transcript_path: None,
-        worktree: format!(".worktrees/klobuk-{n}"),
-        branch: format!("feat/klobuk-{n}"),
+        worktree: format!(".worktrees/asf-{n}"),
+        branch: format!("feat/asf-{n}"),
         base_sha: "base".into(),
         state,
         budget_usd: None,
@@ -63,7 +63,7 @@ fn merge(n: i64, issue: u32, state: MergeState, error: Option<&str>, at: &str) -
         id: n,
         issue_id: id(issue),
         run_id: None,
-        branch: format!("feat/klobuk-{issue}"),
+        branch: format!("feat/asf-{issue}"),
         state,
         attempts: 1,
         head_sha: None,
@@ -418,7 +418,7 @@ fn the_reason_is_the_one_line_that_says_why() {
         w.waits()
             .into_iter()
             .find(|x| x.waiting.issue == id(n) && x.waiting.kind == kind)
-            .unwrap_or_else(|| panic!("klobuk-{n} {kind}"))
+            .unwrap_or_else(|| panic!("asf-{n} {kind}"))
             .waiting
             .reason
     };
