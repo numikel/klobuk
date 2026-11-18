@@ -83,77 +83,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "asf-core",
- "asf-runtime",
- "asf-store",
- "asf-vcs",
- "assert_cmd",
- "clap",
- "globset",
- "predicates",
- "ratatui",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "asf-core"
-version = "0.1.0"
-dependencies = [
- "globset",
- "proptest",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "time",
- "toml",
- "toml_edit",
- "ulid",
-]
-
-[[package]]
-name = "asf-runtime"
-version = "0.1.0"
-dependencies = [
- "asf-core",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "asf-store"
-version = "0.1.0"
-dependencies = [
- "asf-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "time",
- "ulid",
-]
-
-[[package]]
-name = "asf-vcs"
-version = "0.1.0"
-dependencies = [
- "asf-core",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "assert_cmd"
 version = "2.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -878,6 +807,77 @@ dependencies = [
  "hashbrown",
  "portable-atomic",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "klobuk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "globset",
+ "klobuk-core",
+ "klobuk-runtime",
+ "klobuk-store",
+ "klobuk-vcs",
+ "predicates",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "klobuk-core"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "toml",
+ "toml_edit",
+ "ulid",
+]
+
+[[package]]
+name = "klobuk-runtime"
+version = "0.1.0"
+dependencies = [
+ "klobuk-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "klobuk-store"
+version = "0.1.0"
+dependencies = [
+ "klobuk-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "ulid",
+]
+
+[[package]]
+name = "klobuk-vcs"
+version = "0.1.0"
+dependencies = [
+ "klobuk-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

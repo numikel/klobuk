@@ -1,18 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/asf-core", "crates/asf-store", "crates/asf-vcs", "crates/asf-runtime", "crates/asf"]
+members = ["crates/klobuk-core", "crates/klobuk-store", "crates/klobuk-vcs", "crates/klobuk-runtime", "crates/klobuk"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/numikel/klobuk"
 rust-version = "1.85"
 
 [workspace.dependencies]
-asf-core = { path = "crates/asf-core" }
-asf-store = { path = "crates/asf-store" }
-asf-vcs = { path = "crates/asf-vcs" }
-asf-runtime = { path = "crates/asf-runtime" }
+klobuk-core = { path = "crates/klobuk-core" }
+klobuk-store = { path = "crates/klobuk-store" }
+klobuk-vcs = { path = "crates/klobuk-vcs" }
+klobuk-runtime = { path = "crates/klobuk-runtime" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

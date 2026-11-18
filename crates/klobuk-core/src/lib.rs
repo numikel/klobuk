@@ -1,0 +1,44 @@
+//! Domain types, ports and the pure scheduler for Klobuk.
+//!
+//! This crate performs no IO. Adapters (`klobuk-store`, the `klobuk` binary) depend on it.
+//!
+//! # Inbox relevance rule
+//!
+//! For a lane `L` other than `orchestrator`, a comment is relevant when any of these holds:
+//! it sits on an issue currently claimed by worker `L`; its `to_lane` is `L` or `all`; its author
+//! is `human`. The `orchestrator` lane sees every comment. Only comments above the lane's read
+//! cursor for that issue are returned.
+
+pub mod brief;
+pub mod config;
+pub mod config_edit;
+pub mod cost;
+pub mod error;
+pub mod github;
+pub mod ids;
+pub mod jsonl;
+pub mod lane;
+pub mod method;
+pub mod model;
+pub mod plan;
+pub mod ports;
+pub mod remind;
+pub mod run;
+pub mod runtime;
+pub mod scheduler;
+pub mod vcs;
+
+pub use brief::{render_brief, render_claude_local, render_settings, BriefInput, SettingsInput};
+pub use config::{Config, ConfigError};
+pub use error::{ClaimError, StoreError};
+pub use ids::{is_valid_prefix, IssueId};
+pub use jsonl::{CommentRecord, IssueRecord, Record, FORMAT};
+pub use model::*;
+pub use plan::{
+    detect_format, parse_md_tasks, parse_plan, parse_spec_kit, DraftTask, ParsedPlan, PlanFormat,
+    PlanParseError,
+};
+pub use ports::{ExportOpts, ImportMode, ImportReport, IssueStore};
+pub use run::*;
+pub use runtime::*;
+pub use vcs::*;

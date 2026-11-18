@@ -1,12 +1,12 @@
 # GitHub spec-kit (MIT): /speckit.specify -> /speckit.plan -> /speckit.tasks produce
-# specs/<nnn-feature>/tasks.md. asf imports that file: `asf plan import specs/<n>/tasks.md`
+# specs/<nnn-feature>/tasks.md. klobuk imports that file: `klobuk plan import specs/<n>/tasks.md`
 # (format is auto-detected; `--format spec-kit` forces it).
 
 [methodology]
 name = "spec-kit"
 version = "0.1.0"
 language = "en"
-description = "Spec-driven development with GitHub spec-kit; asf imports specs/*/tasks.md."
+description = "Spec-driven development with GitHub spec-kit; klobuk imports specs/*/tasks.md."
 
 [[stage]]
 id = "tasks"

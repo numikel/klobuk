@@ -1,0 +1,19 @@
+[package]
+name = "klobuk-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Git subprocess implementation of the klobuk Vcs port and the gate runner"
+
+[lints]
+workspace = true
+
+[dependencies]
+klobuk-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

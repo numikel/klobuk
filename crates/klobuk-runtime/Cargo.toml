@@ -1,0 +1,19 @@
+[package]
+name = "klobuk-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "AgentRuntime adapters: Herdr CLI and a file-backed fake"
+
+[lints]
+workspace = true
+
+[dependencies]
+klobuk-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

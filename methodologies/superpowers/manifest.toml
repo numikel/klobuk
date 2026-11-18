@@ -1,12 +1,12 @@
 # superpowers (MIT): brainstorming -> writing-plans produces docs/superpowers/plans/<date>-<name>.md
 # with `### Task N:` headings, `**Files:**` blocks and checkbox steps.
-# asf imports it: `asf plan import docs/superpowers/plans/<file>.md`.
+# klobuk imports it: `klobuk plan import docs/superpowers/plans/<file>.md`.
 
 [methodology]
 name = "superpowers"
 version = "0.1.0"
 language = "en"
-description = "Brainstorm and plan with the superpowers skills; asf imports the writing-plans markdown."
+description = "Brainstorm and plan with the superpowers skills; klobuk imports the writing-plans markdown."
 
 [[stage]]
 id = "brainstorm"
