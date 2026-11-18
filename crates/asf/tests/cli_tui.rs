@@ -605,3 +605,116 @@ fn tui_once_shows_why_a_stopped_loop_stopped_in_the_header_and_the_banner() {
     write_pulse(&repo, "2020-01-01T00:00:00Z", None);
     assert!(line_with(&tui_once_view(&repo, "agents"), 2).contains("without a reason"));
 }
+
+/// The gate run in flight the way `asf serve` writes it (`.factory/runs/gate-live.json`).
+fn write_gate_live(repo: &Repo, kind: &str, issue: &str, gate: &str, finished: &[(&str, u64)]) {
+    let dir = repo.path().join(".factory/runs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let live = serde_json::json!({
+        "kind": kind, "issue": issue, "gates": ["alpha", "beta", "gamma"],
+        "started_at": now_rfc3339(), "gate": gate, "gate_started_at": now_rfc3339(),
+        "finished": finished
+            .iter()
+            .map(|(n, ms)| serde_json::json!({ "name": n, "ok": true, "duration_ms": ms, "tail": "ok" }))
+            .collect::<Vec<_>>(),
+        "tail": "compiling beta\nrunning 3 tests", "updated_at": now_rfc3339(),
+    });
+    std::fs::write(dir.join("gate-live.json"), live.to_string()).unwrap();
+}
+
+/// A config whose gates are no cargo commands: the steps must carry these names.
+fn with_gates(repo: &Repo) {
+    let cfg = repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        s.push_str(&format!(
+            "\n[[gate]]\nname = \"{name}\"\ncmd = [\"echo\", \"{name}\"]\ntimeout_s = 60\n"
+        ));
+    }
+    std::fs::write(&cfg, s).unwrap();
+}
+
+#[test]
+fn tui_once_queue_prints_the_first_item_expanded_with_the_gates_of_the_config_and_the_gate_in_flight() {
+    let repo = fake_repo();
+    with_gates(&repo);
+    live_loop(&repo);
+    let a = repo.create_issue("greeting", &["--ready", "--scope", "src/**"]);
+    let b = repo.create_issue("docs", &["--ready", "--scope", "docs/**"]);
+    let s = store(&repo);
+    for (issue, state) in [(&a, MergeState::Gating), (&b, MergeState::Queued)] {
+        let item = s
+            .enqueue_merge(&issue.parse().unwrap(), None, &format!("feat/{issue}"))
+            .unwrap();
+        s.update_merge(
+            item.id,
+            &MergePatch {
+                state: Some(state),
+                ..MergePatch::default()
+            },
+        )
+        .unwrap();
+    }
+    write_gate_live(&repo, "merge", &a, "beta", &[("alpha", 2000)]);
+    let text = tui_once_view(&repo, "queue");
+    assert!(text.contains("IN THE QUEUE (2)"), "{text}");
+    for part in [
+        "attempt 1",
+        "rebase onto main",
+        "✓ gate alpha",
+        "● gate beta",
+        "running",
+        "○ gate gamma",
+        "○ merge",
+    ] {
+        assert!(text.contains(part), "{part:?} missing:\n{text}");
+    }
+    assert!(!text.contains("cargo"), "{text}");
+    // only the first item is open: the second one is its row and nothing else
+    assert_eq!(
+        text.lines().filter(|l| l.contains(&format!("feat/{b}"))).count(),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
+fn tui_once_now_says_why_a_finishing_run_waits_and_what_a_verifying_run_runs() {
+    let repo = fake_repo();
+    with_gates(&repo);
+    live_loop(&repo);
+    let holder = repo.create_issue("holder", &["--ready", "--scope", "a/**"]);
+    let waiting = repo.create_issue("waiter", &["--ready", "--scope", "b/**"]);
+    repo.ok(&["run", "start", &holder]);
+    repo.ok(&["run", "start", &waiting]);
+    let s = store(&repo);
+    let set = |issue: &str, state: RunState| {
+        let run = s
+            .runs(Some(&issue.parse().unwrap()), true)
+            .unwrap()
+            .pop()
+            .unwrap();
+        s.update_run(
+            &run.id,
+            &RunPatch {
+                state: Some(state),
+                ..RunPatch::default()
+            },
+        )
+        .unwrap();
+    };
+    set(&holder, RunState::Verifying);
+    set(&waiting, RunState::Finishing);
+    write_gate_live(&repo, "verify", &holder, "beta", &[("alpha", 2000)]);
+    let text = tui_once_view(&repo, "now");
+    let wait = text
+        .lines()
+        .find(|l| l.contains("waiting for the gate slot"))
+        .expect(&text);
+    assert!(wait.contains(&format!("{holder} is on gate beta")), "{wait}");
+    let verifying = text
+        .lines()
+        .find(|l| l.contains("gate beta running"))
+        .expect(&text);
+    assert!(verifying.contains("✓ alpha 2 s"), "{verifying}");
+}

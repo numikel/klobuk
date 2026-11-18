@@ -64,6 +64,13 @@ pub enum Mode {
     Help {
         scroll: u16,
     },
+    /// The live output of the gate in flight, read from the snapshot on every frame, so it moves while
+    /// the window is open. `asked` is the issue it was opened from; `back` is how many lines it is
+    /// scrolled up from the newest one (0 follows the tail).
+    Gate {
+        asked: IssueId,
+        back: u16,
+    },
 }
 
 /// How long the overlay waits for the pane to move on after a key before it takes keys again.
@@ -126,6 +133,7 @@ impl Mode {
             Mode::Answer { text: Some(_), .. } => ModeKind::AnswerText,
             Mode::Comment { .. } => ModeKind::Comment,
             Mode::Help { .. } => ModeKind::Help,
+            Mode::Gate { .. } => ModeKind::Gate,
         }
     }
 }
@@ -190,6 +198,34 @@ pub const BINDINGS: &[Binding] = &[
         ANY,
         &[M::Help],
         Slot::None,
+    ),
+    // ---- Gate output ----
+    b(
+        "j / k",
+        "scroll",
+        "scroll the live gate output; it follows the newest line until you scroll up",
+        Group::Window,
+        ANY,
+        &[M::Gate],
+        Slot::Hint,
+    ),
+    b(
+        "G",
+        "follow",
+        "jump to the newest line and follow the output again",
+        Group::Window,
+        ANY,
+        &[M::Gate],
+        Slot::Hint,
+    ),
+    b(
+        "Esc",
+        "close",
+        "close the live gate output",
+        Group::Window,
+        ANY,
+        &[M::Gate],
+        Slot::Hint,
     ),
     // ---- Inbox comment ----
     b(
@@ -420,6 +456,24 @@ pub fn handle_key(mode: Mode, key: KeyEvent, scroll_max: u16) -> (Option<Mode>, 
                 (Some(Mode::Comment { comment, scroll }), Action::None)
             }
         }
+        Mode::Gate { asked, back } => {
+            let closes = matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !is_chord(&key);
+            if closes {
+                return (None, Action::None);
+            }
+            // scrolled from the newest line: down is towards it, up is away from it
+            let back = match key.code {
+                _ if is_chord(&key) => back,
+                KeyCode::Char('j') | KeyCode::Down => back.saturating_sub(1),
+                KeyCode::Char('k') | KeyCode::Up => back.saturating_add(1).min(scroll_max),
+                KeyCode::PageDown => back.saturating_sub(10),
+                KeyCode::PageUp => back.saturating_add(10).min(scroll_max),
+                KeyCode::Char('g') | KeyCode::Home => scroll_max,
+                KeyCode::Char('G') | KeyCode::End => 0,
+                _ => back,
+            };
+            (Some(Mode::Gate { asked, back }), Action::None)
+        }
         Mode::Help { scroll } => {
             let closes = matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) && !is_chord(&key);
             if closes {
@@ -641,6 +695,9 @@ pub fn render(frame: &mut Frame, s: &Screen, mode: &Mode) {
             comment_modal(frame, s.body, comment, *scroll, s.theme, s.scroll_max);
         }
         Mode::Help { scroll } => help_view(frame, s.area, s.view, *scroll, s.theme, s.scroll_max),
+        Mode::Gate { asked, back } => {
+            gate_overlay(frame, s.body, asked, *back, s.snap, s.theme, s.scroll_max)
+        }
         Mode::Normal | Mode::Input { .. } | Mode::Confirm { .. } => {}
     }
 }
@@ -677,6 +734,128 @@ fn comment_modal(
         .take(body.height as usize)
         .map(Line::from)
         .collect();
+    frame.render_widget(Paragraph::new(shown), body);
+}
+
+/// A line of command output made safe to draw: control characters (an escape sequence, the carriage
+/// return of a progress bar) become blanks, so the output cannot paint on the screen.
+fn plain(line: &str) -> String {
+    line.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// The window of the gate in flight: who runs which gate for how long, the gates that are over, and the
+/// newest lines the running gate printed. It reads the snapshot on every frame, so it stays current.
+fn gate_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    asked: &IssueId,
+    back: u16,
+    snap: &Snapshot,
+    theme: &Theme,
+    scroll_max: &Cell<u16>,
+) {
+    use super::snapshot::parse_time;
+    use super::views::steps::duration;
+    let popup = area.centered(Constraint::Percentage(90), Constraint::Percentage(90));
+    let live = snap.gate_live.as_ref();
+    let heading = match live {
+        Some(l) => format!(" gate {} · {} · {} · live ", l.gate, l.issue, l.kind),
+        None => format!(" gate output · {asked} "),
+    };
+    let block = Block::bordered()
+        .title(trunc(&heading, popup.width.saturating_sub(2) as usize))
+        .title_style(theme.bold())
+        .title_bottom(" j/k scroll · G follow · Esc close ")
+        .border_style(theme.accent());
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let Some(live) = live else {
+        scroll_max.set(0);
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "No gate run is in flight: it is over, or asf serve is not running.",
+                theme.dim(),
+            )),
+            inner,
+        );
+        return;
+    };
+    let since = |at: &str| match (parse_time(&snap.now), parse_time(at)) {
+        (Some(now), Some(at)) => duration((now - at).whole_seconds().max(0)),
+        _ => "-".into(),
+    };
+    let mut head = vec![Line::from(vec![
+        Span::styled(format!("gate {} ", live.gate), theme.bold()),
+        Span::styled(
+            format!("running {}", since(&live.gate_started_at)),
+            theme.accent(),
+        ),
+        Span::raw(format!(
+            " · {} run of {}, started {} ago",
+            live.kind,
+            live.issue,
+            since(&live.started_at)
+        )),
+    ])];
+    if &live.issue != asked {
+        head.push(Line::styled(
+            format!("{asked} waits for the gate slot; this is the gate that holds it"),
+            theme.warn(),
+        ));
+    }
+    let done: Vec<String> = live
+        .finished
+        .iter()
+        .map(|g| {
+            format!(
+                "{} {} {}",
+                if g.ok { "✓" } else { "✗" },
+                g.name,
+                duration((g.duration_ms / 1000) as i64)
+            )
+        })
+        .collect();
+    let next: Vec<&str> = live
+        .gates
+        .iter()
+        .skip(live.finished.len() + 1)
+        .map(String::as_str)
+        .collect();
+    let done = if done.is_empty() {
+        "nothing yet".to_string()
+    } else {
+        done.join(", ")
+    };
+    let next = if next.is_empty() {
+        "nothing".to_string()
+    } else {
+        next.join(", ")
+    };
+    head.push(Line::styled(
+        trunc(&format!("done: {done} · next: {next}"), inner.width as usize),
+        theme.dim(),
+    ));
+    head.push(Line::styled("─".repeat(inner.width as usize), theme.dim()));
+    let [top, body] =
+        Layout::vertical([Constraint::Length(head.len() as u16), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(Paragraph::new(head), top);
+    let lines: Vec<String> = live.tail.lines().map(plain).collect();
+    let visible = body.height as usize;
+    let max = lines.len().saturating_sub(visible).min(u16::MAX as usize);
+    scroll_max.set(max as u16);
+    let end = lines.len().saturating_sub((back as usize).min(max));
+    let start = end.saturating_sub(visible);
+    let shown: Vec<Line> = if lines.is_empty() {
+        vec![Line::styled("(the gate has printed nothing yet)", theme.dim())]
+    } else {
+        lines[start..end]
+            .iter()
+            .map(|l| Line::raw(trunc(l, body.width as usize)))
+            .collect()
+    };
     frame.render_widget(Paragraph::new(shown), body);
 }
 

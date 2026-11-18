@@ -624,7 +624,7 @@ pub fn run(cli: &Cli, a: &ServeArgs) -> Result<Rendered, AppError> {
             ids.join(", ")
         );
     }
-    let mut gate = GateSlot::new();
+    let mut gate = GateSlot::reporting_to(&ctx.root);
     let mut hb = Heartbeat::start(&ctx.root, mode, &ctx.config, a);
     let result = serve_loop(cli, a, &mut ctx, &mut reminders, &mut gate, &mut hb);
     if let Err(e) = &result {

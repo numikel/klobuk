@@ -210,7 +210,7 @@ fn when_an_agent_needs_you_lists_a_b_f_r_v_x_in_the_mockup_order_and_r_says_both
         .find(|s| s.title == "QUEUE")
         .expect("a QUEUE heading");
     let queue_keys: Vec<&str> = queue.items.iter().map(|(k, _)| *k).collect();
-    assert_eq!(queue_keys, ["r", "v", "Enter", "f"]);
+    assert_eq!(queue_keys, ["r", "v", "Enter", "l / h", "o", "f"]);
     // and the rendered page shows the rows in that order
     let mut a = app();
     a.handle_key(key('?'));

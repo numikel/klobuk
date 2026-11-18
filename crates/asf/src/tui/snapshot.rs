@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use asf_core::config::GateWhen;
 use asf_core::config_edit::{editable_keys, lookup};
 pub use asf_core::remind::Act;
 use asf_core::remind::{self, EventIndex, Wait, WaitInput, WaitKind};
@@ -21,6 +22,7 @@ use super::overlays::InputTarget;
 use super::theme::Mark;
 use crate::ctx::{Ctx, CONFIG_FILE, FACTORY_DIR};
 use crate::output::AppError;
+use crate::worker::{read_gate_live, GateLive, FIX_SENT_BACK};
 
 /// The event the merge queue appends when a review round starts (`commands/merge.rs`); its payload
 /// carries the `round` number.
@@ -28,6 +30,21 @@ pub const REVIEW_STARTED: &str = "merge.review_started";
 
 /// How many events the Log view keeps (the newest).
 const LOG_LIMIT: usize = 200;
+
+/// Whether an event is one the steps of a queue item are read from (`views/queue.rs`): the queue's own
+/// events and a worker sent back for a gate. The snapshot keeps them for the items in the queue even
+/// when they fall outside the newest [`LOG_LIMIT`], so an item that has waited a long time still has
+/// its history.
+fn is_step_event(kind: &str) -> bool {
+    kind.starts_with("merge.") || kind == FIX_SENT_BACK
+}
+
+/// A `[[gate]]` of the config: its name and the stages it runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateInfo {
+    pub name: String,
+    pub when: Vec<GateWhen>,
+}
 
 /// Failed runtime probes in a row before the header says the runtime is down. The probe runs every
 /// couple of seconds on a machine that may be loaded; one miss is not an outage.
@@ -139,6 +156,14 @@ pub struct Snapshot {
     /// What the pulse of `asf serve` says about the loop; `None` in a snapshot nobody loaded (the header
     /// and the banners then say nothing about the loop).
     pub serve: Option<LoopInfo>,
+    /// The gate run in flight in `asf serve`'s slot, from the file it writes ([`GateLive`]); `None`
+    /// when nothing runs or the file is older than a live loop would leave it.
+    pub gate_live: Option<GateLive>,
+    /// Every `[[gate]]` of the config, in order, whatever stage it runs in.
+    pub gates: Vec<GateInfo>,
+    /// The newest verdict (a DECISION of a review issue's lane) on each live issue: what the review
+    /// step of a queue item shows.
+    pub verdicts: BTreeMap<IssueId, Comment>,
 }
 
 /// The loop as [`serve_pulse::judge`] sees it, with the mode its restart command is shown in.
@@ -701,6 +726,7 @@ pub fn load_snapshot(
             }
         }
     }
+    let merge_all = store.merge_queue()?;
     let mut events = store.events_since(0, usize::MAX)?;
     // The review round is read from every event, before the log is cut to its newest lines.
     let rounds: BTreeMap<IssueId, i64> = events
@@ -708,21 +734,47 @@ pub fn load_snapshot(
         .filter(|e| e.kind == REVIEW_STARTED)
         .filter_map(|e| Some((e.issue_id.clone()?, e.payload["round"].as_i64()?)))
         .collect(); // ordered by seq: the last (newest) round of an issue wins
+    let mut older: Vec<Event> = Vec::new();
     if events.len() > LOG_LIMIT {
-        events = events.split_off(events.len() - LOG_LIMIT);
+        let newest = events.split_off(events.len() - LOG_LIMIT);
+        // what the steps of a queued item are read from stays, as far back as the item goes
+        older = std::mem::replace(&mut events, newest)
+            .into_iter()
+            .filter(|e| is_step_event(&e.kind))
+            .filter(|e| {
+                merge_all
+                    .iter()
+                    .any(|m| !m.state.is_terminal() && e.issue_id.as_ref() == Some(&m.issue_id))
+            })
+            .collect();
     }
     events.reverse();
+    older.reverse();
+    events.append(&mut older);
     let issues = store.list_issues(&IssueFilter::default())?;
     // Unanswered questions are read from all comments, not the inbox: marking the inbox read must
     // not hide a question that still blocks `asf issue finish`. The newest BLOCKER of each live
     // issue rides along: it quotes the screen of a blocked worker.
     let mut questions = Vec::new();
     let mut blockers = Vec::new();
+    let mut verdicts: BTreeMap<IssueId, Comment> = BTreeMap::new();
     for issue in issues
         .iter()
         .filter(|i| !matches!(i.status, Status::Done | Status::Cancelled))
     {
         let comments = store.comments(&issue.id)?;
+        let lanes: Vec<String> = issues
+            .iter()
+            .filter(|i| i.kind == IssueType::Review && i.parent_id.as_ref() == Some(&issue.id))
+            .flat_map(|i| [i.id.to_string(), format!("agent:{}", i.id)])
+            .collect();
+        if let Some(verdict) = comments
+            .iter()
+            .filter(|c| c.kind == CommentType::Decision && lanes.contains(&c.author))
+            .max_by_key(|c| c.id)
+        {
+            verdicts.insert(issue.id.clone(), verdict.clone());
+        }
         let open = unanswered_questions(&comments);
         blockers.extend(
             comments
@@ -788,7 +840,7 @@ pub fn load_snapshot(
     // `time`'s local-offset support is enabled workspace-wide by ratatui; UTC when it cannot be read.
     let utc_offset_secs = UtcOffset::current_local_offset().map_or(0, |o| o.whole_seconds());
     let now = now_rfc3339();
-    let merge_all = store.merge_queue()?;
+    let gate_live = read_gate_live(&ctx.root).filter(|l| l.is_fresh(&now));
     let mut snap = Snapshot {
         repo_name: ctx
             .root
@@ -830,6 +882,16 @@ pub fn load_snapshot(
         detail: None,
         pane_preview: None,
         serve: None,
+        gate_live,
+        gates: cfg
+            .gates
+            .iter()
+            .map(|g| GateInfo {
+                name: g.name.clone(),
+                when: g.when.clone(),
+            })
+            .collect(),
+        verdicts,
     };
     // age only: a process lookup is a child process on Windows and the snapshot refreshes every few seconds
     let pulse = serve_pulse::read(&ctx.root).ok().flatten();

@@ -3,6 +3,7 @@
 //! Completion is never inferred from the agent's screen state: a run is verified only after the
 //! worker ran `asf issue finish` (issue `in-review`), and only the orchestrator decides `succeeded`.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use asf_core::config::{GateWhen, SelfTest};
 use asf_core::*;
-use asf_vcs::gates::stage_specs;
+use asf_vcs::gates::{run_gates_watched, stage_specs, GateEvent};
 use asf_vcs::{run_gates, GitCli};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -366,8 +367,95 @@ pub struct GateRun {
 struct Running {
     job: Job,
     since: Instant,
-    gate: Arc<Mutex<String>>,
+    live: Arc<Mutex<GateLive>>,
     results: mpsc::Receiver<Vec<GateResult>>,
+}
+
+/// File (under `.factory/runs/`) the gate run in flight reports itself in, for the TUI: the gate thread
+/// of `asf serve` lives in another process, so memory would show it nothing.
+pub const GATE_LIVE_FILE: &str = "gate-live.json";
+
+/// How many of the newest output lines of the gate in flight the file keeps.
+const LIVE_TAIL_LINES: usize = 200;
+/// The file is rewritten at most this often while the gate prints, and at least this often otherwise
+/// (the heartbeat that tells a quiet gate from a dead loop).
+const LIVE_WRITE_EVERY: Duration = Duration::from_millis(400);
+const LIVE_HEARTBEAT: Duration = Duration::from_secs(2);
+/// A file older than this was left by a loop that is gone. Longer than the longest pause a gate
+/// takes between two heartbeats (the linker-lock reruns wait up to a minute).
+pub const LIVE_STALE_S: i64 = 90;
+
+/// A gate of the run in flight that is over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveGate {
+    pub name: String,
+    pub ok: bool,
+    pub duration_ms: u64,
+    /// The last lines of its output, as the gate result keeps them.
+    pub tail: String,
+}
+
+/// The gate run in flight as the file [`GATE_LIVE_FILE`] says it: whose run it is, which gates it will
+/// execute, the ones that are over, the one that runs (with the last lines it printed) and when each began.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateLive {
+    /// `verify`, `merge` or `main`.
+    pub kind: String,
+    pub issue: IssueId,
+    /// Every gate the run executes, in order.
+    pub gates: Vec<String>,
+    /// RFC 3339 UTC time the run started.
+    pub started_at: String,
+    /// The gate that runs now.
+    pub gate: String,
+    pub gate_started_at: String,
+    /// The gates of this run that are over, in order.
+    pub finished: Vec<LiveGate>,
+    /// The newest lines the running gate printed (at most [`LIVE_TAIL_LINES`]).
+    pub tail: String,
+    /// When the file was written.
+    pub updated_at: String,
+}
+
+impl GateLive {
+    /// Whether the file is recent enough to be believed at `now` (RFC 3339). A file that was left by a
+    /// loop that died is not.
+    pub fn is_fresh(&self, now: &str) -> bool {
+        match (
+            OffsetDateTime::parse(now, &Rfc3339),
+            OffsetDateTime::parse(&self.updated_at, &Rfc3339),
+        ) {
+            (Ok(now), Ok(at)) => (now - at).whole_seconds() <= LIVE_STALE_S,
+            _ => false,
+        }
+    }
+}
+
+/// Where the gate run in flight reports itself under repository `root`.
+pub fn gate_live_path(root: &Path) -> PathBuf {
+    root.join(FACTORY_DIR).join(RUNS_DIR).join(GATE_LIVE_FILE)
+}
+
+/// The gate run in flight, from its file; `None` when there is none or it cannot be read. Staleness is
+/// the caller's call ([`GateLive::is_fresh`]).
+pub fn read_gate_live(root: &Path) -> Option<GateLive> {
+    let text = std::fs::read_to_string(gate_live_path(root)).ok()?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
+}
+
+/// Writes the file in one rename, so a reader never sees half of it. A failure only costs the TUI its
+/// live view; the gates must not depend on it.
+fn write_gate_live(path: &Path, live: &GateLive) {
+    let Ok(text) = serde_json::to_string(live) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// The one place where a gate run can be in flight while `asf serve` goes on ticking. Gate runs are
@@ -382,6 +470,8 @@ struct Running {
 pub struct GateSlot {
     running: Option<Running>,
     started: u64,
+    /// Where the run in flight reports itself ([`GATE_LIVE_FILE`]); `None` reports nowhere.
+    live_path: Option<PathBuf>,
 }
 
 fn gate_failure(name: &str, why: String) -> GateResult {
@@ -395,25 +485,100 @@ fn gate_failure(name: &str, why: String) -> GateResult {
     }
 }
 
-/// Runs the gates in order, stopping at the first failure like `run_gates`, and tells `current` the
-/// name of each gate before it starts.
-fn run_gates_reporting(specs: &[GateSpec], cwd: &Path, mut current: impl FnMut(&str)) -> Vec<GateResult> {
-    let mut results = Vec::new();
-    for spec in specs {
-        current(&spec.name);
-        let one = run_gates(std::slice::from_ref(spec), cwd);
-        let stop = one.last().is_some_and(|r| !r.ok);
-        results.extend(one);
-        if stop {
-            break;
+/// What the gate thread keeps of the run while it goes on, and writes to [`GATE_LIVE_FILE`].
+struct LiveWriter {
+    live: Arc<Mutex<GateLive>>,
+    path: Option<PathBuf>,
+    lines: VecDeque<String>,
+    last_write: Instant,
+    dirty: bool,
+}
+
+impl LiveWriter {
+    fn write(&mut self) {
+        let snapshot = {
+            let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            live.tail = self
+                .lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            live.updated_at = now_rfc3339();
+            live.clone()
+        };
+        if let Some(path) = &self.path {
+            write_gate_live(path, &snapshot);
+        }
+        self.last_write = Instant::now();
+        self.dirty = false;
+    }
+
+    fn event(&mut self, e: GateEvent) {
+        match e {
+            GateEvent::Started(name) => {
+                {
+                    let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+                    live.gate = name.to_string();
+                    live.gate_started_at = now_rfc3339();
+                }
+                self.lines.clear();
+                self.write();
+            }
+            GateEvent::Output(new) => {
+                for line in new {
+                    if self.lines.len() == LIVE_TAIL_LINES {
+                        self.lines.pop_front();
+                    }
+                    self.lines.push_back(line.clone());
+                    self.dirty = true;
+                }
+                let waited = self.last_write.elapsed();
+                if (self.dirty && waited >= LIVE_WRITE_EVERY) || waited >= LIVE_HEARTBEAT {
+                    self.write();
+                }
+            }
+            GateEvent::Finished(r) => {
+                self.live
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .finished
+                    .push(LiveGate {
+                        name: r.name.clone(),
+                        ok: r.ok,
+                        duration_ms: r.duration_ms,
+                        tail: r.tail.clone(),
+                    });
+                self.lines.clear();
+                self.write();
+            }
         }
     }
-    results
 }
 
 impl GateSlot {
+    /// A slot that reports nowhere (the tests; `asf serve` uses [`GateSlot::reporting_to`]).
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A slot whose run in flight reports itself in [`GATE_LIVE_FILE`] under `root`, for the TUI. A file
+    /// a loop that died left behind is removed: nothing is in flight in a slot that has just been made.
+    pub fn reporting_to(root: &Path) -> Self {
+        let path = gate_live_path(root);
+        let _ = std::fs::remove_file(&path);
+        GateSlot {
+            live_path: Some(path),
+            ..Self::default()
+        }
+    }
+
+    /// The run is over: its file goes, so nobody reads a gate that no longer runs.
+    fn clear_live(&self) {
+        if let Some(path) = &self.live_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     pub fn is_busy(&self) -> bool {
@@ -438,16 +603,33 @@ impl GateSlot {
             });
         }
         let (tx, results) = mpsc::channel();
-        // named before the thread exists, so the report never shows a run with no gate
-        let gate = Arc::new(Mutex::new(specs[0].name.clone()));
-        let shared = Arc::clone(&gate);
+        // the first gate is named before the thread exists, so the report never shows a run with no gate
+        let now = now_rfc3339();
+        let live = Arc::new(Mutex::new(GateLive {
+            kind: job.kind().to_string(),
+            issue: job.issue().clone(),
+            gates: specs.iter().map(|s| s.name.clone()).collect(),
+            started_at: now.clone(),
+            gate: specs[0].name.clone(),
+            gate_started_at: now.clone(),
+            finished: Vec::new(),
+            tail: String::new(),
+            updated_at: now,
+        }));
+        let mut writer = LiveWriter {
+            live: Arc::clone(&live),
+            path: self.live_path.clone(),
+            lines: VecDeque::new(),
+            last_write: Instant::now(),
+            dirty: false,
+        };
+        writer.write();
         let spawned = thread::Builder::new().name("asf-gates".into()).spawn(move || {
-            let results = run_gates_reporting(&specs, &cwd, |name| {
-                *shared.lock().unwrap_or_else(PoisonError::into_inner) = name.to_string();
-            });
+            let results = run_gates_watched(&specs, &cwd, &mut |e| writer.event(e));
             let _ = tx.send(results);
         });
         if let Err(e) = spawned {
+            self.clear_live();
             return Some(Finished {
                 job,
                 results: vec![gate_failure(
@@ -460,7 +642,7 @@ impl GateSlot {
         self.running = Some(Running {
             job,
             since: Instant::now(),
-            gate,
+            live,
             results,
         });
         None
@@ -487,6 +669,7 @@ impl GateSlot {
             }
         };
         let running = self.running.take()?;
+        self.clear_live();
         Some(Finished {
             job: running.job,
             results,
@@ -508,6 +691,7 @@ impl GateSlot {
             }
         };
         let running = self.running.take()?;
+        self.clear_live();
         Some(Finished {
             job: running.job,
             results,
@@ -520,7 +704,7 @@ impl GateSlot {
         Some(GateRun {
             kind: r.job.kind(),
             issue: r.job.issue().clone(),
-            gate: r.gate.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            gate: r.live.lock().unwrap_or_else(PoisonError::into_inner).gate.clone(),
             seconds: r.since.elapsed().as_secs(),
         })
     }
@@ -4803,5 +4987,81 @@ mod gate_slot_tests {
         let slow = spec("slow", "import time; time.sleep(3)");
         let _ = slot.start(job(1), vec![slow.clone()], dir.path().to_path_buf());
         let _ = slot.start(job(2), vec![slow], dir.path().to_path_buf());
+    }
+
+    /// Polls `read` until it returns `Some`, for at most 60 s.
+    fn until<T>(mut read: impl FnMut() -> Option<T>) -> T {
+        let limit = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(v) = read() {
+                return v;
+            }
+            assert!(Instant::now() < limit, "the condition never came true");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn a_reporting_slot_writes_the_gate_in_flight_its_finished_gates_and_its_output_and_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let release = root.join("release");
+        let hold = format!(
+            "import os, time
+print('compiling', flush=True)
+while not os.path.exists({:?}):
+    time.sleep(0.05)",
+            release.to_string_lossy().replace('\\', "/")
+        );
+        let stale = gate_live_path(root);
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "left by a loop that died").unwrap();
+        let mut slot = GateSlot::reporting_to(root);
+        assert!(!stale.exists(), "a fresh slot removes what a dead loop left");
+        let specs = vec![spec("fmt", "pass"), spec("test", &hold), spec("last", "pass")];
+        assert!(slot.start(job(9), specs, root.to_path_buf()).is_none());
+
+        // the second gate is the one in flight, the first one is over, and the output so far is there
+        let live = until(|| {
+            read_gate_live(root)
+                .filter(|l| l.gate == "test" && l.tail.contains("compiling") && l.finished.len() == 1)
+        });
+        assert_eq!(
+            (live.kind.as_str(), live.issue.to_string()),
+            ("merge", "asf-9".to_string())
+        );
+        assert_eq!(live.gates, ["fmt", "test", "last"]);
+        assert_eq!(
+            (live.finished[0].name.as_str(), live.finished[0].ok),
+            ("fmt", true)
+        );
+        assert!(live.is_fresh(&now_rfc3339()));
+        assert!(
+            !GateLive {
+                updated_at: "2020-01-01T00:00:00Z".into(),
+                ..live.clone()
+            }
+            .is_fresh(&now_rfc3339()),
+            "a file nobody has touched for years is stale"
+        );
+
+        std::fs::write(&release, "").unwrap();
+        let done = wait(&mut slot);
+        assert_eq!(done.results.len(), 3);
+        assert!(
+            !stale.exists(),
+            "nothing is in flight any more, so nothing is reported"
+        );
+    }
+
+    #[test]
+    fn a_slot_that_reports_nowhere_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = GateSlot::new();
+        assert!(slot
+            .start(job(3), vec![spec("one", "pass")], dir.path().to_path_buf())
+            .is_none());
+        wait(&mut slot);
+        assert!(!gate_live_path(dir.path()).exists());
     }
 }

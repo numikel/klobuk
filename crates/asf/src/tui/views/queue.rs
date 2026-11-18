@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use super::steps::{duration, item_steps, ItemSteps, Step, StepKind, StepMark};
 use crate::commands::merge::GATES_REUSED;
 use crate::tui::app::{Action, View};
 use crate::tui::bindings::*;
@@ -24,6 +25,43 @@ use crate::tui::theme::{Mark, Theme};
 #[derive(Debug, Clone, Default)]
 pub struct State {
     pub selected: usize,
+    /// The selected item shows its steps under its row. Moving to another item folds it again.
+    pub expanded: bool,
+    /// The line of the open item the cursor is on (an earlier attempt, then a step); `None` is the item's
+    /// own row.
+    pub cursor: Option<usize>,
+    /// Numbers of the earlier attempts of the selected item that are shown opened.
+    pub opened: Vec<usize>,
+}
+
+impl State {
+    /// Selects item `i`; the steps of the item that was selected fold.
+    fn select(&mut self, i: usize) {
+        if i != self.selected {
+            self.selected = i;
+            self.expanded = false;
+            self.cursor = None;
+            self.opened.clear();
+        }
+    }
+}
+
+/// A line the cursor can stand on under an open item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cursor {
+    /// The folded line of earlier attempt `n`.
+    Attempt(usize),
+    /// Step `i` of the current attempt.
+    Step(usize),
+}
+
+fn cursor_lines(steps: &ItemSteps) -> Vec<Cursor> {
+    steps
+        .earlier
+        .iter()
+        .map(|a| Cursor::Attempt(a.n))
+        .chain((0..steps.steps.len()).map(Cursor::Step))
+        .collect()
 }
 
 const QUEUE: &[View] = &[View::Queue];
@@ -58,12 +96,30 @@ pub const BINDINGS: &[Binding] = &[
     ),
     b(
         "Enter",
+        "steps",
+        "open or fold the steps of the item;\non a step: the live gate output,\nthe output of a finished gate or\nthe reviewer verdict",
+        Group::Queue,
+        QUEUE,
+        NORMAL,
+        Slot::Hint,
+    ),
+    b(
+        "l / h",
+        "open / fold",
+        "open or fold the steps of the item\n(an earlier attempt opens into phases)",
+        Group::Queue,
+        QUEUE,
+        NORMAL,
+        Slot::None,
+    ),
+    b(
+        "o",
         "gate output",
         "the full gate output of the item\nin a window",
         Group::Queue,
         QUEUE,
         NORMAL,
-        Slot::Hint,
+        Slot::None,
     ),
     b(
         "f",
@@ -126,7 +182,7 @@ pub enum Stage {
 const HEADERS: [&str; 5] = ["rebase", "gates", "review", "merge", "main gates"];
 
 /// Whether a reviewer was involved with the branch of `id`: a review issue or a review event.
-fn review_seen(snap: &Snapshot, id: &IssueId) -> bool {
+pub(super) fn review_seen(snap: &Snapshot, id: &IssueId) -> bool {
     snap.review_of.values().any(|l| &l.reviews == id)
         || snap
             .events
@@ -136,7 +192,7 @@ fn review_seen(snap: &Snapshot, id: &IssueId) -> bool {
 
 /// The round of the review of `id` that is running: the review issue's link first, then the newest
 /// `merge.review_started` event.
-fn review_round(snap: &Snapshot, id: &IssueId) -> Option<i64> {
+pub(super) fn review_round(snap: &Snapshot, id: &IssueId) -> Option<i64> {
     snap.review_of
         .values()
         .find(|l| &l.reviews == id)
@@ -191,7 +247,7 @@ fn main_ahead(snap: &Snapshot) -> Stage {
 /// Whether the gates of the item's latest attempt were not run because the worker's verification had
 /// passed them on this very commit (`[merge] reuse_verification`). The event names the attempt, so an
 /// older reuse is not read into a later attempt that ran the gates.
-fn gates_reused(snap: &Snapshot, item: &MergeItem) -> bool {
+pub(super) fn gates_reused(snap: &Snapshot, item: &MergeItem) -> bool {
     snap.events.iter().any(|e| {
         e.kind == GATES_REUSED && e.payload["merge_id"] == item.id && e.payload["attempt"] == item.attempts
     })
@@ -539,9 +595,19 @@ fn header_line(cols: &Cols, title: &str, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
-fn item_line(e: &Entry, cols: &Cols, selected: bool, avail: usize, theme: &Theme) -> Line<'static> {
+fn item_line(
+    e: &Entry,
+    cols: &Cols,
+    (selected, open): (bool, bool),
+    avail: usize,
+    theme: &Theme,
+) -> Line<'static> {
     let mut spans = vec![
-        Span::raw(if selected { " ▸ " } else { "   " }),
+        Span::raw(match (selected, open) {
+            (true, true) => " ▾ ",
+            (true, false) => " ▸ ",
+            _ => "   ",
+        }),
         Span::styled(format!("{} ", e.mark.glyph()), theme.mark(e.mark)),
         Span::styled(fit(e.item.issue_id.as_str(), cols.id), theme.bold()),
         Span::raw("  "),
@@ -589,7 +655,8 @@ fn detail_lines(e: &Entry, cols: &Cols, avail: usize, theme: &Theme) -> Vec<Line
     let keys = [
         ("r", " retry after a fix"),
         ("v", " verify the run again"),
-        ("Enter", " full gate output"),
+        ("Enter", " steps"),
+        ("o", " full gate output"),
     ];
     let plain = keys
         .iter()
@@ -653,6 +720,119 @@ fn merged_line(snap: &Snapshot, item: &MergeItem, id: usize, edge: usize, theme:
     ])
 }
 
+/// The glyph and style of a step mark.
+fn step_mark(mark: StepMark, theme: &Theme) -> (&'static str, Style) {
+    match mark {
+        StepMark::Done => ("✓", theme.ok()),
+        StepMark::Running => ("●", theme.accent()),
+        StepMark::Waiting => ("○", Style::default()),
+        StepMark::Failed => ("✗", theme.danger()),
+        StepMark::Skipped => ("–", theme.dim()),
+    }
+}
+
+/// One line of a step list: `indent`, a cursor, the mark, the label and, at the right edge, the note and
+/// the time (the one of a running step counts up with the snapshot's clock).
+fn step_line(
+    snap: &Snapshot,
+    step: &Step,
+    under: usize,
+    on_cursor: bool,
+    avail: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let (glyph, style) = step_mark(step.mark, theme);
+    let time = step.seconds(snap).map(duration).unwrap_or_default();
+    let right = match (step.note.is_empty(), time.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => step.note.clone(),
+        (true, false) => time,
+        (false, false) => format!("{}  {time}", step.note),
+    };
+    let lead = under + 2 + 2;
+    let right_w = text_width(&right);
+    let room = avail.saturating_sub(lead + right_w + 2).max(8);
+    let label = fit(&step.label, room.min(text_width(&step.label).max(1)));
+    let gap = avail.saturating_sub(lead + text_width(&label) + right_w);
+    let mut line = Line::from(vec![
+        Span::raw(" ".repeat(under)),
+        Span::raw(if on_cursor { "▸ " } else { "  " }),
+        Span::styled(format!("{glyph} "), style),
+        Span::raw(label),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(
+            right,
+            if step.mark == StepMark::Failed {
+                theme.danger()
+            } else {
+                theme.dim()
+            },
+        ),
+    ]);
+    if on_cursor {
+        line = line.style(theme.selected());
+    }
+    line
+}
+
+/// The lines under the row of the open item, and the index (among them) of the one the cursor is on.
+fn open_lines(
+    snap: &Snapshot,
+    item: &MergeItem,
+    state: &State,
+    cols: &Cols,
+    avail: usize,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    let steps = item_steps(snap, item);
+    let under = cols.lead;
+    let room = avail.saturating_sub(under + 2).max(1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut at = None;
+    let mut index = 0;
+    let mut head = format!("attempt {}", steps.attempt);
+    if let Some(secs) = steps.elapsed {
+        head.push_str(&format!(" · {}", duration(secs)));
+    }
+    out.push(Line::from(vec![
+        Span::raw(" ".repeat(under)),
+        Span::styled(trunc(&head, room), theme.dim()),
+    ]));
+    for a in &steps.earlier {
+        let on_cursor = state.cursor == Some(index);
+        if on_cursor {
+            at = Some(out.len());
+        }
+        let open = state.opened.contains(&a.n);
+        let text = format!("{} {}", if open { "▾" } else { "▸" }, a.text);
+        let mut line = Line::from(vec![
+            Span::raw(" ".repeat(under)),
+            Span::styled(fit(&text, room), theme.dim()),
+        ]);
+        if on_cursor {
+            line = line.style(theme.selected());
+        }
+        out.push(line);
+        if open {
+            out.extend(
+                a.phases
+                    .iter()
+                    .map(|p| step_line(snap, p, under + 4, false, avail, theme)),
+            );
+        }
+        index += 1;
+    }
+    for step in &steps.steps {
+        let on_cursor = state.cursor == Some(index);
+        if on_cursor {
+            at = Some(out.len());
+        }
+        out.push(step_line(snap, step, under, on_cursor, avail, theme));
+        index += 1;
+    }
+    (out, at)
+}
+
 pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, theme: &Theme) {
     let avail = area.width as usize;
     let entries: Vec<Entry> = snap.queue.iter().map(|m| entry(snap, m, theme)).collect();
@@ -667,6 +847,7 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
 
     let mut lines: Vec<Line> = Vec::new();
     let mut block = (0, 0);
+    let mut cursor_line = None;
     if entries.is_empty() {
         lines.push(Line::styled(format!(" {EMPTY}"), theme.dim()));
     } else {
@@ -678,10 +859,16 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
         lines.push(Line::raw(""));
         for (i, e) in entries.iter().enumerate() {
             let start = lines.len();
-            lines.push(item_line(e, &cols, i == sel, avail, theme));
+            let open = i == sel && state.expanded;
+            lines.push(item_line(e, &cols, (i == sel, open), avail, theme));
             if needs_a_fix(e.item) {
                 lines.extend(detail_lines(e, &cols, avail, theme));
-            } else if gates_reused(snap, e.item) {
+            }
+            if open {
+                let (steps, at) = open_lines(snap, e.item, state, &cols, avail, theme);
+                cursor_line = at.map(|a| lines.len() + a);
+                lines.extend(steps);
+            } else if !needs_a_fix(e.item) && gates_reused(snap, e.item) {
                 let indent = cols.indent();
                 let room = avail.saturating_sub(indent).max(1);
                 lines.push(Line::from(vec![
@@ -719,13 +906,28 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
 
     // Keep the selected item (all its lines, as far as they fit) on screen.
     let height = area.height as usize;
-    let top = block.1.saturating_sub(height).min(block.0);
+    let mut top = block.1.saturating_sub(height).min(block.0);
+    if let Some(at) = cursor_line {
+        top = top.min(at).max((at + 1).saturating_sub(height));
+    }
     frame.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), area);
 }
 
 // ---------------------------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------------------------
+
+/// One gate as the output window shows it: its verdict and exit code, then the tail it kept.
+fn gate_section(g: &GateResult) -> String {
+    let verdict = if g.ok { "ok" } else { "FAILED" };
+    let exit = g.exit_code.map_or_else(|| "none".to_string(), |c| c.to_string());
+    let mut out = format!("gate {}: {verdict} (exit {exit})\n", g.name);
+    if !g.tail.trim().is_empty() {
+        out.push_str(g.tail.trim_end());
+        out.push('\n');
+    }
+    out
+}
 
 /// The gate output of an item as one text: the error, whether the gates were reused from the
 /// verification, then every gate with its exit code and tail.
@@ -740,29 +942,167 @@ fn gate_output(snap: &Snapshot, item: &MergeItem) -> String {
         out.push_str("\n\n");
     }
     for g in &item.gate_results {
-        let verdict = if g.ok { "ok" } else { "FAILED" };
-        let exit = g.exit_code.map_or_else(|| "none".to_string(), |c| c.to_string());
-        out.push_str(&format!("gate {}: {verdict} (exit {exit})\n", g.name));
-        if !g.tail.trim().is_empty() {
-            out.push_str(g.tail.trim_end());
-            out.push('\n');
-        }
+        out.push_str(&gate_section(g));
         out.push('\n');
     }
     out.trim_end().to_string()
 }
 
-/// Keys of the Queue view: navigation, `r` retry, `v` verify, `Enter` the gate output, `f` the reviewer.
+/// A window of the merge queue with `body`, titled by the item.
+fn open_text(item: &MergeItem, body: String) -> Action {
+    Action::OpenComment(Comment {
+        id: item.id,
+        issue_id: item.issue_id.clone(),
+        author: "merge queue".into(),
+        kind: CommentType::Status,
+        to_lane: LANE_HUMAN.to_string(),
+        body,
+        reply_to: None,
+        resolved_at: None,
+        created_at: item.updated_at.clone(),
+    })
+}
+
+/// The output of the gate `name` of `item`: from the gates of the run in flight that are over, or from
+/// the results of its last run.
+fn finished_gate_output(snap: &Snapshot, item: &MergeItem, name: &str) -> Option<String> {
+    if let Some(live) = snap
+        .gate_live
+        .as_ref()
+        .filter(|l| l.kind == "merge" && l.issue == item.issue_id && item.state == MergeState::Gating)
+    {
+        let g = live.finished.iter().find(|g| g.name == name)?;
+        let verdict = if g.ok { "ok" } else { "FAILED" };
+        let mut out = format!(
+            "gate {}: {verdict} ({})\n",
+            g.name,
+            duration((g.duration_ms / 1000) as i64)
+        );
+        if !g.tail.trim().is_empty() {
+            out.push_str(g.tail.trim_end());
+            out.push('\n');
+        }
+        return Some(out);
+    }
+    item.gate_results
+        .iter()
+        .find(|g| g.name == name)
+        .map(gate_section)
+}
+
+/// What `Enter` does on a step of the open item.
+fn activate_step(snap: &Snapshot, item: &MergeItem, step: &Step) -> Action {
+    let id = &item.issue_id;
+    match (&step.kind, step.mark) {
+        (StepKind::Gate(_), StepMark::Running) => Action::OpenGate(id.clone()),
+        (StepKind::Gate(name), StepMark::Done | StepMark::Failed) => {
+            match finished_gate_output(snap, item, name) {
+                Some(body) => open_text(item, body),
+                None => Action::Status(format!("{id}: no output kept for gate {name}")),
+            }
+        }
+        (StepKind::Review, _) => match snap.verdicts.get(id) {
+            Some(v) => Action::OpenComment(v.clone()),
+            None => match item
+                .last_error
+                .as_deref()
+                .filter(|e| e.starts_with("review asks for changes"))
+            {
+                Some(error) => open_text(item, error.to_string()),
+                None => Action::Status(format!("{id}: the reviewer has given no verdict yet")),
+            },
+        },
+        _ if !step.note.is_empty() => Action::Status(format!("{id}: {} · {}", step.label, step.note)),
+        _ => Action::Status(format!("{id}: {}", step.label)),
+    }
+}
+
+/// Keys of the Queue view: navigation (j/k walk the lines of the open item before they leave it), `l`/`h`
+/// open and fold the steps, `Enter` acts on the line the cursor is on, `r` retry, `v` verify, `o` the
+/// gate output, `f` the reviewer.
 pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
-    if let Some(i) = move_selection(&key, state.selected, rows(snap)) {
-        state.selected = i;
+    let sel = selected(snap, state);
+    if state.expanded {
+        if let Some(item) = snap.queue.get(sel) {
+            let lines = cursor_lines(&item_steps(snap, item)).len();
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let next = state.cursor.map_or(0, |c| c + 1);
+                    if next < lines {
+                        state.cursor = Some(next);
+                        return Action::None;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => match state.cursor {
+                    Some(0) => {
+                        state.cursor = None;
+                        return Action::None;
+                    }
+                    Some(c) => {
+                        state.cursor = Some(c.min(lines) - 1);
+                        return Action::None;
+                    }
+                    None => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    if let Some(i) = move_selection(&key, sel, rows(snap)) {
+        state.select(i);
         return Action::None;
     }
-    let Some(item) = snap.queue.get(selected(snap, state)) else {
+    state.selected = sel;
+    let Some(item) = snap.queue.get(sel) else {
         return Action::None;
     };
     let id = item.issue_id.clone();
     match key.code {
+        KeyCode::Char('l') | KeyCode::Right => {
+            state.expanded = true;
+            Action::None
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            if state.cursor.is_some() {
+                state.cursor = None;
+            } else {
+                state.expanded = false;
+            }
+            Action::None
+        }
+        KeyCode::Enter => match (state.expanded, state.cursor) {
+            (false, _) => {
+                state.expanded = true;
+                Action::None
+            }
+            (true, None) => {
+                state.expanded = false;
+                Action::None
+            }
+            (true, Some(c)) => {
+                let steps = item_steps(snap, item);
+                match cursor_lines(&steps).get(c) {
+                    Some(Cursor::Attempt(n)) => {
+                        match state.opened.iter().position(|o| o == n) {
+                            Some(at) => {
+                                state.opened.remove(at);
+                            }
+                            None => state.opened.push(*n),
+                        }
+                        Action::None
+                    }
+                    Some(Cursor::Step(i)) => activate_step(snap, item, &steps.steps[*i]),
+                    None => Action::None,
+                }
+            }
+        },
+        KeyCode::Char('o') => {
+            let body = gate_output(snap, item);
+            if body.is_empty() {
+                return Action::Status(format!("{id} has no gate output yet"));
+            }
+            open_text(item, body)
+        }
         KeyCode::Char('r') if needs_a_fix(item) => Action::Retry(id),
         KeyCode::Char('r') => Action::Status(format!(
             "{id}: r retries a failed or blocked merge; it is {}",
@@ -773,23 +1113,6 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
             "{id}: v verifies the run of a failed or blocked merge; it is {}",
             item.state
         )),
-        KeyCode::Enter => {
-            let body = gate_output(snap, item);
-            if body.is_empty() {
-                return Action::Status(format!("{id} has no gate output yet"));
-            }
-            Action::OpenComment(Comment {
-                id: item.id,
-                issue_id: id,
-                author: "merge queue".into(),
-                kind: CommentType::Status,
-                to_lane: LANE_HUMAN.to_string(),
-                body,
-                reply_to: None,
-                resolved_at: None,
-                created_at: item.updated_at.clone(),
-            })
-        }
         KeyCode::Char('f') => {
             let reviewer = snap
                 .review_of

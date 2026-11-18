@@ -19,11 +19,12 @@ use time::OffsetDateTime;
 
 use asf_store::serve_pulse::{self, LoopState};
 
+use super::steps::run_gate_text;
 use crate::tui::app::{Action, View};
 use crate::tui::bindings::*;
 use crate::tui::overlays::InputTarget;
 use crate::tui::snapshot::{
-    age, first_line, fit, money, move_selection, offset_of, parse_time, Need, NeedSource, Snapshot,
+    age, first_line, fit, money, move_selection, offset_of, parse_time, trunc, Need, NeedSource, Snapshot,
 };
 use crate::tui::theme::{Mark, Theme};
 
@@ -61,6 +62,9 @@ pub struct RunRow {
     pub cost: f64,
     pub budget: Option<f64>,
     pub since: String,
+    /// What a run that waits for the gate slot or runs its gates says about it (`Enter` opens the live
+    /// output of the gate in flight); `None` for any other run.
+    pub gate: Option<String>,
 }
 
 /// The row the Now view's selection points at.
@@ -223,6 +227,7 @@ pub fn running(snap: &Snapshot) -> Vec<RunRow> {
                 cost: r.cost_usd,
                 budget: r.budget_usd,
                 since: r.started_at.clone(),
+                gate: run_gate_text(snap, r),
             }
         })
         .collect()
@@ -501,6 +506,14 @@ pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot, state: &State, the
             ])
             .style(row_style(i)),
         );
+        // what the run waits for or runs, under its row, in the column of the title
+        if let Some(gate) = &r.gate {
+            let indent = 1 + 2 + 2 + id_w + 2 + RUN_STATE_W + 2;
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(trunc(gate, width.saturating_sub(indent).max(8)), theme.dim()),
+            ]));
+        }
     }
     lines.push(Line::raw(""));
 
@@ -588,6 +601,8 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
     match key.code {
         KeyCode::Enter => match row {
             Some(NowRow::Loop) => explain_loop(snap),
+            // a run in the gate queue: the output of the gate that holds the slot, live
+            Some(NowRow::Running(r)) if r.gate.is_some() => Action::OpenGate(r.issue),
             Some(r) => r.issue().map_or(Action::None, |i| Action::OpenOnBoard(i.clone())),
             None => Action::None,
         },

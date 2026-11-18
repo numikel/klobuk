@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::steps::{run_gate_short, run_gate_text};
 use crate::tui::app::{Action, View};
 use crate::tui::bindings::*;
 use crate::tui::snapshot::{
@@ -237,6 +238,9 @@ fn entry<'a>(snap: &'a Snapshot, run: &'a Run) -> Entry<'a> {
 /// `asked 4 min ago` for a blocked run (since it began to wait), else how long ago the run was last
 /// seen: `12 s ago`, `5 min ago`; `-` when it never was.
 fn activity(snap: &Snapshot, run: &Run) -> String {
+    if let Some(gate) = run_gate_short(snap, run) {
+        return gate;
+    }
     if run.state == RunState::Blocked {
         let since = snap
             .needs_you
@@ -438,6 +442,12 @@ fn preview(frame: &mut Frame, area: Rect, snap: &Snapshot, entry: &Entry, theme:
             Some(text) => tail(text, inner.height as usize, inner.width as usize, theme),
         }
     };
+    // a run in the gate queue also says what it waits for or runs, before its pane
+    let mut body = body;
+    if let Some(text) = run_gate_text(snap, entry.run) {
+        body.insert(0, Line::styled(trunc(&text, inner.width as usize), theme.warn()));
+        body.truncate(inner.height as usize);
+    }
     frame.render_widget(Paragraph::new(body).block(block), area);
 }
 
@@ -482,6 +492,10 @@ pub fn handle_key(key: KeyEvent, snap: &Snapshot, state: &mut State) -> Action {
         return Action::None;
     };
     match key.code {
+        // a run in the gate queue: the output of the gate that holds the slot, live
+        KeyCode::Enter if snap.run_for(&id).and_then(|r| run_gate_short(snap, r)).is_some() => {
+            Action::OpenGate(id)
+        }
         KeyCode::Enter => Action::OpenOnBoard(id),
         KeyCode::Char('m') => Action::Enqueue(id),
         KeyCode::Char('f') => Action::Focus(id),

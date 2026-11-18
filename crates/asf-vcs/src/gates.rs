@@ -232,11 +232,29 @@ fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// What a gate run tells whoever watches it while it goes on (see [`run_gates_watched`]).
+#[derive(Debug, Clone, Copy)]
+pub enum GateEvent<'a> {
+    /// The gate `.0` is about to start.
+    Started(&'a str),
+    /// The complete output lines the gate in flight wrote since the last event. Sent every poll, also
+    /// with no lines at all, so a watcher that writes them down can tell a quiet gate from a dead runner.
+    Output(&'a [String]),
+    /// The gate is over (a rerun after a linker lock is part of the same gate).
+    Finished(&'a GateResult),
+}
+
 /// Runs one gate; never panics. After the gate exits or is killed it waits at most [`DRAIN_GRACE`]
 /// for its output, so a descendant that holds the pipes open cannot delay the result. The process
 /// start itself is not bounded: the timeout clock runs from before it, so a slow start only means
 /// the timeout is already due when the gate finally runs.
 pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
+    run_gate_watched(spec, cwd, &mut |_| {})
+}
+
+/// [`run_gate`] that tells `watch` the output as it comes ([`GateEvent::Output`] only: the caller of a
+/// single gate knows when it starts and ends).
+pub fn run_gate_watched(spec: &GateSpec, cwd: &Path, watch: &mut dyn FnMut(GateEvent)) -> GateResult {
     let started = Instant::now();
     let fail = |tail: String| GateResult {
         name: spec.name.clone(),
@@ -275,10 +293,12 @@ pub fn run_gate(spec: &GateSpec, cwd: &Path) -> GateResult {
                 break None;
             }
             Ok(None) => {
-                let lines = t_out.new_lines(&mut seen_out);
-                for line in lines.iter().chain(&t_err.new_lines(&mut seen_err)) {
+                let mut lines = t_out.new_lines(&mut seen_out);
+                lines.extend(t_err.new_lines(&mut seen_err));
+                for line in &lines {
                     slow.feed(line);
                 }
+                watch(GateEvent::Output(&lines));
                 if slow.limit_hit(spec) {
                     kill_tree(&mut child);
                     stop = Some(Stop::SlowTests);
@@ -469,9 +489,14 @@ fn locked_set(files: &[std::path::PathBuf]) -> BTreeSet<String> {
 /// the whole workspace relinks and every attempt trips over different files, so a rerun whose set
 /// of locked files differs from the previous attempt's is free. Reruns are capped at
 /// [`LINKER_LOCK_MAX_RERUNS`] in any case.
-fn run_gate_with_retry(spec: &GateSpec, cwd: &Path, pauses: &LinkerLockPauses) -> GateResult {
+fn run_gate_with_retry(
+    spec: &GateSpec,
+    cwd: &Path,
+    pauses: &LinkerLockPauses,
+    watch: &mut dyn FnMut(GateEvent),
+) -> GateResult {
     let started = Instant::now();
-    let mut r = run_gate(spec, cwd);
+    let mut r = run_gate_watched(spec, cwd, watch);
     // attempts that count against the limit, the first run included
     let mut counted = 1;
     let mut reruns = 0;
@@ -530,7 +555,7 @@ fn run_gate_with_retry(spec: &GateSpec, cwd: &Path, pauses: &LinkerLockPauses) -
             "[asf] gate `{}` hit a linker lock ({LINKER_LOCK_MARKER}); {what}; {verdict}",
             spec.name,
         ));
-        r = run_gate(spec, cwd);
+        r = run_gate_watched(spec, cwd, watch);
     }
     if !r.ok && !notes.is_empty() && r.tail.contains(LINKER_LOCK_MARKER) {
         let reason = if reruns >= LINKER_LOCK_MAX_RERUNS {
@@ -554,9 +579,31 @@ pub fn run_gates(specs: &[GateSpec], cwd: &Path) -> Vec<GateResult> {
 
 /// [`run_gates`] with the linker-lock pause schedules injected (tests use millisecond pauses).
 pub fn run_gates_with_pauses(specs: &[GateSpec], cwd: &Path, pauses: &LinkerLockPauses) -> Vec<GateResult> {
+    run_gates_watched_with_pauses(specs, cwd, pauses, &mut |_| {})
+}
+
+/// [`run_gates`] that tells `watch` when each gate starts, the output it writes while it runs and its
+/// result, so a caller can show the run before it is over.
+pub fn run_gates_watched(
+    specs: &[GateSpec],
+    cwd: &Path,
+    watch: &mut dyn FnMut(GateEvent),
+) -> Vec<GateResult> {
+    run_gates_watched_with_pauses(specs, cwd, &LinkerLockPauses::DEFAULT, watch)
+}
+
+/// [`run_gates_watched`] with the linker-lock pause schedules injected.
+pub fn run_gates_watched_with_pauses(
+    specs: &[GateSpec],
+    cwd: &Path,
+    pauses: &LinkerLockPauses,
+    watch: &mut dyn FnMut(GateEvent),
+) -> Vec<GateResult> {
     let mut results = Vec::new();
     for spec in specs {
-        let r = run_gate_with_retry(spec, cwd, pauses);
+        watch(GateEvent::Started(&spec.name));
+        let r = run_gate_with_retry(spec, cwd, pauses, watch);
+        watch(GateEvent::Finished(&r));
         let ok = r.ok;
         results.push(r);
         if !ok {

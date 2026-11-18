@@ -120,6 +120,9 @@ pub enum Action {
     OpenComment(Comment),
     /// Switch to the Board with the issue selected.
     OpenOnBoard(IssueId),
+    /// Open the live output of the gate in flight (`asf serve`'s slot); `.0` is the issue the key was
+    /// pressed on, which the window names when the gate that runs is another one's.
+    OpenGate(IssueId),
 }
 
 impl Action {
@@ -377,6 +380,11 @@ impl App {
             Action::OpenComment(comment) => {
                 self.scroll_max.set(u16::MAX);
                 self.overlays.push(Mode::Comment { comment, scroll: 0 });
+                Action::None
+            }
+            Action::OpenGate(id) => {
+                self.scroll_max.set(u16::MAX);
+                self.overlays.push(Mode::Gate { asked: id, back: 0 });
                 Action::None
             }
             Action::OpenOnBoard(id) => {

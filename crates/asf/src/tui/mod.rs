@@ -385,6 +385,7 @@ fn execute(action: Action, ctx: &Ctx, worker: &Worker<'_>) -> Result<Option<Stri
         | Action::OpenInput { .. }
         | Action::Confirm { .. }
         | Action::OpenComment(_)
+        | Action::OpenGate(_)
         | Action::OpenOnBoard(_) => None,
         Action::Answer(id, question, text) => Some(post_answer(&ctx.store, &id, question, &text)?),
         Action::Focus(id) => {
@@ -443,6 +444,8 @@ pub fn run_once(ctx: &Ctx, view: Option<View>) -> Result<String, AppError> {
     if let Some(v) = view {
         app.view = v;
     }
+    // a still picture has no keys: the first item of the queue shows its steps, so they can be checked
+    app.queue.expanded = true;
     Ok(chrome::render_to_text(&app, 120, 30))
 }
 

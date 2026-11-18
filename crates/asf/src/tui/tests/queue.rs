@@ -174,7 +174,7 @@ fn a_failed_item_gets_three_dim_lines_the_error_with_the_attempt_the_tests_and_t
     );
     assert_eq!(
         lines[at + 3].trim(),
-        "r retry after a fix · v verify the run again · Enter full gate output"
+        "r retry after a fix · v verify the run again · Enter steps · o full gate output"
     );
     // all three are secondary text, the key letters excepted
     assert!(cell_style(&a, "· attempt 1", "gate `test` failed")
@@ -381,10 +381,7 @@ fn the_selection_moves_with_j_and_k_and_the_window_scrolls_to_keep_it_on_screen(
     // a screen too short for everything still shows the selected item with its detail lines
     a.handle_key(key('j'));
     let t = render_to_text(&a, 100, 20);
-    assert!(
-        t.contains("■ asf-25") && t.contains("Enter full gate output"),
-        "{t}"
-    );
+    assert!(t.contains("■ asf-25") && t.contains("Enter steps"), "{t}");
 }
 
 #[test]
@@ -589,10 +586,10 @@ fn failed_test_names_come_from_libtest_lines_and_the_failures_section_without_re
 }
 
 #[test]
-fn enter_opens_the_gate_output_in_the_comment_modal() {
+fn o_opens_the_gate_output_of_the_item_in_the_comment_modal() {
     let mut a = queue_app(queue_desk());
     a.handle_key(key('j'));
-    match a.handle_key(code(KeyCode::Enter)) {
+    match a.handle_key(key('o')) {
         Action::None => {}
         other => panic!("the app consumes OpenComment itself: {other:?}"),
     }
@@ -610,7 +607,7 @@ fn enter_opens_the_gate_output_in_the_comment_modal() {
     s.queue[0].state = MergeState::Queued;
     s.queue[0].gate_results.clear();
     let mut a = queue_app(s);
-    a.handle_key(code(KeyCode::Enter));
+    a.handle_key(key('o'));
     assert!(matches!(a.mode(), Mode::Normal));
     assert!(
         a.status.as_deref().unwrap_or("").contains("asf-28"),
@@ -670,7 +667,7 @@ fn the_footer_and_the_help_page_list_the_queue_keys() {
             "j / k move",
             "r retry",
             "v verify",
-            "Enter gate output",
+            "Enter steps",
             "f focus reviewer",
             "? help",
             "q quit",
@@ -684,7 +681,7 @@ fn the_footer_and_the_help_page_list_the_queue_keys() {
         .find(|s| s.title == "QUEUE")
         .expect("a QUEUE heading");
     let keys: Vec<&str> = queue.items.iter().map(|(k, _)| *k).collect();
-    assert_eq!(keys, ["r", "v", "Enter", "f"]);
+    assert_eq!(keys, ["r", "v", "Enter", "l / h", "o", "f"]);
 }
 
 #[test]
@@ -726,7 +723,7 @@ fn gates_reused_from_the_verification_are_said_in_the_cell_under_the_row_and_in_
     assert!(t.contains("gates reused from verification"), "{t}");
 
     let mut a = queue_app(s.clone());
-    a.handle_key(code(KeyCode::Enter));
+    a.handle_key(key('o'));
     match a.mode() {
         Mode::Comment { comment, .. } => {
             assert!(

@@ -172,7 +172,7 @@ fn footer(app: &App) -> Paragraph<'static> {
         Mode::Input { prompt, buf, .. } => lead(format!(" {prompt}: {buf}▏  ")),
         Mode::Confirm { what, .. } => lead(format!(" {what}  ")),
         Mode::Answer { id, .. } => Line::from(format!(" answering {id}")),
-        Mode::Comment { .. } | Mode::Help { .. } => lead(" ".into()),
+        Mode::Comment { .. } | Mode::Help { .. } | Mode::Gate { .. } => lead(" ".into()),
         Mode::Normal => match &app.status {
             Some(s) => Line::from(format!(" {s}")),
             None => lead(" ".into()),

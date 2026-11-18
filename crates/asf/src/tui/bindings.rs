@@ -60,11 +60,13 @@ pub enum ModeKind {
     /// The full-comment modal of the Inbox.
     Comment,
     Help,
+    /// The live output of the gate in flight.
+    Gate,
 }
 
 impl ModeKind {
     #[cfg(test)]
-    pub const ALL: [ModeKind; 7] = [
+    pub const ALL: [ModeKind; 8] = [
         ModeKind::Normal,
         ModeKind::Input,
         ModeKind::Confirm,
@@ -72,6 +74,7 @@ impl ModeKind {
         ModeKind::AnswerText,
         ModeKind::Comment,
         ModeKind::Help,
+        ModeKind::Gate,
     ];
 }
 
@@ -151,6 +154,7 @@ pub const EVERY_MODE: &[ModeKind] = &[
     ModeKind::AnswerText,
     ModeKind::Comment,
     ModeKind::Help,
+    ModeKind::Gate,
 ];
 
 use Group::{Everywhere, Window};

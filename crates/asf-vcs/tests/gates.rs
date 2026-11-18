@@ -1212,3 +1212,65 @@ sys.exit(101)";
         assert!(results[0].tail.contains("    t0\n"), "{}", results[0].tail);
     }
 }
+
+/// What a watcher saw, flattened: `start:<gate>`, `line:<text>`, `done:<gate>:<ok>`.
+fn watch_run(specs: &[GateSpec], dir: &std::path::Path) -> (Vec<String>, Vec<asf_core::GateResult>) {
+    let mut seen: Vec<String> = Vec::new();
+    let results = asf_vcs::gates::run_gates_watched(specs, dir, &mut |e| match e {
+        asf_vcs::gates::GateEvent::Started(g) => seen.push(format!("start:{g}")),
+        asf_vcs::gates::GateEvent::Output(lines) => seen.extend(lines.iter().map(|l| format!("line:{l}"))),
+        asf_vcs::gates::GateEvent::Finished(r) => seen.push(format!("done:{}:{}", r.name, r.ok)),
+    });
+    (seen, results)
+}
+
+#[test]
+fn a_watcher_sees_each_gate_start_its_output_while_it_runs_and_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let specs = vec![
+        // a gate that is over before the first poll is reported by its result alone, so this one lingers
+        spec("one", &py("import time; print('first line', flush=True); time.sleep(0.3)"), 30),
+        spec(
+            "two",
+            &py("import sys,time; print('before', flush=True); time.sleep(0.4); print('after', flush=True); sys.exit(2)"),
+            30,
+        ),
+        spec("three", &py("print('never')"), 30),
+    ];
+    let (seen, results) = watch_run(&specs, dir.path());
+    assert_eq!(results.len(), 2, "the failing gate stops the run");
+    let at = |needle: &str| {
+        seen.iter()
+            .position(|s| s == needle)
+            .unwrap_or_else(|| panic!("{needle} missing from {seen:?}"))
+    };
+    assert!(at("start:one") < at("line:first line") && at("line:first line") < at("done:one:true"));
+    assert!(at("done:one:true") < at("start:two"));
+    assert!(at("start:two") < at("line:before") && at("line:before") < at("done:two:false"));
+    assert!(
+        !seen.iter().any(|s| s.contains("three")),
+        "a gate behind a failure is never announced: {seen:?}"
+    );
+}
+
+#[test]
+fn a_watcher_hears_the_output_of_a_gate_that_is_still_running() {
+    let dir = tempfile::tempdir().unwrap();
+    // the gate stays alive 2 s after its first line; the watcher must have the line long before that
+    let specs = vec![spec(
+        "slow",
+        &py("import time; print('early', flush=True); time.sleep(2)"),
+        30,
+    )];
+    let started = std::time::Instant::now();
+    let mut heard_at = None;
+    asf_vcs::gates::run_gates_watched(&specs, dir.path(), &mut |e| {
+        if let asf_vcs::gates::GateEvent::Output(lines) = e {
+            if lines.iter().any(|l| l == "early") && heard_at.is_none() {
+                heard_at = Some(started.elapsed());
+            }
+        }
+    });
+    let heard = heard_at.expect("the line was never reported");
+    assert!(heard < Duration::from_millis(1800), "heard only after {heard:?}");
+}
