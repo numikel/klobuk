@@ -1888,3 +1888,138 @@ fn config_sets_the_interval_and_the_tick_limit_and_flags_override_it() {
         "the flag wins: {p}"
     );
 }
+
+// ---- API errors and infrastructure stops (asf-158) ----
+
+fn fake_runtime(repo: &Repo) -> FakeRuntime {
+    FakeRuntime::new(repo.path().join(".factory/fake-runtime.json"))
+}
+
+/// The pane Claude Code leaves after a turn that died on `error`.
+fn pane_after_error(error: &str) -> String {
+    format!(
+        "> Start x: read the brief and follow it.\n\n  ⎿  {error}\n\n\
+         ╭────────────────────────────────╮\n│ >                              │\n╰────────────────────────────────╯\n  ? for shortcuts"
+    )
+}
+
+#[test]
+fn a_reviewer_that_died_on_an_api_error_is_started_again_like_a_worker() {
+    const ERROR: &str = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+    let g = gated(HOLD_GATE, "[\"merge\"]", false);
+    review_on_label_risky(&g);
+    let r = risky_queued_item(&g.repo, "docs/**", "docs/r.md");
+    g.release();
+    let res = g.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "reviewing", "{res}");
+    assert_eq!(reviewers_running(&g), 1);
+    let rid = g
+        .store()
+        .list_issues(&asf_core::IssueFilter {
+            kind: Some(asf_core::IssueType::Review),
+            parent: Some(r.parse().unwrap()),
+            ..asf_core::IssueFilter::default()
+        })
+        .unwrap()
+        .last()
+        .expect("a reviewer was started")
+        .id
+        .to_string();
+    let prompts = |g: &Gated| -> Vec<String> {
+        fake_runtime(&g.repo)
+            .log()
+            .into_iter()
+            .filter(|e| e.op == "prompt" && e.args["name"] == rid.as_str())
+            .map(|e| e.args["text"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let kickoff = prompts(&g).remove(0);
+    assert!(kickoff.starts_with(&format!("Start {rid}: read")), "{kickoff}");
+
+    // the kick-off prompt died on the error: the pane is idle with no tool call
+    fake_runtime(&g.repo)
+        .script(serde_json::json!({ "info": [{"state": "idle"}], "screen": pane_after_error(ERROR) }))
+        .unwrap();
+    g.repo.ok(&["serve", "--once"]);
+    let api = |g: &Gated| -> Vec<asf_core::Event> {
+        g.store()
+            .events_since(0, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "run.api_error" || e.kind == "run.api_resend")
+            .collect()
+    };
+    assert_eq!(api(&g).len(), 1, "first sight: noted, nothing sent yet");
+    assert_eq!(prompts(&g).len(), 1);
+    // the wait of a minute is over
+    let run = g
+        .store()
+        .runs(Some(&rid.parse().unwrap()), true)
+        .unwrap()
+        .remove(0);
+    g.store()
+        .append_event(&NewEvent {
+            kind: "run.api_error".into(),
+            issue_id: Some(run.issue_id.clone()),
+            run_id: Some(run.id.clone()),
+            actor: Some("orchestrator".into()),
+            payload: serde_json::json!({
+                "error": ERROR, "tool_calls": 0, "resends": 0, "due_at": "2000-01-01T00:00:00Z", "gave_up": false,
+            }),
+        })
+        .unwrap();
+    let res = g.repo.ok(&["serve", "--once"]);
+    assert!(
+        res["watch"]["transitions"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("kickoff"),
+        "{res}"
+    );
+    assert_eq!(
+        prompts(&g),
+        vec![kickoff.clone(), kickoff],
+        "the kick-off line again"
+    );
+    // the review is still on: no round and no queue change came out of the resend
+    assert_eq!(queue_states(&g), vec![MergeState::Reviewing]);
+    assert!(g
+        .event_kinds()
+        .iter()
+        .all(|(k, _)| !k.contains("sent_back") && k != "run.fix_sent_back"));
+}
+
+/// A gate that its 1 s timeout stops on the first run (no exit code) and that passes afterwards.
+const STOPPED_ONCE_GATE: &str = "import sys, time\nlog = sys.argv[1]\ntry:\n    n = len(open(log).read().splitlines())\nexcept OSError:\n    n = 0\nopen(log, 'a').write('run\\n')\nif n == 0:\n    time.sleep(60)\n";
+
+#[test]
+fn the_loop_runs_a_verification_again_once_when_a_gate_was_stopped_by_the_infrastructure() {
+    let g = gated(STOPPED_ONCE_GATE, "[\"verify\"]", false);
+    let cfg = g.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str("timeout_s = 1\n");
+    std::fs::write(&cfg, s).unwrap();
+    let a = finished_worker(&g.repo, "src/**", "src/a.rs");
+    // a few ticks at most: the rerun is the same verification, picked up by the next call
+    for _ in 0..4 {
+        g.repo.ok(&["serve", "--once"]);
+        if g.repo.ok(&["run", "list"])[0]["state"] == "succeeded" {
+            break;
+        }
+    }
+    let runs = g.repo.ok(&["run", "list"]);
+    assert_eq!(runs[0]["state"], "succeeded", "{runs}");
+    assert_eq!(g.runs().len(), 2, "stopped once, then passed");
+    let reruns = g
+        .event_kinds()
+        .into_iter()
+        .filter(|(k, i)| k == "run.verify_rerun" && i.as_deref() == Some(a.as_str()))
+        .count();
+    assert_eq!(reruns, 1);
+    // verified, queued and (by a later tick of the loop) merged: the issue is not blocked
+    assert!(
+        ["validating", "done"].contains(&g.issue_status(&a).as_str()),
+        "{}",
+        g.issue_status(&a)
+    );
+}

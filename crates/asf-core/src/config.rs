@@ -120,6 +120,10 @@ pub struct WorkerCfg {
     pub start_timeout_ms: u64,
     pub prompt_timeout_ms: u64,
     pub heartbeat_s: u64,
+    /// How many times `asf serve` sends the turn again when an agent ends it on an API or network
+    /// error (`API Error: ...`), waiting 1, 2, 4, ... minutes between the sends, before the run is
+    /// `stalled`. A resend uses neither a run attempt nor a review round.
+    pub api_retries: u32,
 }
 
 impl Default for WorkerCfg {
@@ -148,6 +152,7 @@ impl Default for WorkerCfg {
             start_timeout_ms: 90_000,
             prompt_timeout_ms: 15_000,
             heartbeat_s: 30,
+            api_retries: 5,
         }
     }
 }
@@ -435,6 +440,7 @@ runtime = "herdr"         # herdr | fake
 # model = "sonnet"        # fable | opus | sonnet | haiku, or a full model id (claude-...); unset: Claude Code default
 budget_usd = 5.0          # per issue; cost as reported by Claude Code for each session (API list prices incl. cache; on a subscription an equivalent, not a bill)
 stall_minutes = 15
+api_retries = 5           # an agent whose turn ends on an API or network error (ENOTFOUND, 5xx, timeout) gets the turn sent again after 1, 2, 4, ... min; after this many sends the run is stalled with a BLOCKER (a send uses no attempt and no review round)
 max_wall_minutes = 90
 max_tool_calls = 400
 allowed_tools = ["Read", "Edit", "Glob", "Grep", "Bash(git *)", "Bash(asf *)"]
@@ -710,6 +716,7 @@ mod tests {
         assert_eq!(c.worker.start_timeout_ms, 90_000);
         assert_eq!(c.worker.prompt_timeout_ms, 15_000);
         assert_eq!(c.worker.heartbeat_s, 30);
+        assert_eq!(c.worker.api_retries, 5);
         assert_eq!(c.worker.nudges, 1);
         assert!(c.worker.model.is_none());
         assert!(c.gates.is_empty());

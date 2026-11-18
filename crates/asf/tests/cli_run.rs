@@ -2066,3 +2066,382 @@ fn reply_with_budget_raises_and_sends_in_one_step() {
     assert_eq!((code, ecode.as_str()), (2, "usage"));
     assert_eq!(fake(&f).log().iter().filter(|e| e.op == "prompt").count(), sent);
 }
+
+// ---- a turn that ends on an API or network error is sent again (asf-158) ----
+
+const API_ERROR_LINE: &str = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+
+/// The pane Claude Code leaves after a turn that died on `error`: the echoed prompt, the error and the
+/// input box with `input` in it.
+fn pane_after(error: &str, input: &str) -> String {
+    format!(
+        "> Start asf-1: read .factory/runs/asf-1/brief.md and follow it.\n\n  ⎿  {error}\n\n\
+         ╭────────────────────────────────╮\n│ > {input:<28} │\n╰────────────────────────────────╯\n  ? for shortcuts"
+    )
+}
+
+/// The agent has ended its turn: Herdr calls it idle and its pane shows `screen`.
+fn agent_idle_showing(f: &F, screen: &str) {
+    fake(f)
+        .script(serde_json::json!({ "info": [{"state": "idle"}], "screen": screen }))
+        .unwrap();
+}
+
+fn api_events(f: &F) -> Vec<Event> {
+    store(f)
+        .events_since(0, 10_000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "run.api_error" || e.kind == "run.api_resend")
+        .collect()
+}
+
+/// The prompts that reached the agent, oldest first.
+fn prompts(f: &F) -> Vec<String> {
+    fake(f)
+        .log()
+        .into_iter()
+        .filter(|e| e.op == "prompt")
+        .map(|e| e.args["text"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Seconds between an API event and the moment its `due_at` names.
+fn wait_s(e: &Event) -> i64 {
+    use time::format_description::well_known::Rfc3339;
+    let at = |s: &str| time::OffsetDateTime::parse(s, &Rfc3339).unwrap();
+    (at(e.payload["due_at"].as_str().unwrap()) - at(&e.ts)).whole_seconds()
+}
+
+/// Lets the wait before the next resend run out without sleeping: the newest event of the episode,
+/// again, with a `due_at` long past.
+fn wait_is_over(f: &F) {
+    let run = active_run(f);
+    let last = api_events(f).pop().expect("an API event to carry on from");
+    store(f)
+        .append_event(&NewEvent {
+            kind: "run.api_error".into(),
+            issue_id: Some(run.issue_id.clone()),
+            run_id: Some(run.id.clone()),
+            actor: Some(LANE_ORCHESTRATOR.into()),
+            payload: serde_json::json!({
+                "error": last.payload["error"], "tool_calls": run.tool_calls,
+                "resends": last.payload["resends"], "due_at": "2000-01-01T00:00:00Z", "gave_up": false,
+            }),
+        })
+        .unwrap();
+}
+
+fn watch_once(f: &F) -> serde_json::Value {
+    f.repo.ok(&["run", "watch", "--once"])
+}
+
+fn set_api_retries(f: &F, n: u32) {
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    assert!(s.contains("api_retries = 5"), "the template carries the default");
+    std::fs::write(&cfg, s.replace("api_retries = 5", &format!("api_retries = {n}"))).unwrap();
+}
+
+#[test]
+fn a_kickoff_that_died_on_an_api_error_is_sent_again_once_the_wait_is_over() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    let kickoff = prompts(&f).remove(0);
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, ""));
+
+    // the first sight only starts the wait of a minute
+    let res = watch_once(&f);
+    assert!(res["transitions"].as_array().unwrap().is_empty(), "{res}");
+    let events = api_events(&f);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "run.api_error");
+    assert!(events[0].payload["error"].as_str().unwrap().contains("ENOTFOUND"));
+    assert!((59..=61).contains(&wait_s(&events[0])), "{}", wait_s(&events[0]));
+    watch_once(&f);
+    assert_eq!(
+        prompts(&f).len(),
+        1,
+        "back-off: nothing goes out before the wait is over"
+    );
+
+    wait_is_over(&f);
+    let res = watch_once(&f);
+    assert_eq!(res["transitions"][0]["to"], "working", "{res}");
+    assert!(
+        res["transitions"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("kickoff"),
+        "{res}"
+    );
+    assert_eq!(
+        prompts(&f),
+        vec![kickoff.clone(), kickoff],
+        "the kick-off line again"
+    );
+    let sent = api_events(&f).pop().unwrap();
+    assert_eq!(
+        (sent.kind.as_str(), sent.payload["resends"].as_u64()),
+        ("run.api_resend", Some(1))
+    );
+    assert_eq!(sent.payload["what"], "kickoff");
+    assert!(
+        (119..=121).contains(&wait_s(&sent)),
+        "the next wait is two minutes"
+    );
+
+    // a resend is no new attempt, no review round and no BLOCKER
+    let run = active_run(&f);
+    assert_eq!((run.state, run.attempt), (RunState::Working, 1));
+    assert_eq!(blockers(&f), 0);
+    assert!(store(&f)
+        .events_since(0, 10_000)
+        .unwrap()
+        .iter()
+        .all(|e| !e.kind.contains("sent_back")));
+}
+
+#[test]
+fn a_run_that_failed_mid_turn_gets_a_short_continue_message() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    patch_run(
+        &f,
+        RunPatch {
+            tool_calls: Some(7),
+            ..RunPatch::default()
+        },
+    );
+    agent_idle_showing(&f, &pane_after("API Error: 529 overloaded_error", ""));
+    watch_once(&f);
+    wait_is_over(&f);
+    let res = watch_once(&f);
+    assert!(
+        res["transitions"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("continue"),
+        "{res}"
+    );
+    assert_eq!(
+        prompts(&f).pop().unwrap(),
+        "Your last turn ended with an API error; continue where you left off."
+    );
+    assert_eq!(api_events(&f).pop().unwrap().payload["what"], "continue");
+}
+
+#[test]
+fn the_wait_doubles_with_every_resend_and_the_run_stalls_after_api_retries() {
+    let f = setup();
+    set_api_retries(&f, 2);
+    f.repo.ok(&["run", "start", &f.issue]);
+    patch_run(
+        &f,
+        RunPatch {
+            tool_calls: Some(3),
+            ..RunPatch::default()
+        },
+    );
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, ""));
+    watch_once(&f);
+    assert!((59..=61).contains(&wait_s(&api_events(&f)[0])));
+    for expected in [120, 240] {
+        wait_is_over(&f);
+        agent_idle_showing(&f, &pane_after(API_ERROR_LINE, ""));
+        let res = watch_once(&f);
+        assert_eq!(res["transitions"][0]["to"], "working", "{res}");
+        let wait = wait_s(&api_events(&f).pop().unwrap());
+        assert!(
+            (expected - 1..=expected + 1).contains(&wait),
+            "{wait} vs {expected}"
+        );
+    }
+    assert_eq!(prompts(&f).len(), 3, "the kick-off and two resends");
+    assert_eq!(active_run(&f).state, RunState::Working);
+
+    // the error again after the last allowed resend: the run gives up
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, ""));
+    let res = watch_once(&f);
+    assert_eq!(res["transitions"][0]["to"], "stalled", "{res}");
+    let run = active_run(&f);
+    assert_eq!((run.state, run.attempt), (RunState::Stalled, 1));
+    assert!(run.exit_reason.unwrap().contains("ENOTFOUND"));
+    let comments = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
+    let blocker = comments
+        .iter()
+        .find(|c| c.kind == CommentType::Blocker)
+        .expect("a BLOCKER");
+    assert!(
+        blocker.body.contains("ENOTFOUND") && blocker.body.contains("api_retries"),
+        "{}",
+        blocker.body
+    );
+    assert_eq!(blockers(&f), 1);
+    assert_eq!(prompts(&f).len(), 3, "nothing is sent after the run gave up");
+    // a stalled run is left alone by the next passes
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, ""));
+    watch_once(&f);
+    assert_eq!((prompts(&f).len(), blockers(&f)), (3, 1));
+}
+
+#[test]
+fn an_error_the_resend_cannot_cure_or_text_in_the_input_box_is_left_alone() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    // a rejected key: no event at all
+    agent_idle_showing(&f, &pane_after("API Error: 401 Invalid API key", ""));
+    watch_once(&f);
+    assert!(api_events(&f).is_empty());
+    // the human is typing something else into the box
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, "wait, one more thing"));
+    watch_once(&f);
+    wait_is_over(&f);
+    watch_once(&f);
+    assert_eq!(prompts(&f).len(), 1, "text in the input box is not typed over");
+    // a working agent is not looked at
+    fake(&f)
+        .script(
+            serde_json::json!({ "info": [{"state": "working"}], "screen": pane_after(API_ERROR_LINE, "") }),
+        )
+        .unwrap();
+    let before = api_events(&f).len();
+    watch_once(&f);
+    assert_eq!(api_events(&f).len(), before);
+}
+
+#[test]
+fn a_kickoff_line_that_claude_put_back_in_the_input_box_only_gets_its_enter() {
+    let f = setup();
+    f.repo.ok(&["run", "start", &f.issue]);
+    let kickoff = prompts(&f).remove(0);
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, &kickoff));
+    watch_once(&f);
+    wait_is_over(&f);
+    watch_once(&f);
+    assert_eq!(prompts(&f).len(), 1, "the line is not typed a second time");
+    let keys: Vec<_> = fake(&f)
+        .log()
+        .into_iter()
+        .filter(|e| e.op == "send_keys")
+        .map(|e| e.args["keys"].clone())
+        .collect();
+    assert_eq!(keys, vec![serde_json::json!(["enter"])]);
+    assert_eq!(api_events(&f).pop().unwrap().kind, "run.api_resend");
+}
+
+#[test]
+fn an_outage_the_agent_got_over_starts_the_count_again() {
+    let f = setup();
+    set_api_retries(&f, 1);
+    f.repo.ok(&["run", "start", &f.issue]);
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, ""));
+    watch_once(&f);
+    wait_is_over(&f);
+    watch_once(&f);
+    assert_eq!(prompts(&f).len(), 2);
+    // the agent worked (its hooks counted a tool call) and then met the next outage: a new episode
+    patch_run(
+        &f,
+        RunPatch {
+            tool_calls: Some(4),
+            ..RunPatch::default()
+        },
+    );
+    agent_idle_showing(&f, &pane_after(API_ERROR_LINE, ""));
+    let res = watch_once(&f);
+    assert!(
+        res["transitions"].as_array().unwrap().is_empty(),
+        "first sight again: {res}"
+    );
+    assert_eq!(active_run(&f).state, RunState::Working);
+    assert_eq!(api_events(&f).pop().unwrap().payload["resends"], 0);
+}
+
+// ---- a gate stopped by the infrastructure is not a code failure (asf-158) ----
+
+/// A gate that is stopped by its 1 s timeout for as many runs as the log has lines below `stops`, then passes.
+fn stopped_gate(f: &F, stops: usize) -> PathBuf {
+    let dir = f.repo.path().join(".factory");
+    let script = dir.join("stopped_gate.py");
+    std::fs::write(
+        &script,
+        format!(
+            "import sys, time\nlog = sys.argv[1]\ntry:\n    n = len(open(log).read().splitlines())\nexcept OSError:\n    n = 0\n\
+             open(log, 'a').write('run\\n')\nif n < {stops}:\n    time.sleep(60)\n"
+        ),
+    )
+    .unwrap();
+    let log = dir.join("stopped_gate.log");
+    let fwd = |p: &Path| p.to_str().unwrap().replace('\\', "/");
+    let cfg = f.repo.path().join(".factory/config.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(&format!(
+        "\n[[gate]]\nname = \"flaky\"\ncmd = ['python', '{}', '{}']\ntimeout_s = 1\n",
+        fwd(&script),
+        fwd(&log)
+    ));
+    std::fs::write(&cfg, s).unwrap();
+    log
+}
+
+fn gate_runs(log: &Path) -> usize {
+    std::fs::read_to_string(log).unwrap_or_default().lines().count()
+}
+
+fn rerun_events(f: &F) -> usize {
+    store(f)
+        .events_since(0, 10_000)
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == "run.verify_rerun")
+        .count()
+}
+
+#[test]
+fn a_gate_stopped_by_the_infrastructure_is_run_again_once_and_a_pass_succeeds() {
+    let f = setup();
+    let log = stopped_gate(&f, 1);
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let res = watch_once(&f);
+    assert_eq!(res["transitions"][0]["to"], "succeeded", "{res}");
+    assert_eq!(gate_runs(&log), 2, "stopped once, then passed");
+    assert_eq!(rerun_events(&f), 1);
+    assert_eq!(active_run(&f).state, RunState::Succeeded);
+    assert_eq!(store(&f).merge_queue().unwrap().len(), 1);
+    assert_eq!(blockers(&f), 0);
+}
+
+#[test]
+fn a_second_infrastructure_stop_blocks_the_issue_and_says_so() {
+    let f = setup();
+    let log = stopped_gate(&f, 99);
+    f.repo.ok(&["run", "start", &f.issue]);
+    worker_finishes(&f);
+    let res = watch_once(&f);
+    assert_eq!(res["transitions"][0]["to"], "failed", "{res}");
+    assert_eq!(gate_runs(&log), 2, "one automatic rerun, not more");
+    assert_eq!(rerun_events(&f), 1);
+    let run = active_run(&f);
+    assert_eq!(run.state, RunState::Failed);
+    assert!(
+        run.exit_reason.as_deref().unwrap().contains("infrastructure"),
+        "{run:?}"
+    );
+    let comments = store(&f).comments(&f.issue.parse().unwrap()).unwrap();
+    let blocker = comments
+        .iter()
+        .find(|c| c.kind == CommentType::Blocker)
+        .expect("a BLOCKER");
+    assert!(
+        blocker.body.contains("infrastructure") && blocker.body.contains("flaky"),
+        "{}",
+        blocker.body
+    );
+    assert_eq!(issue_status(&f), "blocked");
+    // an operator-triggered verification of the same commit does not rerun by itself again
+    f.repo.ok(&["run", "verify", &f.issue]);
+    assert_eq!(gate_runs(&log), 3);
+    assert_eq!(rerun_events(&f), 1);
+}

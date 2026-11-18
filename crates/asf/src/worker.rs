@@ -15,6 +15,8 @@ use asf_vcs::gates::stage_specs;
 use asf_vcs::{run_gates, GitCli};
 use serde::Serialize;
 use serde_json::json;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::ctx::{Ctx, ENV_ISSUE, FACTORY_DIR};
 use crate::output::{AppError, ErrorCode};
@@ -164,22 +166,42 @@ pub fn is_environmental(r: &GateResult) -> bool {
     r.exit_code.is_none() || r.tail.contains(LINKER_LOCK)
 }
 
-/// Every `merge.sent_back` and `run.fix_sent_back` event of `id`, oldest first.
+/// Event for the first sight of an agent whose turn ended on an API or network error. Its payload
+/// has the `error` line, the run's `tool_calls` (what tells one outage from the next: any progress
+/// moves it), the `resends` done so far and `due_at`, when the next resend may go out.
+pub const API_ERROR: &str = "run.api_error";
+
+/// Event for a turn sent again after such an error. Same payload as [`API_ERROR`] plus the `what` that
+/// was sent (`kickoff` or `continue`); `resends` counts this one.
+pub const API_RESEND: &str = "run.api_resend";
+
+/// Event for a verification that is run again because a gate was stopped for an infrastructure
+/// reason (see [`is_environmental`]). Its payload has the `head` the gates ran on and the `gate`.
+pub const VERIFY_RERUN: &str = "run.verify_rerun";
+
+/// Every event of one of `kinds` that belongs to `id`, oldest first.
 // shortcut: full event scan per call (the store has no query by issue and kind), upgrade to one when
-// events > ~50k or ticks slow; callers scan once per send-back and, in `auto_finish`, only for a run
+// events > ~50k or ticks slow; callers scan once per send-back, once per agent found idle on an API
+// error and once per verification stopped by the infrastructure, and in `auto_finish` only for a run
 // that was reopened by a send-back.
-fn sent_back_events(ctx: &Ctx, id: &IssueId) -> Result<Vec<Event>, AppError> {
+fn events_of(ctx: &Ctx, id: &IssueId, kinds: &[&str]) -> Result<Vec<Event>, AppError> {
     let mut found = Vec::new();
     let mut seq = 0;
     loop {
         let page = ctx.store.events_since(seq, 500)?;
         let Some(last) = page.last() else { break };
         seq = last.seq;
-        found.extend(page.into_iter().filter(|e| {
-            matches!(e.kind.as_str(), SENT_BACK | FIX_SENT_BACK) && e.issue_id.as_ref() == Some(id)
-        }));
+        found.extend(
+            page.into_iter()
+                .filter(|e| kinds.contains(&e.kind.as_str()) && e.issue_id.as_ref() == Some(id)),
+        );
     }
     Ok(found)
+}
+
+/// Every `merge.sent_back` and `run.fix_sent_back` event of `id`, oldest first.
+fn sent_back_events(ctx: &Ctx, id: &IssueId) -> Result<Vec<Event>, AppError> {
+    events_of(ctx, id, &[SENT_BACK, FIX_SENT_BACK])
 }
 
 /// Times `id` was sent back for a gate failure or a rebase conflict (not for a review): what
@@ -648,6 +670,126 @@ pub(crate) fn open_questions(report: &str) -> Vec<String> {
 fn tail(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+// ---- a turn that ends on an API or network error ---------------------------------------------------
+//
+// Claude Code prints `API Error: ...` where a reply would be and returns to the prompt, so Herdr calls
+// the agent idle and the run looks `working` for good. The fix is always to send the turn again.
+
+/// Lines read from the pane of an idle agent to look for the error.
+const API_PANE_LINES: u32 = 30;
+
+/// How many non-blank lines from the bottom of the pane the error may stand: the input box, its borders
+/// and the hint and status lines under it.
+const API_ERROR_WITHIN: usize = 12;
+
+/// Wait before the first resend; every further one doubles it (1, 2, 4, 8, ... minutes).
+const API_BACKOFF_S: u64 = 60;
+
+/// What an agent is told when its last turn (not the kick-off) ended on an API error.
+const API_CONTINUE: &str = "Your last turn ended with an API error; continue where you left off.";
+
+/// Lines the agent printed start with one of these: the message, a tool call, its result, a spinner.
+const AGENT_MARKS: [char; 8] = ['⏺', '●', '⎿', '✻', '✽', '✶', '✳', '✢'];
+
+/// A pane line without its blanks and the box-drawing characters of the input box around it.
+fn unframed(line: &str) -> &str {
+    line.trim_matches(|c: char| c.is_whitespace() || ('\u{2500}'..='\u{257f}').contains(&c))
+}
+
+/// `t` without whitespace and box-drawing characters: text that the input box wrapped compares equal.
+fn dense(t: &str) -> String {
+    t.chars()
+        .filter(|c| !c.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(c))
+        .collect()
+}
+
+/// The first three digits of `rest` say a 5xx status (`529 {"type":"overloaded_error"...}`).
+fn is_server_error(rest: &str) -> bool {
+    let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    code.len() == 3 && code.starts_with('5')
+}
+
+/// An error that sending the turn again can cure: the network (`ENOTFOUND`, unreachable server,
+/// timeout), an overloaded or failing server. A rejected request, a bad key or an exhausted quota stay
+/// as they are (nothing here would change them).
+fn transient_api_error(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("API Error:") else {
+        return text.starts_with("Request timed out");
+    };
+    let rest = rest.trim_start();
+    let lower = rest.to_lowercase().replace('’', "'");
+    const NETWORK: [&str; 10] = [
+        "reach the api server",
+        "enotfound",
+        "econnreset",
+        "econnrefused",
+        "etimedout",
+        "eai_again",
+        "timed out",
+        "connection error",
+        "socket hang up",
+        "overloaded",
+    ];
+    is_server_error(rest) || NETWORK.iter().any(|m| lower.contains(m))
+}
+
+/// A pane whose last agent message is a transient API or network error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApiEnding {
+    /// The error line, as printed.
+    error: String,
+    /// What stands in the input box under it: empty when the box is empty.
+    input: String,
+}
+
+/// Looks from the bottom of the pane for the error line: the input box, its borders and the hints
+/// under it are skipped, anything the agent printed after the error means the turn went on. An error
+/// that sending again cannot cure is not one.
+fn api_error_ending(screen: &str) -> Option<ApiEnding> {
+    let mut input = None;
+    for line in screen
+        .lines()
+        .rev()
+        .map(unframed)
+        .filter(|l| !l.is_empty())
+        .take(API_ERROR_WITHIN)
+    {
+        let text = line.trim_start_matches(AGENT_MARKS).trim_start();
+        if text.starts_with("API Error:") || text.starts_with("Request timed out") {
+            return transient_api_error(text).then(|| ApiEnding {
+                error: text.to_string(),
+                input: input.unwrap_or_default(),
+            });
+        }
+        if line.starts_with(AGENT_MARKS) {
+            return None;
+        }
+        if input.is_none() {
+            input = line.strip_prefix(['>', '❯']).map(|rest| rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// The wait before the resend that follows `resends` earlier ones.
+fn api_backoff_s(resends: u32) -> u64 {
+    API_BACKOFF_S.saturating_mul(1 << resends.min(16))
+}
+
+/// The prompt that starts a worker or a reviewer on its brief.
+fn kickoff_text(id: &IssueId) -> String {
+    format!("Start {id}: read {FACTORY_DIR}/{RUNS_DIR}/{id}/brief.md and follow it.")
+}
+
+/// `secs` from now, as an RFC 3339 string.
+fn rfc3339_in(secs: u64) -> String {
+    (OffsetDateTime::now_utc() + time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX / 2)))
+        .replace_nanosecond(0)
+        .ok()
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .unwrap_or_else(now_rfc3339)
 }
 
 /// Lines of wrapped question text read after the `SCOPE:` line while looking for `because`.
@@ -1177,7 +1319,7 @@ impl<'a> Worker<'a> {
                 session_name: session_name(id.as_str(), &issue.title),
                 settings_path,
                 model: self.ctx.config.worker.model.clone(),
-                kick: format!("Start {id}: read {FACTORY_DIR}/{RUNS_DIR}/{id}/brief.md and follow it."),
+                kick: kickoff_text(id),
                 reviewer: false,
             },
             &fail_run,
@@ -1468,11 +1610,6 @@ impl<'a> Worker<'a> {
     /// Whitespace and box-drawing characters are ignored on both sides, so a line that the input box
     /// wrapped (borders and line breaks inside the text) is still found.
     fn kickoff_in_input_box(&self, handle: &AgentHandle, text: &str) -> bool {
-        let dense = |t: &str| {
-            t.chars()
-                .filter(|c| !c.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(c))
-                .collect::<String>()
-        };
         let Ok(screen) = self.rt.read(handle, 60) else {
             return true;
         };
@@ -1710,7 +1847,7 @@ impl<'a> Worker<'a> {
                 session_name: session_name(&format!("review-{}", issue.id), &issue.title),
                 settings_path,
                 model: Some(self.ctx.config.review.model.clone()),
-                kick: format!("Start {rid}: read {FACTORY_DIR}/{RUNS_DIR}/{rid}/brief.md and follow it."),
+                kick: kickoff_text(&rid),
                 reviewer: true,
             },
             &fail_run,
@@ -2409,6 +2546,9 @@ impl<'a> Worker<'a> {
                         },
                     )?;
                 }
+                AgentState::Idle | AgentState::Done if run.state == RunState::Working => {
+                    transitions.extend(self.recover_api_error(run, &handle)?);
+                }
                 _ => {}
             }
         }
@@ -2424,6 +2564,131 @@ impl<'a> Worker<'a> {
             checked: active.len() + again.len(),
             transitions,
         })
+    }
+
+    /// An agent that is idle although its run is `working`: when its last turn ended on a transient
+    /// API or network error, the turn is sent again (see [`api_error_ending`]). The kick-off prompt goes
+    /// out again for a run whose hooks never fired (`tool_calls == 0`), a short continue message for any
+    /// other. Only into an empty input box: text there is the human's (or the kick-off line that Claude
+    /// Code put back, which only needs its Enter).
+    ///
+    /// The state is in the events of the run, so a restarted `asf serve` goes on where it stopped: the
+    /// first sight of the error writes [`API_ERROR`] (wait 1 min), every resend [`API_RESEND`] (wait
+    /// twice as long as the one before), and the newest event says how many resends were done and when
+    /// the next one is due. An event that carries other `tool_calls` than the run has now belongs to an
+    /// outage the agent got over. After `worker.api_retries` resends the next sight of the error stalls
+    /// the run with a BLOCKER. No run attempt and no review round is used.
+    fn recover_api_error(&self, run: &Run, h: &AgentHandle) -> Result<Option<Transition>, AppError> {
+        let Ok(screen) = self.rt.read(h, API_PANE_LINES) else {
+            return Ok(None);
+        };
+        let Some(end) = api_error_ending(&screen) else {
+            return Ok(None);
+        };
+        let events = events_of(self.ctx, &run.issue_id, &[API_ERROR, API_RESEND])?;
+        let current = events
+            .iter()
+            .rev()
+            .find(|e| e.run_id.as_deref() == Some(run.id.as_str()))
+            .filter(|e| e.payload["tool_calls"].as_i64() == Some(run.tool_calls))
+            .filter(|e| e.payload["gave_up"].as_bool() != Some(true));
+        let Some(last) = current else {
+            self.api_event(API_ERROR, run, &end.error, 0, "", false)?;
+            return Ok(None);
+        };
+        let resends = last.payload["resends"].as_u64().unwrap_or(0) as u32;
+        let max = self.ctx.config.worker.api_retries;
+        let (from, to) = (run.state, RunState::Stalled);
+        if resends >= max {
+            let reason = format!(
+                "{}; the turn was sent again {resends} time(s) without success",
+                end.error
+            );
+            self.api_event(API_ERROR, run, &end.error, resends, "", true)?;
+            self.set_state(run, RunState::Stalled, Some(reason.clone()))?;
+            self.blocker(
+                run,
+                format!(
+                    "The agent of {id} cannot reach the API: its turn ended on `{error}` and sending it again {resends} time(s) \
+                     did not help (`worker.api_retries` is {max}). The run is stalled. When the connection is back, send the \
+                     turn with `asf run nudge {id}` (or `asf run reply {id} <text>`); that puts the run back to working.",
+                    id = run.issue_id,
+                    error = end.error
+                ),
+            )?;
+            return Ok(Some(Transition {
+                run_id: run.id.clone(),
+                issue_id: run.issue_id.clone(),
+                from,
+                to,
+                detail: reason,
+            }));
+        }
+        let due = last.payload["due_at"]
+            .as_str()
+            .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+        if due.is_some_and(|d| OffsetDateTime::now_utc() < d) {
+            return Ok(None);
+        }
+        let (what, text) = if run.tool_calls == 0 {
+            ("kickoff", kickoff_text(&run.issue_id))
+        } else {
+            ("continue", API_CONTINUE.to_string())
+        };
+        let probe: String = dense(&text).chars().take(KICKOFF_PROBE_CHARS).collect();
+        if !end.input.is_empty() && !dense(&end.input).starts_with(&probe) {
+            return Ok(None); // somebody is typing: not ours to send over
+        }
+        let n = resends + 1;
+        // written before the send: a crash in it must not turn into a resend on every tick
+        self.api_event(API_RESEND, run, &end.error, n, what, false)?;
+        let sent = if end.input.is_empty() {
+            self.send_kickoff(h, &text).map(|_| ())
+        } else {
+            self.rt.send_keys(h, &["enter"])
+        };
+        let result = match sent {
+            Ok(()) => String::new(),
+            Err(e) => format!("; the send failed: {e}"),
+        };
+        Ok(Some(Transition {
+            run_id: run.id.clone(),
+            issue_id: run.issue_id.clone(),
+            from: run.state,
+            to: run.state,
+            detail: format!(
+                "API error ({}): the {what} prompt was sent again ({n}/{max}), the next one in {} s if it fails{result}",
+                end.error,
+                api_backoff_s(n)
+            ),
+        }))
+    }
+
+    /// Writes the [`API_ERROR`] or [`API_RESEND`] event that the next tick reads its state from.
+    fn api_event(
+        &self,
+        kind: &str,
+        run: &Run,
+        error: &str,
+        resends: u32,
+        what: &str,
+        gave_up: bool,
+    ) -> Result<(), AppError> {
+        self.ctx.store.append_event(&NewEvent {
+            kind: kind.into(),
+            issue_id: Some(run.issue_id.clone()),
+            run_id: Some(run.id.clone()),
+            actor: Some(LANE_ORCHESTRATOR.into()),
+            payload: json!({
+                "error": error,
+                "tool_calls": run.tool_calls,
+                "resends": resends,
+                "what": what,
+                "due_at": rfc3339_in(api_backoff_s(resends)),
+                "gave_up": gave_up,
+            }),
+        })?;
+        Ok(())
     }
 
     /// The run that waits longest for its verification: an active run whose worker has finished
@@ -2568,9 +2833,16 @@ impl<'a> Worker<'a> {
 
     /// Independent verification after the worker's finish ritual, gates included, in this thread.
     fn verify(&self, run: &Run, issue: &Issue) -> Result<Transition, AppError> {
-        let job = self.verify_prepare(run, issue)?;
-        let results = run_gates(&self.verify_specs(), &job.wt);
-        self.verify_conclude(job, results)
+        // a verification stopped by the infrastructure comes back as `verifying` and runs once more
+        // (`verify_conclude` allows that once per commit, so the loop ends after at most two runs)
+        loop {
+            let job = self.verify_prepare(run, issue)?;
+            let results = run_gates(&self.verify_specs(), &job.wt);
+            let t = self.verify_conclude(job, results)?;
+            if t.to != RunState::Verifying {
+                return Ok(t);
+            }
+        }
     }
 
     fn verify_specs(&self) -> Vec<GateSpec> {
@@ -2641,6 +2913,37 @@ impl<'a> Worker<'a> {
             ..
         } = job;
         let (run, issue) = (&run, &issue);
+        // A gate stopped by the infrastructure (timeout, slow-test stop, linker lock) says nothing about the
+        // code: the verification runs once more by itself, on the same commit. Its second stop is a failure.
+        let stopped = results.iter().find(|r| !r.ok && is_environmental(r));
+        let mut rerun_used = false;
+        if let Some(stopped) = stopped.filter(|_| problems.is_empty()) {
+            let head_now = head.clone().unwrap_or_default();
+            rerun_used = events_of(self.ctx, &run.issue_id, &[VERIFY_RERUN])?
+                .iter()
+                .any(|e| {
+                    e.run_id.as_deref() == Some(run.id.as_str()) && e.payload["head"] == head_now.as_str()
+                });
+            if !rerun_used {
+                self.ctx.store.append_event(&NewEvent {
+                    kind: VERIFY_RERUN.into(),
+                    issue_id: Some(run.issue_id.clone()),
+                    run_id: Some(run.id.clone()),
+                    actor: Some(LANE_ORCHESTRATOR.into()),
+                    payload: json!({ "head": head_now, "gate": stopped.name }),
+                })?;
+                return Ok(Transition {
+                    run_id: run.id.clone(),
+                    issue_id: run.issue_id.clone(),
+                    from: run.state,
+                    to: RunState::Verifying,
+                    detail: format!(
+                        "gate `{}` was stopped for an infrastructure reason; the verification runs again",
+                        stopped.name
+                    ),
+                });
+            }
+        }
         // a gate that really failed, with nothing else wrong, is the worker's to fix: it is idle in its pane
         let mut not_sent = None;
         let fixable = results
@@ -2670,8 +2973,16 @@ impl<'a> Worker<'a> {
             }
         }
         for r in results.iter().filter(|r| !r.ok) {
+            let why = if !is_environmental(r) {
+                String::new()
+            } else if rerun_used {
+                " It was stopped for an infrastructure reason, not for a code failure, and again when the verification ran a second time."
+                    .to_string()
+            } else {
+                " It was stopped for an infrastructure reason, not for a code failure.".to_string()
+            };
             problems.push(format!(
-                "gate `{}` failed (exit {:?}):\n{}",
+                "gate `{}` failed (exit {:?}):{why}\n{}",
                 r.name,
                 r.exit_code,
                 tail(&r.tail, 15)
@@ -2850,6 +3161,83 @@ mod tests {
             Some(1),
             "error: this boolean expression can be simplified"
         )));
+    }
+
+    /// A pane the way Claude Code leaves it after a turn that died on `error`: the echoed prompt, the
+    /// error, the input box with `input` in it and a hint line.
+    fn pane_after(error: &str, input: &str) -> String {
+        format!(
+            "> Start asf-1: read .factory/runs/asf-1/brief.md and follow it.\n\n  ⎿  {error}\n\n\
+             ╭────────────────────────────────╮\n│ > {input:<28} │\n╰────────────────────────────────╯\n  ? for shortcuts\n"
+        )
+    }
+
+    #[test]
+    fn the_error_lines_of_an_outage_and_of_a_failing_server_are_transient_a_rejected_request_is_not() {
+        for line in [
+            "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+            "API Error: Can’t reach the API server",
+            "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}",
+            "API Error: 500 Internal server error",
+            "API Error: Request timed out.",
+            "API Error: read ECONNRESET",
+            "Request timed out",
+        ] {
+            assert!(transient_api_error(line), "{line}");
+        }
+        for line in [
+            "API Error: 400 {\"error\":{\"message\":\"prompt is too long\"}}",
+            "API Error: 401 Invalid API key",
+            "API Error: Credit balance is too low",
+            "something else",
+        ] {
+            assert!(!transient_api_error(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_pane_that_ends_on_an_api_error_is_recognised_with_its_input_box() {
+        let err = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+        let end = api_error_ending(&pane_after(err, "")).expect("the error is the last message");
+        assert_eq!((end.error.as_str(), end.input.as_str()), (err, ""));
+        // text in the box is reported, not lost
+        assert_eq!(
+            api_error_ending(&pane_after(err, "half a thou")).unwrap().input,
+            "half a thou"
+        );
+        // the error without a marker or a frame, as the brief quotes it
+        assert!(api_error_ending(&format!("{err}\n")).is_some());
+    }
+
+    #[test]
+    fn a_turn_that_went_on_after_the_error_or_a_cure_less_error_is_not_an_ending() {
+        let err = "API Error: Request timed out.";
+        let went_on = format!("{}  ⏺ Bash(cargo test)\n", pane_after(err, ""));
+        assert_eq!(
+            api_error_ending(&went_on),
+            None,
+            "the agent printed something after the error"
+        );
+        assert_eq!(
+            api_error_ending(&pane_after("API Error: 401 Invalid API key", "")),
+            None
+        );
+        assert_eq!(api_error_ending("⏺ All done.\n\n╭───╮\n│ >   │\n╰───╯\n"), None);
+        assert_eq!(api_error_ending(""), None);
+        // an error far above the input box is history
+        let old = format!("  ⎿  {err}\n{}", "x line\n".repeat(API_ERROR_WITHIN + 2));
+        assert_eq!(api_error_ending(&old), None);
+    }
+
+    #[test]
+    fn the_wait_between_resends_doubles_from_one_minute() {
+        let waits: Vec<u64> = (0..5).map(api_backoff_s).collect();
+        assert_eq!(waits, [60, 120, 240, 480, 960]);
+        assert_eq!(
+            api_backoff_s(u32::MAX),
+            60 << 16,
+            "a huge count does not overflow"
+        );
     }
 
     #[test]
