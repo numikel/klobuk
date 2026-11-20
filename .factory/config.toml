@@ -1,5 +1,6 @@
-# auto-software-factory configuration (committed). Unknown sections are ignored.
-# Dogfooding: asf builds asf. Local merges; workers on sonnet with a 5 USD cap per issue.
+# Klobuk configuration (committed). Unknown sections are ignored.
+# Dogfooding: Klobuk builds Klobuk. Local merges; workers on sonnet with a 10 USD cap per issue.
+# The issue prefix stays `asf` in this repository: the ids are part of its history.
 
 [repo]
 prefix = "asf"
@@ -8,7 +9,7 @@ worktrees_dir = ".worktrees"
 
 [scheduler]
 max_parallel = 2
-hotspots = ["Cargo.toml", "Cargo.lock", "crates/asf-core/src/ports.rs"]
+hotspots = ["Cargo.toml", "Cargo.lock", "crates/klobuk-core/src/ports.rs"]
 
 [store]
 auto_export = true
@@ -18,7 +19,7 @@ export_comments = true
 language = "en"
 
 [methodology]
-name = "asf-default"
+name = "klobuk-default"
 
 [worker]
 runtime = "herdr"
@@ -30,7 +31,7 @@ max_tool_calls = 400
 start_timeout_ms = 180000  # Herdr reports the Claude pane idle later than 90 s on this machine (asf-8/12/20/21)
 # Workers: no gh (merges and GitHub are the orchestrator's job), no cat/dir (Read/Glob cover it),
 # cargo limited to build/check/fmt/clippy/test, rtk only for the ls rewrite the user's hook applies.
-allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)", "Bash(asf *)", "Bash(cargo build *)", "Bash(cargo check *)", "Bash(cargo fmt *)", "Bash(cargo clippy *)", "Bash(cargo test *)", "Bash(ls *)", "Bash(rtk ls *)"]
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)", "Bash(klobuk *)", "Bash(cargo build *)", "Bash(cargo check *)", "Bash(cargo fmt *)", "Bash(cargo clippy *)", "Bash(cargo test *)", "Bash(ls *)", "Bash(rtk ls *)"]
 deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)", "Bash(git push *)", "Bash(git remote *)", "Bash(rtk proxy *)", "Bash(cargo install *)", "Bash(cargo run *)", "Bash(* .env*)", "Bash(*secrets*)"]
 permission_mode = "auto"  # no permission prompts: the classifier decides, deny rules still win
 auto_trust = true
