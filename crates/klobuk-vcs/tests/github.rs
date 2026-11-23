@@ -21,19 +21,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 fn commit_file(dir: &Path, name: &str, content: &str, msg: &str) {
     std::fs::write(dir.join(name), content).unwrap();
     git(dir, &["add", name]);
-    git(
-        dir,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@x",
-            "commit",
-            "-q",
-            "-m",
-            msg,
-        ],
-    );
+    git(dir, &["commit", "-q", "-m", msg]);
 }
 
 /// `origin` (bare) + a clone on `main` with one commit pushed.
@@ -43,6 +31,9 @@ fn repo_with_remote() -> (TempDir, PathBuf, PathBuf) {
     git(tmp.path(), &["init", "-q", "--bare", "-b", "main", "origin.git"]);
     let root = tmp.path().join("work");
     git(tmp.path(), &["init", "-q", "-b", "main", "work"]);
+    // identity lives in the repo, so no commit or amend in a test depends on the machine's git config
+    git(&root, &["config", "user.email", "t@x"]);
+    git(&root, &["config", "user.name", "t"]);
     git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
     commit_file(&root, "README.md", "# hi\n", "init");
     git(&root, &["push", "-q", "-u", "origin", "main"]);
