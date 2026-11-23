@@ -7,13 +7,16 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/numikel/klobuk"
+homepage = "https://github.com/numikel/klobuk"
+keywords = ["claude-code", "ai-agents", "git-worktree", "automation", "orchestration"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-klobuk-core = { path = "crates/klobuk-core" }
-klobuk-store = { path = "crates/klobuk-store" }
-klobuk-vcs = { path = "crates/klobuk-vcs" }
-klobuk-runtime = { path = "crates/klobuk-runtime" }
+# Release bump: change `version` here and in [workspace.package]; crates inherit both.
+klobuk-core = { version = "0.1.0", path = "crates/klobuk-core" }
+klobuk-store = { version = "0.1.0", path = "crates/klobuk-store" }
+klobuk-vcs = { version = "0.1.0", path = "crates/klobuk-vcs" }
+klobuk-runtime = { version = "0.1.0", path = "crates/klobuk-runtime" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

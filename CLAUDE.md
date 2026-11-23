@@ -17,8 +17,8 @@ from memory. Herdr facts verified for 0.9.5 / protocol 22 are in project memory 
 
 ## Crates
 - `klobuk-core` — domain types, ports (`IssueStore`, later `AgentRuntime`, `Vcs`), scheduler, lane resolution, config, JSONL records. **No IO.**
-- `klobuk-store` — rusqlite adapter (`schema.sql`, WAL, `busy_timeout` 10 s, IMMEDIATE transactions for writes).
-- `klobuk` — binary: clap CLI with `--json` everywhere; exit codes 0 ok / 1 error / 2 usage / 3 conflict.
+- `klobuk-store` — rusqlite adapter (`schema.sql`, WAL, `busy_timeout` 10 s, IMMEDIATE transactions for writes). `tests/schema_states.rs` pins `RunState::ALL`/`MergeState::ALL` to the schema `CHECK` lists.
+- `klobuk` — binary: clap CLI with `--json` everywhere; exit codes 0 ok / 1 error / 2 usage / 3 conflict. Shipped methodologies live in `crates/klobuk/methodologies/` (embedded with `include_str!`).
 
 ## Gates (run all before claiming green; CI runs the same)
 ```

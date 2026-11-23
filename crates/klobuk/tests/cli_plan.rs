@@ -229,7 +229,7 @@ fn plan_new_dry_run_saves_artifacts_but_creates_no_issues_and_reports_llm_errors
 /// Copies the shipped `klobuk-default` methodology into `.factory/methodologies/<name>/`, replaces its
 /// first prompt with `prd_prompt` and makes it the active methodology.
 fn local_methodology(repo: &Repo, name: &str, prd_prompt: &str) {
-    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../methodologies/klobuk-default");
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("methodologies/klobuk-default");
     let dir = repo.path().join(".factory/methodologies").join(name);
     for rel in [
         "manifest.toml",
@@ -283,7 +283,7 @@ fn plan_new_sends_the_prompts_of_the_active_local_methodology() {
     assert_eq!(calls[0]["schema_name"], "prd");
     let shipped_issues = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../methodologies/klobuk-default/prompts/prd-to-issues.md"),
+            .join("methodologies/klobuk-default/prompts/prd-to-issues.md"),
     )
     .unwrap();
     assert_eq!(
@@ -296,7 +296,7 @@ fn plan_new_sends_the_prompts_of_the_active_local_methodology() {
 fn shipped_prompt(name: &str) -> String {
     std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../methodologies/klobuk-default/prompts")
+            .join("methodologies/klobuk-default/prompts")
             .join(name),
     )
     .unwrap()

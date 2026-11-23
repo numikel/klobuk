@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
 rust-version.workspace = true
-description = "Klobuk, the autonomous software factory: CLI"
+description = "Klobuk, an autonomous software factory: plans work into issues, runs Claude Code workers in git worktrees, verifies and merges"
 
 [[bin]]
 name = "klobuk"

@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["development-tools"]
+readme = "README.md"
 rust-version.workspace = true
-description = "AgentRuntime adapters: Herdr CLI and a file-backed fake"
+description = "Klobuk agent runtime adapters: the Herdr CLI and a file-backed fake for tests"
 
 [lints]
 workspace = true

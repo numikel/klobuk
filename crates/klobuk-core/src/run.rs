@@ -152,25 +152,8 @@ pub struct MergePatch {
 mod tests {
     use super::*;
 
-    const SCHEMA: &str = include_str!("../../klobuk-store/src/schema.sql");
-
-    /// Values of the `CHECK (col IN (...))` list that follows the first occurrence of `marker`.
-    fn check_list(marker: &str) -> Vec<String> {
-        let idx = SCHEMA.find(marker).expect("marker in schema");
-        let rest = &SCHEMA[idx..];
-        let start = rest.find("IN (").expect("CHECK IN") + 4;
-        let end = rest[start..].find(')').unwrap() + start;
-        rest[start..end]
-            .split(',')
-            .map(|s| s.trim().trim_matches('\'').to_string())
-            .collect()
-    }
-
     #[test]
-    fn run_state_strings_match_schema() {
-        let schema = check_list("CREATE TABLE runs");
-        let ours: Vec<String> = RunState::ALL.iter().map(|s| s.to_string()).collect();
-        assert_eq!(ours, schema);
+    fn run_state_strings_round_trip() {
         assert_eq!("over_budget".parse::<RunState>().unwrap(), RunState::OverBudget);
         assert_eq!(
             serde_json::to_string(&RunState::OverBudget).unwrap(),
@@ -182,10 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_state_strings_match_schema() {
-        let schema = check_list("CREATE TABLE merge_queue");
-        let ours: Vec<String> = MergeState::ALL.iter().map(|s| s.to_string()).collect();
-        assert_eq!(ours, schema);
+    fn merge_state_strings_round_trip() {
         assert_eq!(serde_json::to_string(&MergeState::PrOpen).unwrap(), "\"pr_open\"");
         assert!(MergeState::Merged.is_terminal());
         assert!(MergeState::Skipped.is_terminal());

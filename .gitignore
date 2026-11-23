@@ -10,7 +10,7 @@
 *.md
 !CLAUDE.md
 !README.md
-!methodologies/**/*.md
+!crates/klobuk/methodologies/**/*.md
 !crates/**/README.md.keep
 
 # --- Factory runtime state (per repo, local only) ---

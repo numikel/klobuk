@@ -25,34 +25,34 @@ type Builtin = (
 const BUILTIN: &[Builtin] = &[
     (
         "klobuk-default",
-        include_str!("../../../../methodologies/klobuk-default/manifest.toml"),
+        include_str!("../../methodologies/klobuk-default/manifest.toml"),
         &[
             (
                 "prompts/idea-to-prd.md",
-                include_str!("../../../../methodologies/klobuk-default/prompts/idea-to-prd.md"),
+                include_str!("../../methodologies/klobuk-default/prompts/idea-to-prd.md"),
             ),
             (
                 "prompts/prd-to-issues.md",
-                include_str!("../../../../methodologies/klobuk-default/prompts/prd-to-issues.md"),
+                include_str!("../../methodologies/klobuk-default/prompts/prd-to-issues.md"),
             ),
             (
                 "schemas/prd.json",
-                include_str!("../../../../methodologies/klobuk-default/schemas/prd.json"),
+                include_str!("../../methodologies/klobuk-default/schemas/prd.json"),
             ),
             (
                 "schemas/issues.json",
-                include_str!("../../../../methodologies/klobuk-default/schemas/issues.json"),
+                include_str!("../../methodologies/klobuk-default/schemas/issues.json"),
             ),
         ],
     ),
     (
         "spec-kit",
-        include_str!("../../../../methodologies/spec-kit/manifest.toml"),
+        include_str!("../../methodologies/spec-kit/manifest.toml"),
         &[],
     ),
     (
         "superpowers",
-        include_str!("../../../../methodologies/superpowers/manifest.toml"),
+        include_str!("../../methodologies/superpowers/manifest.toml"),
         &[],
     ),
 ];

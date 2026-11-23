@@ -6,7 +6,7 @@ use common::Repo;
 
 fn shipped(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../methodologies")
+        .join("methodologies")
         .join(name)
 }
 
