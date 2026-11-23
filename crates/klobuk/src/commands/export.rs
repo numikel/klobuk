@@ -148,6 +148,30 @@ fn install(tmp: &Path, path: &Path, rename: &dyn Fn(&Path, &Path) -> io::Result<
     }
 }
 
+/// How many temp names are tried before giving up on leftovers.
+const TMP_TRIES: u32 = 32;
+
+/// Creates a new temp file under the next name `next_name` gives. A name that is already taken is
+/// skipped: no live process owns a file with this process's pid and a counter it has not handed out
+/// yet, so it is a leftover of a run that died (and had the same pid, which is recycled). A symlink
+/// under a candidate name is refused, never written through. Errors name the file.
+fn open_new_tmp(next_name: &mut dyn FnMut() -> PathBuf) -> Result<(fs::File, PathBuf), AppError> {
+    let mut last = PathBuf::new();
+    for _ in 0..TMP_TRIES {
+        let tmp = next_name();
+        refuse_symlink(&tmp)?;
+        match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((f, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = tmp,
+            Err(e) => return Err(AppError::io(format!("{}: {e}", tmp.display()))),
+        }
+    }
+    Err(AppError::io(format!(
+        "{}: temp file already exists; no free name after {TMP_TRIES} tries, remove the leftover *.tmp files next to the destination",
+        last.display()
+    )))
+}
+
 /// Writes the export atomically (own temp file + rename) and returns the number of records.
 /// Every call writes to a temp file of its own, so parallel exports never share one; whichever
 /// rename finishes last wins, and each wrote a complete snapshot, so any winner is a valid file.
@@ -166,10 +190,7 @@ pub fn write_export(ctx: &Ctx, path: &Path) -> Result<usize, AppError> {
     }
     refuse_symlink(path)?;
     sweep_leftovers(path, SystemTime::now());
-    let tmp = sibling_of(path, "tmp");
-    refuse_symlink(&tmp)?;
-    // `create_new` also refuses a file or symlink planted under the name
-    let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let (mut f, tmp) = open_new_tmp(&mut || sibling_of(path, "tmp"))?;
     let wrote = f.write_all(&buf).and_then(|()| f.sync_all());
     drop(f);
     let installed = match wrote {
@@ -226,7 +247,7 @@ pub fn import(cli: &Cli, a: &ImportArgs) -> Result<Rendered, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{install, is_numbered_tmp, sibling_of, sweep_leftovers, STALE_TMP_AFTER};
+    use super::{install, is_numbered_tmp, open_new_tmp, sibling_of, sweep_leftovers, STALE_TMP_AFTER};
     use std::cell::Cell;
     use std::io;
     use std::path::Path;
@@ -253,6 +274,65 @@ mod tests {
             sibling_of(Path::new("out.jsonl"), "old").parent(),
             Some(Path::new(""))
         );
+    }
+
+    /// A run killed between creating and renaming its temp file leaves `<file>.<pid>.0.tmp`; a later
+    /// process that gets the same pid must step over it, not fail after its store write.
+    #[test]
+    fn a_young_leftover_under_the_next_name_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let leftover = dir.path().join("issues.jsonl.7.0.tmp");
+        std::fs::write(&leftover, "crashed").unwrap();
+        let fresh = dir.path().join("issues.jsonl.7.1.tmp");
+        let mut names = vec![leftover.clone(), fresh.clone()].into_iter();
+        let (file, tmp) = open_new_tmp(&mut || names.next().unwrap()).unwrap();
+        drop(file);
+        assert_eq!(tmp, fresh);
+        assert_eq!(
+            std::fs::read_to_string(&leftover).unwrap(),
+            "crashed",
+            "the leftover is not touched"
+        );
+    }
+
+    #[test]
+    fn leftovers_under_every_name_end_in_an_error_that_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let leftover = dir.path().join("issues.jsonl.7.0.tmp");
+        std::fs::write(&leftover, "crashed").unwrap();
+        let tries = std::cell::Cell::new(0);
+        let err = open_new_tmp(&mut || {
+            tries.set(tries.get() + 1);
+            leftover.clone()
+        })
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            tries.get() > 1 && tries.get() < 100,
+            "bounded retries, got {}",
+            tries.get()
+        );
+        assert!(err.contains("issues.jsonl.7.0.tmp"), "{err}");
+    }
+
+    #[test]
+    fn a_symlink_under_a_candidate_name_is_refused_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        let link = dir.path().join("issues.jsonl.7.0.tmp");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&victim, &link).is_ok();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&victim, &link).is_ok();
+        if !made {
+            eprintln!("skipping: cannot create symlinks on this machine");
+            return;
+        }
+        let err = open_new_tmp(&mut || link.clone()).map(|_| ()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
     }
 
     #[test]
