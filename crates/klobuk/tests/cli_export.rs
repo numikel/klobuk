@@ -208,6 +208,40 @@ fn parallel_comments_no_lock_errors() {
     );
 }
 
+/// Exports that run at the same time each write a temp file of their own: all succeed, the file
+/// they leave is one complete snapshot and no temp file stays behind.
+#[test]
+fn parallel_exports_all_succeed_and_leave_one_complete_file() {
+    let r = Repo::initialised();
+    seed(&r);
+    let root = r.path().to_path_buf();
+    let results = parallel(8, move |_| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_klobuk"));
+        c.env_remove("KLOBUK_RUN")
+            .env_remove("KLOBUK_ISSUE")
+            .env_remove("KLOBUK_LANE");
+        c.current_dir(&root).args(["export", "--json"]);
+        c
+    });
+    let failures: Vec<_> = results.iter().filter(|(code, _)| *code != 0).collect();
+    assert!(failures.is_empty(), "{failures:?}");
+    let factory = r.path().join(".factory");
+    let text = std::fs::read_to_string(factory.join("issues.jsonl")).unwrap();
+    assert!(text.ends_with('\n'), "complete file, no cut-off last line");
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+        .collect();
+    assert_eq!(records.len(), 5, "meta + 2 issues + 1 dep + 1 comment");
+    let leftovers: Vec<_> = std::fs::read_dir(&factory)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("issues.jsonl.") || n.ends_with(".tmp") || n.ends_with(".old"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 #[test]
 fn parallel_claims_exactly_one_winner() {
     let r = Repo::initialised();

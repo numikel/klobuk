@@ -61,6 +61,12 @@ klobuk repo doctor                # git, config, database, herdr, claude, github
 and `.git/info/exclude`; `repo doctor` warns when any of them is missing. `.factory/config.toml`
 and `.factory/issues.jsonl` are meant to be committed.
 
+### Platforms
+
+Windows is the system Klobuk is developed and used on every day. On Linux the test suite passes,
+but no live factory run (Herdr plus Claude Code workers) has been done there yet. macOS is
+untested. Reports from Linux and macOS users are welcome.
+
 ## The loop, step by step
 
 Every command accepts `--repo <path>` (default: the current directory, any path inside the
@@ -506,6 +512,11 @@ cargo test --workspace
 
 CI runs the same three commands on Windows and Linux. New behaviour comes with a failing test
 first; integration tests use a fake runtime and a fake GitHub so they run without Herdr or `gh`.
+
+The tests fake gates and workers with `python -c …` and `python <script>`, so `cargo test` needs a
+`python` command (3.x) on `PATH`; without it every such test fails with "cannot start `python …`".
+PowerShell (`powershell` on Windows, `pwsh` elsewhere) is optional: the one test that runs a gate
+through it prints "skipping" when the program is missing.
 
 ## License
 

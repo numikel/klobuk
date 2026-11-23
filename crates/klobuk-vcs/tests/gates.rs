@@ -162,8 +162,22 @@ fn tail_keeps_last_lines_only_and_runs_in_cwd() {
     assert!(!results[0].tail.contains("\n0\n"), "early lines dropped");
 }
 
+/// Needs PowerShell on the machine (`powershell` on Windows, `pwsh` elsewhere); the program choice
+/// itself is pinned without it by the unit tests of `build_for`.
 #[test]
 fn shell_pwsh_runs_through_powershell() {
+    let program = if cfg!(windows) { "powershell" } else { "pwsh" };
+    let present = std::process::Command::new(program)
+        .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if !present {
+        eprintln!("skipping: `{program}` is not installed on this machine");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let s = GateSpec {
         name: "ps".into(),

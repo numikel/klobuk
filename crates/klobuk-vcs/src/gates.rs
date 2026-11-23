@@ -60,24 +60,57 @@ fn tail(s: &str) -> String {
     lines[start..].join("\n")
 }
 
-fn build(spec: &GateSpec) -> Option<Command> {
-    match spec.shell.as_deref() {
-        Some("pwsh") | Some("powershell") => {
-            let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-Command", &spec.cmd.join(" ")]);
+/// The program a `shell = "..."` setting runs the gate command through, `None` for no shell (the
+/// command then starts directly). Windows PowerShell is `powershell`; PowerShell 7, the only one on
+/// Linux and macOS, is `pwsh`.
+fn shell_program(shell: &str, windows: bool) -> Option<&'static str> {
+    match shell {
+        "pwsh" | "powershell" => Some(if windows { "powershell" } else { "pwsh" }),
+        "sh" | "bash" => Some("sh"),
+        _ => None,
+    }
+}
+
+/// The command that runs `spec` on Windows (`windows`) or elsewhere; [`build`] picks the real one.
+fn build_for(spec: &GateSpec, windows: bool) -> Option<Command> {
+    let line = spec.cmd.join(" ");
+    match spec
+        .shell
+        .as_deref()
+        .and_then(|s| shell_program(s, windows).map(|p| (s, p)))
+    {
+        Some(("pwsh" | "powershell", program)) => {
+            let mut c = Command::new(program);
+            c.args(["-NoProfile", "-NonInteractive", "-Command", &line]);
             Some(c)
         }
-        Some("sh") | Some("bash") => {
-            let mut c = Command::new("sh");
-            c.args(["-c", &spec.cmd.join(" ")]);
+        Some((_, program)) => {
+            let mut c = Command::new(program);
+            c.args(["-c", &line]);
             Some(c)
         }
-        _ => {
+        None => {
             let (prog, rest) = spec.cmd.split_first()?;
             let mut c = Command::new(prog);
             c.args(rest);
             Some(c)
         }
+    }
+}
+
+fn build(spec: &GateSpec) -> Option<Command> {
+    build_for(spec, cfg!(windows))
+}
+
+/// Why `program` could not be started for `spec`. A gate that asked for a shell names the shell
+/// program (the gate command is not what is missing) and the setting that asked for it.
+fn start_error(spec: &GateSpec, program: &str, e: &std::io::Error) -> String {
+    match spec.shell.as_deref().filter(|s| shell_program(s, cfg!(windows)).is_some()) {
+        Some(shell) => format!(
+            "cannot start `{program}`: {e}; gate `{}` asked for it through `shell = \"{shell}\"`, is it installed and on PATH?",
+            spec.name
+        ),
+        None => format!("cannot start `{}`: {e}", spec.cmd.join(" ")),
     }
 }
 
@@ -267,6 +300,7 @@ pub fn run_gate_watched(spec: &GateSpec, cwd: &Path, watch: &mut dyn FnMut(GateE
     let Some(mut cmd) = build(spec) else {
         return fail("gate has an empty cmd".into());
     };
+    let program = cmd.get_program().to_string_lossy().into_owned();
     cmd.current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -276,7 +310,7 @@ pub fn run_gate_watched(spec: &GateSpec, cwd: &Path, watch: &mut dyn FnMut(GateE
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return fail(format!("cannot start `{}`: {e}", spec.cmd.join(" "))),
+        Err(e) => return fail(start_error(spec, &program, &e)),
     };
     let t_out = Drain::start(child.stdout.take().expect("piped"));
     let t_err = Drain::start(child.stderr.take().expect("piped"));
@@ -856,8 +890,91 @@ pub fn foreign_tests(repo: &Path, tail: &str, changed: &[String]) -> Option<Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{locked_files, slow_test_line, SlowTests, SLOW_MAX_LISTED};
+    use super::{build_for, locked_files, slow_test_line, start_error, SlowTests, SLOW_MAX_LISTED};
+    use klobuk_core::GateSpec;
     use std::path::PathBuf;
+
+    fn shell_spec(shell: Option<&str>, cmd: &[&str]) -> GateSpec {
+        GateSpec {
+            name: "ps".into(),
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            timeout_s: 30,
+            shell: shell.map(str::to_owned),
+            slow_tests: None,
+            slow_after_s: None,
+        }
+    }
+
+    /// The program and arguments `build_for` produces, without starting anything.
+    fn program_and_args(spec: &GateSpec, windows: bool) -> (String, Vec<String>) {
+        let c = build_for(spec, windows).expect("a command");
+        (
+            c.get_program().to_string_lossy().into_owned(),
+            c.get_args().map(|a| a.to_string_lossy().into_owned()).collect(),
+        )
+    }
+
+    #[test]
+    fn pwsh_and_powershell_start_powershell_on_windows_and_pwsh_elsewhere() {
+        for shell in ["pwsh", "powershell"] {
+            let spec = shell_spec(Some(shell), &["Write-Output", "hi"]);
+            let args = ["-NoProfile", "-NonInteractive", "-Command", "Write-Output hi"];
+            assert_eq!(
+                program_and_args(&spec, true),
+                ("powershell".into(), args.map(String::from).to_vec()),
+                "{shell} on Windows"
+            );
+            assert_eq!(
+                program_and_args(&spec, false),
+                ("pwsh".into(), args.map(String::from).to_vec()),
+                "{shell} elsewhere"
+            );
+        }
+    }
+
+    #[test]
+    fn other_shells_and_plain_commands_do_not_depend_on_the_platform() {
+        for windows in [true, false] {
+            let sh = shell_spec(Some("bash"), &["echo", "hi"]);
+            assert_eq!(
+                program_and_args(&sh, windows),
+                ("sh".into(), vec!["-c".into(), "echo hi".into()])
+            );
+            let plain = shell_spec(None, &["cargo", "test", "-q"]);
+            assert_eq!(
+                program_and_args(&plain, windows),
+                ("cargo".into(), vec!["test".into(), "-q".into()])
+            );
+            let unknown = shell_spec(Some("zsh"), &["cargo", "fmt"]);
+            assert_eq!(
+                program_and_args(&unknown, windows),
+                ("cargo".into(), vec!["fmt".into()])
+            );
+        }
+        assert!(
+            build_for(&shell_spec(None, &[]), true).is_none(),
+            "empty cmd has nothing to start"
+        );
+    }
+
+    #[test]
+    fn a_missing_shell_program_is_named_with_the_setting_that_asked_for_it() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = start_error(&shell_spec(Some("pwsh"), &["Write-Output", "hi"]), "pwsh", &e);
+        assert!(msg.starts_with("cannot start `pwsh`: "), "{msg}");
+        assert!(
+            msg.contains("gate `ps` asked for it through `shell = \"pwsh\"`"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Write-Output"),
+            "the gate command is not what is missing: {msg}"
+        );
+        // without a shell the message names the gate command, as before
+        let msg = start_error(&shell_spec(None, &["python", "-c", "1"]), "python", &e);
+        assert!(msg.starts_with("cannot start `python -c 1`: "), "{msg}");
+        assert!(!msg.contains("shell ="), "{msg}");
+    }
 
     #[test]
     fn reads_the_name_and_seconds_of_a_libtest_hang_warning() {
