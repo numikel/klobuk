@@ -24,10 +24,7 @@ fn export_default_path_and_determinism() {
     seed(&r);
     let res = r.ok(&["export"]);
     let path = r.path().join(".factory/issues.jsonl");
-    assert_eq!(
-        res["path"].as_str().unwrap().replace('\\', "/"),
-        path.to_string_lossy().replace('\\', "/")
-    );
+    common::assert_same_path(res["path"].as_str().unwrap(), &path);
     assert_eq!(res["records"], 5, "meta + 2 issues + 1 dep + 1 comment");
     let first = std::fs::read_to_string(&path).unwrap();
     r.ok(&["export"]);

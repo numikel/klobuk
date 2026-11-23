@@ -111,6 +111,20 @@ impl Repo {
     }
 }
 
+/// Asserts that a path printed by `klobuk` and a path built from the temp directory name the same
+/// existing file or directory. It compares what both resolve to, not their spelling: `TEMP` can hold
+/// the 8.3 short form (`RUNNER~1`) while git, and so `klobuk`, reports the long form.
+pub fn assert_same_path(printed: &str, expected: &Path) {
+    let resolve =
+        |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|e| panic!("cannot resolve {}: {e}", p.display()));
+    assert_eq!(
+        resolve(Path::new(printed)),
+        resolve(expected),
+        "printed {printed:?} is not {}",
+        expected.display()
+    );
+}
+
 pub fn git(cwd: &Path, args: &[&str]) {
     let st = Command::new("git").args(args).current_dir(cwd).status().unwrap();
     assert!(st.success(), "git {args:?} failed");
