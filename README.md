@@ -39,7 +39,14 @@ You need:
   are Herdr workspaces, so you can watch and talk to them.
 - Optional: the [GitHub CLI](https://cli.github.com) (`gh`) when you merge through pull requests.
 
-Install from a clone of this repository:
+Install from crates.io:
+
+```bash
+cargo install klobuk
+klobuk --version
+```
+
+Or install the development version from a clone of this repository:
 
 ```bash
 git clone https://github.com/numikel/klobuk
@@ -495,7 +502,7 @@ Global options: `--repo <path>`, `--lane <id|orchestrator|human>`, `--json`, `-q
 | Merge `blocked` with `rebase … conflicts in:` | Resolve in the worktree, then `klobuk merge retry <id>` |
 | Verification `failed` on a test that is flaky | `klobuk run verify <id>` reruns it; `klobuk merge enqueue <id> --force` is the last resort |
 | Worker hit a Claude usage limit mid-task | It leaves a BLOCKER; when the limit resets, `klobuk run reply <id> "continue"` |
-| `cargo install` fails with "Access is denied" on Windows | A running worker's status line is using `klobuk.exe`; stop the workers or build with `cargo build --release -p klobuk` and copy the binary |
+| `cargo install` fails with "Access is denied" on Windows | A running worker's status line is using `klobuk.exe`; stop the workers, or in a clone build with `cargo build --release -p klobuk` and copy the binary |
 
 ## Development
 
