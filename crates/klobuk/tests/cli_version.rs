@@ -37,12 +37,14 @@ fn short_flag_matches_long_flag() {
 
 #[test]
 fn shape_check_rejects_malformed_lines() {
-    for bad in [
-        "klobuk 0.0.0 (abc1234)\n",
-        "klobuk (abc1234)\n",
-        "klobuk 0.1.0 (abc12)\n",
-        "klobuk 0.1.0 (zzzzzzz)\n",
-    ] {
+    // The last two carry the real version, so only the sha part can make them fail.
+    let bad_lines = [
+        "klobuk 0.0.0 (abc1234)\n".to_string(),
+        "klobuk (abc1234)\n".to_string(),
+        concat!("klobuk ", env!("CARGO_PKG_VERSION"), " (abc12)\n").to_string(),
+        concat!("klobuk ", env!("CARGO_PKG_VERSION"), " (zzzzzzz)\n").to_string(),
+    ];
+    for bad in &bad_lines {
         assert!(
             std::panic::catch_unwind(|| assert_shape(bad)).is_err(),
             "{bad:?} passed"

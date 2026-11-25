@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/klobuk-core", "crates/klobuk-store", "crates/klobuk-vcs", "crates/klobuk-runtime", "crates/klobuk"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/numikel/klobuk"
@@ -13,10 +13,10 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Release bump: change `version` here and in [workspace.package]; crates inherit both.
-klobuk-core = { version = "0.1.0", path = "crates/klobuk-core" }
-klobuk-store = { version = "0.1.0", path = "crates/klobuk-store" }
-klobuk-vcs = { version = "0.1.0", path = "crates/klobuk-vcs" }
-klobuk-runtime = { version = "0.1.0", path = "crates/klobuk-runtime" }
+klobuk-core = { version = "0.1.1", path = "crates/klobuk-core" }
+klobuk-store = { version = "0.1.1", path = "crates/klobuk-store" }
+klobuk-vcs = { version = "0.1.1", path = "crates/klobuk-vcs" }
+klobuk-runtime = { version = "0.1.1", path = "crates/klobuk-runtime" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
