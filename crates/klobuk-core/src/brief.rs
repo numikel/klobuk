@@ -414,7 +414,7 @@ pub fn render_settings(s: &SettingsInput<'_>) -> Value {
                 { "matcher": "Edit|Write|MultiEdit", "hooks": [hook(format!("{bin} hook pre-tool"), s.hook_timeout_s)] }
             ],
             "PostToolUse": [
-                { "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [hook(format!("{bin} hook post-tool"), s.hook_timeout_s)] }
+                { "matcher": "*", "hooks": [hook(format!("{bin} hook post-tool"), s.hook_timeout_s)] }
             ],
             "Stop": [
                 { "hooks": [hook(format!("{bin} hook stop"), s.hook_timeout_s)] }
@@ -630,10 +630,8 @@ mod tests {
         assert_eq!(pre["hooks"][0]["type"], "command");
         assert_eq!(pre["hooks"][0]["command"], "D:/bin/klobuk.exe hook pre-tool");
         assert_eq!(pre["hooks"][0]["timeout"], 30);
-        assert_eq!(
-            v["hooks"]["PostToolUse"][0]["matcher"],
-            "Edit|Write|MultiEdit|Bash"
-        );
+        // counting sees every tool (docs: `"*"` matches all); enforcement above keeps its edit-only matcher
+        assert_eq!(v["hooks"]["PostToolUse"][0]["matcher"], "*");
         assert_eq!(
             v["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             "D:/bin/klobuk.exe hook post-tool"

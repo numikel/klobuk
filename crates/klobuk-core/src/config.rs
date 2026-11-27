@@ -134,7 +134,7 @@ impl Default for WorkerCfg {
             budget_usd: 5.0,
             stall_minutes: 15,
             max_wall_minutes: 90,
-            max_tool_calls: 400,
+            max_tool_calls: 1000,
             allowed_tools: ["Read", "Edit", "Glob", "Grep", "Bash(git *)", "Bash(klobuk *)"]
                 .iter()
                 .map(|s| s.to_string())
@@ -446,7 +446,7 @@ budget_usd = 5.0          # per issue; cost as reported by Claude Code for each 
 stall_minutes = 15
 api_retries = 5           # an agent whose turn ends on an API or network error (ENOTFOUND, 5xx, timeout) gets the turn sent again after 1, 2, 4, ... min; after this many sends the run is stalled with a BLOCKER (a send uses no attempt and no review round)
 max_wall_minutes = 90
-max_tool_calls = 400
+max_tool_calls = 1000
 allowed_tools = ["Read", "Edit", "Glob", "Grep", "Bash(git *)", "Bash(klobuk *)"]
 deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)"]
 permission_mode = "auto"  # auto | acceptEdits | dontAsk | bypassPermissions (deny rules always win)
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(c.worker.budget_usd, 5.0);
         assert_eq!(c.worker.stall_minutes, 15);
         assert_eq!(c.worker.max_wall_minutes, 90);
-        assert_eq!(c.worker.max_tool_calls, 400);
+        assert_eq!(c.worker.max_tool_calls, 1000);
         assert!(c.worker.allowed_tools.iter().any(|t| t == "Edit"));
         assert!(c.worker.allowed_tools.iter().any(|t| t == "Bash(klobuk *)"));
         assert!(c.worker.deny.iter().any(|t| t == "Read(./.env)"));

@@ -1984,10 +1984,10 @@ fn raising_the_budget_of_a_cap_tripped_run_keeps_it_over_budget_and_adds_no_seco
     let cfg = f.repo.path().join(".factory/config.toml");
     let s = std::fs::read_to_string(&cfg).unwrap();
     assert!(
-        s.contains("max_tool_calls = 400"),
+        s.contains("max_tool_calls = 1000"),
         "config template lacks the cap"
     );
-    std::fs::write(&cfg, s.replace("max_tool_calls = 400", "max_tool_calls = 2")).unwrap();
+    std::fs::write(&cfg, s.replace("max_tool_calls = 1000", "max_tool_calls = 2")).unwrap();
     f.repo.ok(&["run", "start", &f.issue]);
     let post_tool = serde_json::json!({
         "session_id": "s", "transcript_path": "C:/x.jsonl", "hook_event_name": "PostToolUse",

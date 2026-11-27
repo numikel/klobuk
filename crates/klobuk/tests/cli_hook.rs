@@ -225,7 +225,7 @@ fn pre_tool_resolves_run_from_issue_env_and_is_noop_without_context() {
 
 #[test]
 fn post_tool_counts_calls_records_session_and_trips_max_tool_calls() {
-    let f = fixture(Some(("max_tool_calls = 400", "max_tool_calls = 2")));
+    let f = fixture(Some(("max_tool_calls = 1000", "max_tool_calls = 2")));
     let env = [("KLOBUK_RUN", f.run_id.as_str())];
     let payload = serde_json::json!({
         "session_id": "sess-9", "transcript_path": "C:/t/sess-9.jsonl", "hook_event_name": "PostToolUse",
@@ -256,6 +256,33 @@ fn post_tool_counts_calls_records_session_and_trips_max_tool_calls() {
             .any(|c| c.kind == CommentType::Blocker && c.to_lane == "human"),
         "{blockers:?}"
     );
+}
+
+#[test]
+fn post_tool_counts_every_tool_name_not_only_the_edit_tools() {
+    let f = fixture(None);
+    let env = [("KLOBUK_RUN", f.run_id.as_str())];
+    let tools = [
+        "Read",
+        "Grep",
+        "Glob",
+        "PowerShell",
+        "WebFetch",
+        "Agent",
+        "mcp__plugin_context7_context7__query-docs",
+        "Edit",
+        "Bash",
+    ];
+    for (i, tool) in tools.iter().enumerate() {
+        let payload = serde_json::json!({
+            "session_id": "sess-1", "transcript_path": "C:/t/sess-1.jsonl", "hook_event_name": "PostToolUse",
+            "tool_name": tool, "tool_input": {}, "tool_response": {}, "tool_use_id": format!("t{i}"), "duration_ms": 1
+        });
+        let (code, out, _) = hook(&f.wt, "post-tool", &env, &payload);
+        assert_eq!((code, out.as_str()), (0, ""), "{tool}");
+        let run = store(&f).get_run(&f.run_id).unwrap().unwrap();
+        assert_eq!(run.tool_calls, i as i64 + 1, "after {tool}");
+    }
 }
 
 #[test]

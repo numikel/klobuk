@@ -319,7 +319,7 @@ For each issue the orchestrator:
 5. sends the kick-off prompt and polls the agent state.
 
 Hooks keep the worker inside its lane: `PreToolUse` denies edits outside `file_scope` or the
-worktree, `PostToolUse` counts tool calls, the status line feeds the cost estimate into the
+worktree, `PostToolUse` counts every tool call (reads and searches too), the status line feeds the cost estimate into the
 budget check, and `Stop` blocks the session once until `klobuk issue finish` ran. Inside a worker
 every orchestrator command (`run`, `merge`, `plan`, `gh`, `serve`, `export`, `import`,
 `issue claim/release/status`) is refused, whatever the allowlist says. Workers never see
@@ -384,7 +384,7 @@ runtime = "herdr"         # herdr | fake
 budget_usd = 5.0          # per issue; from statusLine cost estimate
 stall_minutes = 15
 max_wall_minutes = 90
-max_tool_calls = 400
+max_tool_calls = 1000
 allowed_tools = ["Read", "Edit", "Glob", "Grep", "Bash(git *)", "Bash(klobuk *)"]
 deny = ["Read(./.env)", "Read(./.env.*)", "Read(**/secrets/**)"]
 permission_mode = "auto"  # auto | acceptEdits | dontAsk | bypassPermissions (deny rules always win)
