@@ -10,6 +10,15 @@ gates you configure and merges it through a local fast-forward queue or GitHub p
 The language of the project you build does not matter: only the gates and the file scopes in the
 configuration are project-specific.
 
+![The Now view of the klobuk terminal UI: one question from a worker waiting for the human, two running workers with their cost against budget, and the issues that come next.](/assets/screenshots/now.svg)
+
+![The Board view as a kanban with a column per status (backlog, ready, in-progress, blocked, validating, done) and a banner above it that names the question waiting for an answer.](/assets/screenshots/board.svg)
+
+![The Queue view: one branch in the gates of the merge queue with every step of its attempt listed (rebase, the fmt, clippy and test gates, review, merge), and one branch merged today.](/assets/screenshots/queue.svg)
+
+The pictures are drawn by the TUI's own renderer from demo data (a made-up notes tool), not from a
+real project.
+
 ## Why Klobuk
 
 A *kłobuk* is a household spirit from the folklore of Warmia and Masuria, usually seen as a black
@@ -593,6 +602,17 @@ cargo test --workspace
 
 CI runs the same three commands on Windows and Linux. New behaviour comes with a failing test
 first; integration tests use a fake runtime and a fake GitHub so they run without Herdr or `gh`.
+
+The pictures at the top of this file are generated: the TUI's renderer draws them from a fixed demo
+snapshot into `assets/screenshots/*.svg`. When a view changes, and before a release, rewrite them and
+commit the result:
+
+```bash
+cargo test -p klobuk --bin klobuk regenerate_screenshots -- --ignored
+```
+
+The ordinary test run fails, naming this command, when the committed files differ from what the
+renderer draws now. The generator exists in test builds only, so it adds nothing to the binary.
 
 The tests fake gates and workers with `python -c …` and `python <script>`, so `cargo test` needs a
 `python` command (3.x) on `PATH`; without it every such test fails with "cannot start `python …`".
