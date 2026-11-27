@@ -7,7 +7,7 @@ version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/numikel/klobuk"
-homepage = "https://github.com/numikel/klobuk"
+homepage = "https://klobuk.michalsk.pl/"
 keywords = ["claude-code", "ai-agents", "git-worktree", "automation", "orchestration"]
 rust-version = "1.85"
 

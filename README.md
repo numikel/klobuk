@@ -19,6 +19,11 @@ configuration are project-specific.
 The pictures are drawn by the TUI's own renderer from demo data (a made-up notes tool), not from a
 real project.
 
+<a href="https://klobuk.michalsk.pl/media/klobuk_promo_en.mp4"><img src="https://klobuk.michalsk.pl/media/klobuk_promo_en.jpg" width="480" alt="Poster of the klobuk promo film; select it to watch the film with English subtitles."></a>
+
+Watch the promo film, under two minutes: [English subtitles](https://klobuk.michalsk.pl/media/klobuk_promo_en.mp4)
+([Polish](https://klobuk.michalsk.pl/media/klobuk_promo_pl.mp4)). Project site: [klobuk.michalsk.pl](https://klobuk.michalsk.pl/).
+
 ## Why Klobuk
 
 A *kłobuk* is a household spirit from the folklore of Warmia and Masuria, usually seen as a black
