@@ -443,3 +443,24 @@ fn redacted_exports_are_deterministic_and_do_not_bring_paths_back_on_import() {
         "the original paths are gone for good"
     );
 }
+
+/// `plan import <file>` stores the plan's absolute path as the issue source; it is a home path too.
+#[test]
+fn export_redacts_the_source_of_an_imported_plan() {
+    let r = Repo::initialised();
+    let home_dir = tempfile::Builder::new().prefix("klobuk-home-").tempdir().unwrap();
+    let home = home_dir.path().join("alice");
+    std::fs::create_dir_all(&home).unwrap();
+    let plan = home.join("plan.md");
+    std::fs::write(&plan, "# Plan\n\n### Task 1: Do it\n\n- [ ] done\n").unwrap();
+    let (v, code) = json_as(&r, &home, &["plan", "import", plan.to_str().unwrap()]);
+    assert_eq!(code, 0, "{v}");
+    let exported = std::fs::read_to_string(r.path().join(".factory/issues.jsonl")).unwrap();
+    assert!(exported.contains(r#""source":"~/plan.md#"#), "{exported}");
+    assert!(!exported.contains("alice"), "{exported}");
+    let shown = r.ok(&["issue", "show", "asf-2"]);
+    assert!(
+        shown["issue"]["source"].as_str().unwrap().contains("alice"),
+        "the store keeps the path"
+    );
+}

@@ -31,20 +31,25 @@ fn continues_name(b: &[u8], i: usize) -> bool {
 }
 
 /// Byte length of the account name at the start of `rest`, or `None` when there is none. With
-/// `spaces`, `John Smith` is one name when a separator closes it (at most two spaces); otherwise
-/// the name ends at the first space, so prose after a path is never swallowed.
-fn name_len(rest: &str, spaces: bool) -> Option<usize> {
+/// `sep` (the separator that preceded the name), `John Smith` is one name when that same separator
+/// closes it, it has at most two spaces and every word after the first starts with a capital or a
+/// digit. Otherwise the name ends at the first space, so prose after a path
+/// (`C:\Users\anna and src/lib.rs`) is never swallowed. Without `sep` it always ends at the first space.
+fn name_len(rest: &str, sep: Option<char>) -> Option<usize> {
     let mut len = rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
-    if spaces {
+    if let Some(sep) = sep {
         let seg = rest
             .find(|c: char| !(is_name_char(c) || c == ' '))
             .unwrap_or(rest.len());
         let name = &rest[..seg];
-        if rest[seg..].starts_with(is_sep)
+        let words_ok = name
+            .split(' ')
+            .skip(1)
+            .all(|w| w.chars().next().is_some_and(|c| !c.is_lowercase()));
+        if rest[seg..].starts_with(sep)
             && name.matches(' ').count() <= 2
             && !name.starts_with(' ')
-            && !name.ends_with(' ')
-            && !name.contains("  ")
+            && words_ok
         {
             len = seg;
         }
@@ -72,7 +77,8 @@ fn windows_home(s: &str) -> Option<usize> {
     if seps2 == 0 {
         return None;
     }
-    let n = name_len(&after[5 + seps2..], true)?;
+    let sep = after[5..].chars().nth(seps2 - 1);
+    let n = name_len(&after[5 + seps2..], sep)?;
     Some(2 + seps + 5 + seps2 + n)
 }
 
@@ -80,7 +86,7 @@ fn windows_home(s: &str) -> Option<usize> {
 fn unix_home(s: &str) -> Option<usize> {
     ["/home/", "/Users/"].iter().find_map(|root| {
         let rest = s.strip_prefix(root)?;
-        name_len(rest, false).map(|n| root.len() + n)
+        name_len(rest, None).map(|n| root.len() + n)
     })
 }
 
@@ -95,7 +101,7 @@ fn msys_home(s: &str) -> Option<usize> {
     if !rest.get(..5)?.eq_ignore_ascii_case("users") || rest.as_bytes().get(5) != Some(&b'/') {
         return None;
     }
-    let n = name_len(&rest[6..], false)?;
+    let n = name_len(&rest[6..], None)?;
     Some(skip + 3 + 6 + n)
 }
 
@@ -416,6 +422,25 @@ mod tests {
         // not closed by a separator: only the first word is the name, the prose stays
         assert_eq!(redact(r"the dir C:\Users\anna is big"), "the dir ~ is big");
         assert_eq!(redact(r"C:\Users\anna and D:\work"), r"~ and D:\work");
+    }
+
+    /// Prose after a home path must survive, also when a separator follows it further on.
+    #[test]
+    fn a_spaced_name_never_swallows_prose_up_to_the_next_separator() {
+        assert_eq!(
+            redact("files in C:\\Users\\anna and src/lib.rs"),
+            "files in ~ and src/lib.rs"
+        );
+        assert_eq!(redact(r"C:\Users\anna and src\lib.rs"), r"~ and src\lib.rs");
+        assert_eq!(redact(r"C:\Users\anna in the repo\x"), r"~ in the repo\x");
+        // the closing separator must be the one that follows `Users`, and later words are capitalised
+        assert_eq!(redact(r"C:\Users\Mary Ann Smith\Desktop"), r"~\Desktop");
+        assert_eq!(redact("C:/Users/John Smith/x"), "~/x");
+        assert_eq!(
+            redact(r"C:\Users\John Smith/x"),
+            r"~ Smith/x",
+            "mixed separators: only the first word"
+        );
     }
 
     #[test]

@@ -75,10 +75,13 @@ automatic one after a write) rewrites a path under a home directory: the account
 stays readable (`C:\Users\anna\src\a.rs` becomes `~\src\a.rs`). That covers the current user's home
 (from `USERPROFILE` and `HOME`), `X:\Users\<name>` with either slash on any drive, `/home/<name>`,
 `/Users/<name>`, the Git Bash and WSL forms (`/c/Users/<name>`) and the 8.3 short name (`RUNNER~1`)
-in the title, body, acceptance criteria and comments. Other paths are left alone. The store keeps the
-text as written, so the TUI and `issue show` still show full paths.
+in the title, body, acceptance criteria, file scope, labels, comments and the issue source (the
+absolute path `plan import <file>` records). Other paths are left alone. The store keeps the text as
+written, so the TUI and `issue show` still show full paths.
 
-Redaction is one-way: importing a redacted export does not bring the original paths back.
+Redaction is one-way: importing a redacted export does not bring the original paths back, and a
+redacted source (`~/plans/x.md#task-1`) no longer matches the absolute path of a later `plan import`
+of the same file.
 
 An explicit `klobuk export` also checks the same fields for e-mail addresses and secret-like strings
 (well-known key prefixes, a PEM private-key header, `token=`, `password=` or `api_key=` followed by a

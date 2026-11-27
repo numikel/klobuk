@@ -82,7 +82,8 @@ fn scrub(
     }
 }
 
-/// Redacts the text fields of a raw export (title, body, acceptance text and check, comment body).
+/// Redacts the text fields of a raw export (title, body, acceptance text and check, source, file scope,
+/// labels, comment body).
 /// Every line is parsed and written back with the same serializer the store used, so the bytes of a
 /// line without a home path do not change. With `scan`, e-mail addresses and secret-like strings are
 /// listed too. The store is not touched.
@@ -124,6 +125,26 @@ fn redact_export(raw: &[u8], homes: &[&str], scan: bool) -> Result<(Vec<u8>, Vec
                             scan.then_some(&mut found),
                         );
                     }
+                }
+                // `plan import <file>` stores the absolute path of the plan as `source`
+                if let Some(s) = i.source.as_mut() {
+                    scrub(s, homes, (&id, None, "source"), scan.then_some(&mut found));
+                }
+                for (k, s) in i.file_scope.iter_mut().enumerate() {
+                    scrub(
+                        s,
+                        homes,
+                        (&id, None, &format!("file_scope[{k}]")),
+                        scan.then_some(&mut found),
+                    );
+                }
+                for (k, s) in i.labels.iter_mut().enumerate() {
+                    scrub(
+                        s,
+                        homes,
+                        (&id, None, &format!("labels[{k}]")),
+                        scan.then_some(&mut found),
+                    );
                 }
             }
             Record::Comment(c) => {
@@ -612,5 +633,52 @@ mod tests {
         let err = install(&tmp, &dest, &|_, _| Err(denied())).unwrap_err();
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old");
         assert!(err.to_string().contains("was not changed"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_export;
+    use klobuk_core::jsonl::IssueRecord;
+    use klobuk_core::{IssueType, Record, Status};
+
+    fn issue_line(source: &str, scope: &str, label: &str) -> Vec<u8> {
+        let rec = Record::Issue(IssueRecord {
+            id: "asf-1".parse().unwrap(),
+            uid: "u".into(),
+            title: "t".into(),
+            body: String::new(),
+            kind: IssueType::Task,
+            status: Status::Ready,
+            priority: 2,
+            parent: None,
+            file_scope: vec![scope.into()],
+            acceptance: vec![],
+            estimate: None,
+            labels: vec![label.into()],
+            source: Some(source.into()),
+            created_at: "c".into(),
+            updated_at: "u".into(),
+            closed_at: None,
+        });
+        let mut line = serde_json::to_string(&rec).unwrap().into_bytes();
+        line.push(b'\n');
+        line
+    }
+
+    #[test]
+    fn source_file_scope_and_labels_are_redacted_and_scanned() {
+        let raw = issue_line(
+            "C:/Users/anna/plans/x.md#task-1",
+            "/home/bob/src/**",
+            "mail:dev@corp.io",
+        );
+        let (out, found) = redact_export(&raw, &[], true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#""source":"~/plans/x.md#task-1""#), "{text}");
+        assert!(text.contains(r#""file_scope":["~/src/**"]"#), "{text}");
+        assert!(!text.contains("anna") && !text.contains("bob"), "{text}");
+        let got: Vec<_> = found.iter().map(|w| (w.field.as_str(), w.kind)).collect();
+        assert_eq!(got, [("labels[0]", "email")]);
     }
 }
