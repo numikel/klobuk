@@ -1,5 +1,6 @@
 //! `klobuk export|import` and the auto-export hook.
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufReader, Write};
@@ -7,19 +8,141 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use klobuk_core::{ExportOpts, ImportMode, ImportReport, IssueStore};
+use klobuk_core::{
+    redact_home_paths, scan_findings, ExportOpts, ImportMode, ImportReport, IssueStore, Record,
+};
 use serde::Serialize;
 
 use crate::cli::{Cli, ExportArgs, ImportArgs};
 use crate::ctx::{Ctx, FACTORY_DIR};
-use crate::output::{AppError, Rendered};
+use crate::output::{AppError, ErrorCode, Rendered};
 
 pub const EXPORT_FILE: &str = "issues.jsonl";
+
+/// One e-mail address or secret-like string in the export. Names the record and the kind, never the value.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExportWarning {
+    pub issue: String,
+    /// `n` of the comment in the export; `None` for a field of the issue itself.
+    pub comment: Option<i64>,
+    pub field: String,
+    pub kind: &'static str,
+}
+
+impl ExportWarning {
+    fn line(&self) -> String {
+        let at = self
+            .comment
+            .map_or_else(|| self.issue.clone(), |n| format!("{} comment {n}", self.issue));
+        format!("warning: {at} {}: {}", self.field, self.kind)
+    }
+}
 
 #[derive(Serialize)]
 struct ExportResult {
     path: String,
     records: usize,
+    warnings: Vec<ExportWarning>,
+}
+
+/// The home directories of the current user, as the environment spells them. They go to the pure
+/// redaction in `klobuk-core`, which reads no environment itself.
+fn home_dirs() -> Vec<String> {
+    let mut homes: Vec<String> = ["USERPROFILE", "HOME"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(|h| h.to_string_lossy().into_owned())
+        .filter(|h| !h.trim().is_empty())
+        .collect();
+    homes.dedup();
+    homes
+}
+
+/// Rewrites home paths in `s` in place; with `warnings`, also records what the (rewritten) text holds.
+fn scrub(
+    s: &mut String,
+    homes: &[&str],
+    at: (&str, Option<i64>, &str),
+    warnings: Option<&mut Vec<ExportWarning>>,
+) {
+    let rewritten = match redact_home_paths(s, homes) {
+        Cow::Owned(n) => Some(n),
+        Cow::Borrowed(_) => None,
+    };
+    if let Some(n) = rewritten {
+        *s = n;
+    }
+    if let Some(out) = warnings {
+        out.extend(scan_findings(s).into_iter().map(|k| ExportWarning {
+            issue: at.0.to_string(),
+            comment: at.1,
+            field: at.2.to_string(),
+            kind: k.label(),
+        }));
+    }
+}
+
+/// Redacts the text fields of a raw export (title, body, acceptance text and check, comment body).
+/// Every line is parsed and written back with the same serializer the store used, so the bytes of a
+/// line without a home path do not change. With `scan`, e-mail addresses and secret-like strings are
+/// listed too. The store is not touched.
+fn redact_export(raw: &[u8], homes: &[&str], scan: bool) -> Result<(Vec<u8>, Vec<ExportWarning>), AppError> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|e| AppError::new(ErrorCode::Backend, format!("export is not UTF-8: {e}")))?;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut found: Vec<ExportWarning> = Vec::new();
+    for line in text.lines() {
+        let mut rec: Record = serde_json::from_str(line)
+            .map_err(|e| AppError::new(ErrorCode::Backend, format!("export line: {e}")))?;
+        match &mut rec {
+            Record::Issue(i) => {
+                let id = i.id.to_string();
+                scrub(
+                    &mut i.title,
+                    homes,
+                    (&id, None, "title"),
+                    scan.then_some(&mut found),
+                );
+                scrub(
+                    &mut i.body,
+                    homes,
+                    (&id, None, "body"),
+                    scan.then_some(&mut found),
+                );
+                for (k, a) in i.acceptance.iter_mut().enumerate() {
+                    scrub(
+                        &mut a.text,
+                        homes,
+                        (&id, None, &format!("acceptance[{k}].text")),
+                        scan.then_some(&mut found),
+                    );
+                    if let Some(v) = a.verify.as_mut() {
+                        scrub(
+                            v,
+                            homes,
+                            (&id, None, &format!("acceptance[{k}].verify")),
+                            scan.then_some(&mut found),
+                        );
+                    }
+                }
+            }
+            Record::Comment(c) => {
+                let id = c.issue.to_string();
+                scrub(
+                    &mut c.body,
+                    homes,
+                    (&id, Some(c.n), "body"),
+                    scan.then_some(&mut found),
+                );
+            }
+            Record::Meta { .. } | Record::Dep { .. } => {}
+        }
+        let line = serde_json::to_string(&rec)
+            .map_err(|e| AppError::new(ErrorCode::Backend, format!("export line: {e}")))?;
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+    }
+    Ok((out, found))
 }
 
 pub fn default_path(ctx: &Ctx) -> PathBuf {
@@ -172,19 +295,23 @@ fn open_new_tmp(next_name: &mut dyn FnMut() -> PathBuf) -> Result<(fs::File, Pat
     )))
 }
 
-/// Writes the export atomically (own temp file + rename) and returns the number of records.
-/// Every call writes to a temp file of its own, so parallel exports never share one; whichever
-/// rename finishes last wins, and each wrote a complete snapshot, so any winner is a valid file.
-/// Neither the destination nor the temp file may be a symlink; the fallback never writes through
+/// Writes the export atomically (own temp file + rename) and returns the number of records and, with
+/// `scan`, the e-mail and secret-like findings. Home paths are rewritten to `~` in the file, never in
+/// the store. Every call writes to a temp file of its own, so parallel exports never share one;
+/// whichever rename finishes last wins, and each wrote a complete snapshot, so any winner is a valid
+/// file. Neither the destination nor the temp file may be a symlink; the fallback never writes through
 /// the destination path directly.
-pub fn write_export(ctx: &Ctx, path: &Path) -> Result<usize, AppError> {
-    let mut buf: Vec<u8> = Vec::new();
+pub fn write_export(ctx: &Ctx, path: &Path, scan: bool) -> Result<(usize, Vec<ExportWarning>), AppError> {
+    let mut raw: Vec<u8> = Vec::new();
     ctx.store.export_jsonl(
-        &mut buf,
+        &mut raw,
         &ExportOpts {
             include_comments: ctx.config.store.export_comments,
         },
     )?;
+    let homes = home_dirs();
+    let homes: Vec<&str> = homes.iter().map(String::as_str).collect();
+    let (buf, warnings) = redact_export(&raw, &homes, scan)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -201,13 +328,14 @@ pub fn write_export(ctx: &Ctx, path: &Path) -> Result<usize, AppError> {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    Ok(buf.iter().filter(|b| **b == b'\n').count())
+    Ok((buf.iter().filter(|b| **b == b'\n').count(), warnings))
 }
 
-/// Called after every mutating command when `[store] auto_export = true`.
+/// Called after every mutating command when `[store] auto_export = true`. Redacts like an explicit
+/// export but never scans: a finding must not fail or slow a command that only wrote to the store.
 pub fn auto(ctx: &Ctx) -> Result<(), AppError> {
     if ctx.config.store.auto_export {
-        write_export(ctx, &default_path(ctx))?;
+        write_export(ctx, &default_path(ctx), false)?;
     }
     Ok(())
 }
@@ -215,12 +343,29 @@ pub fn auto(ctx: &Ctx) -> Result<(), AppError> {
 pub fn export(cli: &Cli, a: &ExportArgs) -> Result<Rendered, AppError> {
     let ctx = Ctx::load(cli)?;
     let path = a.out.clone().unwrap_or_else(|| default_path(&ctx));
-    let records = write_export(&ctx, &path)?;
+    let (records, warnings) = write_export(&ctx, &path, true)?;
     let res = ExportResult {
         path: path.to_string_lossy().replace('\\', "/"),
         records,
+        warnings,
     };
-    let text = format!("exported {} records to {}", res.records, res.path);
+    let mut text = format!("exported {} records to {}", res.records, res.path);
+    if !res.warnings.is_empty() {
+        for w in &res.warnings {
+            text.push('\n');
+            text.push_str(&w.line());
+        }
+        text.push_str(&format!(
+            "\n{} warning(s); the values are not printed. Review the export before committing it",
+            res.warnings.len()
+        ));
+    }
+    // The envelope has no room for a warning next to a failure, so --strict carries them in the message.
+    if a.strict && !res.warnings.is_empty() {
+        return Err(AppError::validation(format!(
+            "{text}\n--strict: failing because of the warnings above"
+        )));
+    }
     Rendered::new(&res, text)
 }
 

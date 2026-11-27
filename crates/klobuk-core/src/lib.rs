@@ -22,6 +22,7 @@ pub mod method;
 pub mod model;
 pub mod plan;
 pub mod ports;
+pub mod redact;
 pub mod remind;
 pub mod run;
 pub mod runtime;
@@ -39,6 +40,7 @@ pub use plan::{
     PlanParseError,
 };
 pub use ports::{ExportOpts, ImportMode, ImportReport, IssueStore};
+pub use redact::{redact_home_paths, scan_findings, FindingKind};
 pub use run::*;
 pub use runtime::*;
 pub use vcs::*;

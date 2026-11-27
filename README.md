@@ -68,6 +68,34 @@ klobuk repo doctor                # git, config, database, herdr, claude, github
 and `.git/info/exclude`; `repo doctor` warns when any of them is missing. `.factory/config.toml`
 and `.factory/issues.jsonl` are meant to be committed.
 
+### What the export keeps out of git
+
+`.factory/issues.jsonl` is public the moment you push it, so every export (`klobuk export` and the
+automatic one after a write) rewrites a path under a home directory: the account name goes, the rest
+stays readable (`C:\Users\anna\src\a.rs` becomes `~\src\a.rs`). That covers the current user's home
+(from `USERPROFILE` and `HOME`), `X:\Users\<name>` with either slash on any drive, `/home/<name>`,
+`/Users/<name>`, the Git Bash and WSL forms (`/c/Users/<name>`) and the 8.3 short name (`RUNNER~1`)
+in the title, body, acceptance criteria and comments. Other paths are left alone. The store keeps the
+text as written, so the TUI and `issue show` still show full paths.
+
+Redaction is one-way: importing a redacted export does not bring the original paths back.
+
+An explicit `klobuk export` also checks the same fields for e-mail addresses and secret-like strings
+(well-known key prefixes, a PEM private-key header, `token=`, `password=` or `api_key=` followed by a
+long value). It prints one warning per record, field and kind, for example
+`warning: asf-203 comment 4 body: api-key`, and never the value; `--json` carries the same list in
+`result.warnings`. Addresses on `users.noreply.github.com` and `example.com`/`example.org` do not
+warn. Warnings leave the exit code at 0; `klobuk export --strict` exits 1 when there is at least one
+(the file is still written, and the message lists them), so a script can stop before the commit:
+
+```
+klobuk export --strict && git add .factory/issues.jsonl
+```
+
+The automatic export redacts but never warns and never fails because of a finding. Secret-like
+strings and addresses are only reported, not removed: fix the comment or the issue in the store, then
+export again.
+
 ### Platforms
 
 Windows is the system Klobuk is developed and used on every day. On Linux the test suite passes,
@@ -472,7 +500,7 @@ reported and never fatal.
 | `klobuk gh sync [--dry-run]` | Mirror issues to GitHub |
 | `klobuk serve [--interval s] [--once] [--dispatch] [--until-done [--max-ticks N]]` | The orchestrator loop; `--until-done` stops with `all_done`, `max_ticks` or `stuck` |
 | `klobuk tui [--view board\|agents\|inbox\|queue\|log\|config] [--once]` | Terminal UI |
-| `klobuk export [--out f]` / `klobuk import <f> [--mode upsert\|replace]` | JSONL export and import |
+| `klobuk export [--out f] [--strict]` / `klobuk import <f> [--mode upsert\|replace]` | JSONL export and import; the export rewrites home paths to `~` and warns about e-mail addresses and secret-like strings, `--strict` exits 1 on a warning |
 | `klobuk hook pre-tool\|post-tool\|stop\|status` | Claude Code hooks (called by the worker's settings, not by you) |
 
 Global options: `--repo <path>`, `--lane <id|orchestrator|human>`, `--json`, `-q`.

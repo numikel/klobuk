@@ -293,3 +293,153 @@ fn export_refuses_symlink_destination() {
     r.ok(&["export", "--out", out.to_str().unwrap()]);
     assert!(out.exists() && !out.with_extension("jsonl.tmp").exists());
 }
+
+/// Runs `klobuk <args> --json` as the user whose home is `home`; returns the envelope and exit code.
+fn json_as(r: &Repo, home: &std::path::Path, args: &[&str]) -> (serde_json::Value, i32) {
+    let out = r
+        .klobuk()
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("not json: {e}\n{stdout}"));
+    (v, out.status.code().unwrap_or(-1))
+}
+
+const FAKE_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123";
+
+#[test]
+fn export_redacts_home_paths_and_warns_without_printing_values() {
+    let r = Repo::initialised();
+    let home_dir = tempfile::Builder::new().prefix("klobuk-home-").tempdir().unwrap();
+    let home = home_dir.path().join("alice");
+    let home_text = home.to_string_lossy().into_owned();
+    let a = r.create_issue("a", &["--ready"]);
+    let body = format!(
+        r"crashed in {home_text}/src/main.rs, also C:\Users\bob\notes.txt and /home/carol/x; kept D:\work\keep.txt; contact dev@corp.io (not t@example.com, 7+me@users.noreply.github.com, t@x) key {FAKE_KEY}"
+    );
+    let (v, code) = json_as(
+        &r,
+        &home,
+        &[
+            "--lane", "human", "issue", "comment", &a, "--type", "FYI", "--body", &body,
+        ],
+    );
+    assert_eq!((code, &v["ok"]), (0, &serde_json::Value::Bool(true)), "{v}");
+
+    // the automatic export after the comment redacts too, and never warns or fails
+    let path = r.path().join(".factory/issues.jsonl");
+    let auto = std::fs::read_to_string(&path).unwrap();
+    let comment: serde_json::Value = serde_json::from_str(auto.lines().last().unwrap()).unwrap();
+    let exported = comment["body"].as_str().unwrap();
+    assert!(
+        exported.starts_with(r"crashed in ~/src/main.rs, also ~\notes.txt and ~/x; kept D:\work\keep.txt;"),
+        "{exported}"
+    );
+    for gone in ["alice", "bob", "carol"] {
+        assert!(!auto.contains(gone), "{gone} still in the export");
+    }
+
+    // the store keeps the original text
+    let shown = r.ok(&["issue", "show", &a, "--dossier"]);
+    let stored = shown["comments"][0]["body"].as_str().unwrap();
+    assert!(
+        stored.contains(&home_text) && stored.contains(r"C:\Users\bob"),
+        "{stored}"
+    );
+
+    // explicit export: same file, warnings by record and kind, exit 0
+    let (v, code) = json_as(&r, &home, &["export"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        v["result"]["warnings"],
+        serde_json::json!([
+            {"issue": a, "comment": 1, "field": "body", "kind": "email"},
+            {"issue": a, "comment": 1, "field": "body", "kind": "api-key"},
+        ])
+    );
+    let printed = v.to_string();
+    for value in ["corp.io", FAKE_KEY, "sk-ant"] {
+        assert!(!printed.contains(value), "{value} printed: {printed}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().lines().last(),
+        auto.lines().last()
+    );
+
+    // human output names them too
+    let out = r
+        .klobuk()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .arg("export")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(
+        text.contains(&format!("warning: {a} comment 1 body: email")),
+        "{text}"
+    );
+    assert!(!text.contains("corp.io") && !text.contains(FAKE_KEY), "{text}");
+
+    // --strict: exit 1 with warnings (file still written), the message lists kinds, not values
+    let (v, code) = json_as(&r, &home, &["export", "--strict"]);
+    assert_eq!(code, 1, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("comment 1 body: api-key") && !msg.contains("corp.io") && !msg.contains(FAKE_KEY),
+        "{msg}"
+    );
+
+    // --strict without findings: exit 0
+    let clean = Repo::initialised();
+    clean.create_issue("clean", &["--ready"]);
+    let (v, code) = json_as(&clean, &home, &["export", "--strict"]);
+    assert_eq!(
+        (code, &v["result"]["warnings"]),
+        (0, &serde_json::json!([])),
+        "{v}"
+    );
+}
+
+#[test]
+fn redacted_exports_are_deterministic_and_do_not_bring_paths_back_on_import() {
+    let r = Repo::initialised();
+    let a = r.create_issue(r"fix C:\Users\bob\src", &["--ready"]);
+    r.ok(&[
+        "--lane",
+        "human",
+        "issue",
+        "comment",
+        &a,
+        "--type",
+        "FYI",
+        "--body",
+        "see /Users/dan/x and /Users/dan/y",
+    ]);
+    let first = r.path().join("one.jsonl");
+    let second = r.path().join("two.jsonl");
+    r.ok(&["export", "--out", first.to_str().unwrap()]);
+    r.ok(&["export", "--out", second.to_str().unwrap()]);
+    let (one, two) = (
+        std::fs::read_to_string(&first).unwrap(),
+        std::fs::read_to_string(&second).unwrap(),
+    );
+    assert_eq!(body(&one), body(&two));
+    assert!(
+        one.contains(r#""title":"fix ~\\src""#) && one.contains("see ~/x and ~/y"),
+        "{one}"
+    );
+
+    let dst = Repo::initialised();
+    dst.ok(&["import", first.to_str().unwrap()]);
+    let shown = dst.ok(&["issue", "show", "asf-1", "--dossier"]);
+    assert_eq!(
+        shown["comments"][0]["body"], "see ~/x and ~/y",
+        "the original paths are gone for good"
+    );
+}

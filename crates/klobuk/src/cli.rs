@@ -153,6 +153,9 @@ pub struct ServeArgs {
 pub struct ExportArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Exit 1 when the export holds an e-mail address or a secret-like string (the file is still written).
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Args, Debug)]
