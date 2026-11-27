@@ -167,6 +167,8 @@ klobuk extends your scope and answers the QUESTION (`scope extended: ...`) at on
 authorise destructive git. When in doubt, ask the human.\n\
 - Do not rewrite files wholesale when an edit suffices; do not touch files outside the scope; never force-push.\n\
 - Commit messages: Conventional Commits, in English, and no AI attribution trailers (`Co-Authored-By`, `Generated-by`).\n\
+- Sample data in code, tests, fixtures and documentation is invented: never copy a name, a path, \
+a host name or an e-mail address from the machine you run on or from your environment.\n\
 {self_check}\
 - Waiting for a long command of your own: run it in the foreground, or wait for that one process by its id; never poll for \
 'any cargo process' (the gates and other workers run the same tools at the same time) and never wait through a shell that \
@@ -281,7 +283,9 @@ evidence and you do not rerun them;\n\
 read-only.\n\
    A criterion that is neither readable from the diff, nor run, nor listed on `Not run:` is a reason for `changes`.\n\
 3. Look for what the criteria do not cover: out-of-scope files, missing tests, wrong error handling, \
-regressions of existing behaviour. Run a targeted command to probe a suspicion.\n\
+regressions of existing behaviour. Sample data in code, tests, fixtures or documentation that looks taken from a real machine \
+(an account name, a path, a host name or an e-mail address that is not plainly invented) is a finding. \
+Run a targeted command to probe a suspicion.\n\
 4. Remember to name in the verdict every command you ran, on one non-bullet `Ran:` line right after the verdict line, \
 before any bullet, and every criterion you did not run on one non-bullet `Not run:` line right after it.\n\
 \n## Verdict\n\n\

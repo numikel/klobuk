@@ -13,7 +13,7 @@ fn is_sep(c: char) -> bool {
     c == '/' || c == '\\'
 }
 
-/// Characters of an account name: `micha`, `john.doe`, `RUNNER~1` (the 8.3 short form), `Michał`.
+/// Characters of an account name: `anna`, `john.doe`, `RUNNER~1` (the 8.3 short form), `Zoë`.
 fn is_name_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '~')
 }
@@ -31,7 +31,7 @@ fn continues_name(b: &[u8], i: usize) -> bool {
 }
 
 /// Byte length of the account name at the start of `rest`, or `None` when there is none. With
-/// `sep` (the separator that preceded the name), `John Smith` is one name when that same separator
+/// `sep` (the separator that preceded the name), `Max Muster` is one name when that same separator
 /// closes it, it has at most two spaces and every word after the first starts with a capital or a
 /// digit. Otherwise the name ends at the first space, so prose after a path
 /// (`C:\Users\anna and src/lib.rs`) is never swallowed. Without `sep` it always ends at the first space.
@@ -376,11 +376,8 @@ mod tests {
 
     #[test]
     fn windows_backslash_and_slash_any_drive() {
-        assert_eq!(
-            redact(r"open C:\Users\micha\src\a.rs now"),
-            r"open ~\src\a.rs now"
-        );
-        assert_eq!(redact("open C:/Users/micha/src/a.rs now"), "open ~/src/a.rs now");
+        assert_eq!(redact(r"open C:\Users\anna\src\a.rs now"), r"open ~\src\a.rs now");
+        assert_eq!(redact("open C:/Users/anna/src/a.rs now"), "open ~/src/a.rs now");
         assert_eq!(redact(r"D:\Users\anna\x"), r"~\x");
         assert_eq!(redact(r"c:\users\anna\x"), r"~\x");
         assert_eq!(redact(r"\\?\C:\Users\anna\x"), r"\\?\~\x");
@@ -417,8 +414,8 @@ mod tests {
 
     #[test]
     fn a_name_with_spaces_goes_whole_when_a_separator_closes_it() {
-        assert_eq!(redact(r"C:\Users\John Smith\Desktop\a.txt"), r"~\Desktop\a.txt");
-        assert_eq!(redact("C:/Users/Michał Kowalski/a"), "~/a");
+        assert_eq!(redact(r"C:\Users\Max Muster\Desktop\a.txt"), r"~\Desktop\a.txt");
+        assert_eq!(redact("C:/Users/Zoë Müller/a"), "~/a");
         // not closed by a separator: only the first word is the name, the prose stays
         assert_eq!(redact(r"the dir C:\Users\anna is big"), "the dir ~ is big");
         assert_eq!(redact(r"C:\Users\anna and D:\work"), r"~ and D:\work");
@@ -434,11 +431,11 @@ mod tests {
         assert_eq!(redact(r"C:\Users\anna and src\lib.rs"), r"~ and src\lib.rs");
         assert_eq!(redact(r"C:\Users\anna in the repo\x"), r"~ in the repo\x");
         // the closing separator must be the one that follows `Users`, and later words are capitalised
-        assert_eq!(redact(r"C:\Users\Mary Ann Smith\Desktop"), r"~\Desktop");
-        assert_eq!(redact("C:/Users/John Smith/x"), "~/x");
+        assert_eq!(redact(r"C:\Users\Eva Maria Muster\Desktop"), r"~\Desktop");
+        assert_eq!(redact("C:/Users/Max Muster/x"), "~/x");
         assert_eq!(
-            redact(r"C:\Users\John Smith/x"),
-            r"~ Smith/x",
+            redact(r"C:\Users\Max Muster/x"),
+            r"~ Muster/x",
             "mixed separators: only the first word"
         );
     }
@@ -461,7 +458,7 @@ mod tests {
         // another account whose name starts the same is not the current user's home
         assert_eq!(r(r"D:\Dev\mel\x"), r"D:\Dev\mel\x");
         assert_eq!(r(r"D:\Dev\me2\x"), r"D:\Dev\me2\x");
-        let posix = redact_home_paths("cd /srv/people/ann/x", &["/srv/people/ann"]);
+        let posix = redact_home_paths("cd /srv/people/kim/x", &["/srv/people/kim"]);
         assert_eq!(posix, "cd ~/x");
     }
 
@@ -477,7 +474,7 @@ mod tests {
     fn paths_outside_a_home_directory_are_left_alone() {
         for t in [
             r"C:\Windows\System32\cmd.exe",
-            r"D:\Programowanie\auto\x",
+            r"D:\Projects\widgets\x",
             "/usr/local/bin/klobuk",
             "/home/",
             "/home",
@@ -505,7 +502,7 @@ mod tests {
 
     #[test]
     fn a_path_that_appears_several_times_is_rewritten_every_time() {
-        let t = r"C:\Users\anna\a and C:\Users\anna\b, again C:/Users/anna/c; /home/anna/d /home/bob/e";
+        let t = r"C:\Users\anna\a and C:\Users\anna\b, again C:/Users/anna/c; /home/anna/d /home/ben/e";
         assert_eq!(redact(t), r"~\a and ~\b, again ~/c; ~/d ~/e");
         let twice = redact_home_paths("/srv/u/x /srv/u/y", &["/srv/u"]);
         assert_eq!(twice, "~/x ~/y");
@@ -513,7 +510,7 @@ mod tests {
 
     #[test]
     fn the_result_is_stable_when_applied_again() {
-        let once = redact(r"C:\Users\anna\a /home/bob/b");
+        let once = redact(r"C:\Users\anna\a /home/ben/b");
         assert_eq!(redact(&once), once);
     }
 
@@ -539,7 +536,7 @@ mod tests {
             "t@example.org",
             "t@x",
             "a@b",
-            "git@github.com:numikel/klobuk.git",
+            "git@github.com:acme/widgets.git",
             "serde@1.0.200",
             "install @types/node@20.1",
             "no address here",

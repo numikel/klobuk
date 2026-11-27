@@ -1038,16 +1038,16 @@ mod tests {
         assert!(h.ends_with("... and 7 more"), "{h}");
     }
 
-    const EXE: &str = r"D:\Programowanie\auto-software-factory\.worktrees\asf-43\target\debug\deps\klobuk-ce36f34fbf868c1a.exe";
+    const EXE: &str = r"D:\work\app\target\debug\deps\app-0123456789abcdef.exe";
 
     fn only(line: &str) -> Vec<PathBuf> {
         locked_files(line)
     }
 
-    /// The exact line observed on a Polish Windows (asf-43 merge item, 2026-11-09).
+    /// The line as observed on a Polish Windows (asf-43 merge item, 2026-11-09), with an invented path.
     #[test]
     fn reads_the_path_from_a_polish_linker_line() {
-        let line = r"LINK : fatal error LNK1104: nie można otworzyć pliku „D:\Programowanie\auto-software-factory\.worktrees\asf-43\target\debug\deps\klobuk-ce36f34fbf868c1a.exe”";
+        let line = r"LINK : fatal error LNK1104: nie można otworzyć pliku „D:\work\app\target\debug\deps\app-0123456789abcdef.exe”";
         assert_eq!(only(line), vec![PathBuf::from(EXE)]);
     }
 

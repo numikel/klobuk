@@ -303,6 +303,25 @@ fn worker_brief_forbids_ai_attribution_trailers() {
 }
 
 #[test]
+fn worker_brief_says_sample_data_is_invented_and_never_copied_from_the_machine() {
+    let b = worker_brief();
+    let p = protocol(&b);
+    let rule =
+        "- Sample data in code, tests, fixtures and documentation is invented: never copy a name, a path, \
+a host name or an e-mail address from the machine you run on or from your environment.\n";
+    assert!(p.contains(rule), "{p}");
+}
+
+#[test]
+fn review_brief_makes_sample_data_taken_from_a_real_machine_a_finding() {
+    let b = review_brief();
+    let s = review_steps(&b);
+    let check = "Sample data in code, tests, fixtures or documentation that looks taken from a real machine \
+(an account name, a path, a host name or an e-mail address that is not plainly invented) is a finding.";
+    assert!(s.contains(check), "{s}");
+}
+
+#[test]
 fn worker_brief_has_the_rule_for_tests_that_run_a_loop_as_a_process() {
     let b = worker_brief();
     let p = protocol(&b);

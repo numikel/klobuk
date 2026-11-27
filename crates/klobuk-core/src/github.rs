@@ -231,13 +231,13 @@ mod tests {
         // `gh issue list --json author` yields an object, not a string.
         let v = json!({
             "number": 7, "title": "t", "state": "OPEN", "url": "u",
-            "author": {"id": "MDQ6", "is_bot": false, "login": "numikel", "name": ""}
+            "author": {"id": "MDQ6", "is_bot": false, "login": "octo-dev", "name": ""}
         });
         let i: GhIssue = serde_json::from_value(v).unwrap();
-        assert_eq!(i.author, "numikel");
+        assert_eq!(i.author, "octo-dev");
         // our own serialised form (a plain string) must keep working: the fake stores it
         let again: GhIssue = serde_json::from_value(serde_json::to_value(&i).unwrap()).unwrap();
-        assert_eq!(again.author, "numikel");
+        assert_eq!(again.author, "octo-dev");
         // a deleted account is `null` in GitHub's API
         let ghost = json!({"number": 8, "title": "t", "state": "OPEN", "url": "u", "author": null});
         assert_eq!(serde_json::from_value::<GhIssue>(ghost).unwrap().author, "");
