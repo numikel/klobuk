@@ -267,15 +267,23 @@ The full gates already passed in the merge queue on this commit after the rebase
     let _ = writeln!(
         out,
         "\nDo not rerun the whole suite, and do not rebuild the project just to re-check formatting or lints. \
-Your job is to read the diff against the issue text and every acceptance criterion.\n\n\
+Your job is to read the diff against the issue text and to settle every acceptance criterion.\n\n\
 1. Read the change: `git diff {base}...HEAD` (base_sha is `{base}`), plus `git log {base}..HEAD`.\n\
-2. Check every acceptance criterion above against the diff. Run only targeted commands, and only to prove a criterion \
-or probe a suspicion: a single test, one test file or one package (a given `verify` command counts when it is \
-targeted). Anything wider than that is a rerun of the gates.\n\
+2. Settle every acceptance criterion above in one of three ways:\n\
+   - read it from the diff, when the diff itself shows that it holds;\n\
+   - run it: for every acceptance criterion that can only be known by running a command, run that command yourself \
+(a given `verify` command counts). A sentence in the author's report is not evidence. Prefer the narrowest command that \
+proves the criterion: a single test, one test file or one package;\n\
+   - list it on the `Not run:` line with the reason, which is one of exactly two:\n\
+     - queue gate: the gates listed above already ran on this exact commit in the merge queue, so they are machine \
+evidence and you do not rerun them;\n\
+     - needs a write: the check would have to edit a file (to prove that a test fails, for instance), and you are \
+read-only.\n\
+   A criterion that is neither readable from the diff, nor run, nor listed on `Not run:` is a reason for `changes`.\n\
 3. Look for what the criteria do not cover: out-of-scope files, missing tests, wrong error handling, \
-regressions of existing behaviour.\n\
+regressions of existing behaviour. Run a targeted command to probe a suspicion.\n\
 4. Remember to name in the verdict every command you ran, on one non-bullet `Ran:` line right after the verdict line, \
-before any bullet.\n\
+before any bullet, and every criterion you did not run on one non-bullet `Not run:` line right after it.\n\
 \n## Verdict\n\n\
 Finish by posting exactly one DECISION comment as the last thing you do. It is addressed to the reviewed issue \
 `{id}`:\n\n\
@@ -283,15 +291,24 @@ Finish by posting exactly one DECISION comment as the last thing you do. It is a
 or, with findings:\n\n\
 `{klobuk} issue comment {id} --type DECISION --to {id} --body \"changes: ...\"`\n\n\
 The first line of the body is the verdict, matched case-insensitively:\n\n\
-- `approve` — every criterion holds and you found nothing to fix. Put the `Ran:` line right after it.\n\
-- `changes:` — followed by the `Ran:` line, then one bullet (`- ...`) per concrete finding the author must fix, each \
-naming the file or criterion.\n\n\
-The `Ran:` line is one plain line (not a bullet) with the targeted commands you ran, placed right after the verdict \
-line and before any bullet. Anything after a bullet is read as part of a finding, and every bullet is sent to the \
-author as something to fix. Example body of a `changes:` verdict:\n\n\
+- `approve` — every criterion holds and you found nothing to fix. Put the `Ran:` and `Not run:` lines right after it.\n\
+- `changes:` — followed by the `Ran:` and `Not run:` lines, then one bullet (`- ...`) per concrete finding the author \
+must fix, each naming the file or criterion.\n\n\
+The `Ran:` line is one plain line (not a bullet) with the commands you ran, placed right after the verdict line and \
+before any bullet. The `Not run:` line is one plain line (not a bullet) with every criterion you did not run and the \
+reason (queue gate, or needs a write), placed right after the `Ran:` line; write `Not run: none` when you ran or read \
+everything. The `Not run:` line is never a finding and is never sent to the author. Anything else after a bullet is read \
+as part of a finding, and every bullet is sent to the author as something to fix. Example body of an `approve` verdict:\n\n\
+```\n\
+approve\n\
+Ran: <each command you ran>\n\
+Not run: <criterion> (queue gate | needs a write)\n\
+```\n\n\
+Example body of a `changes:` verdict:\n\n\
 ```\n\
 changes:\n\
 Ran: cargo test -p klobuk-core --test brief\n\
+Not run: <criterion> (queue gate | needs a write)\n\
 - <file or criterion>: <finding>\n\
 ```\n\n\
 Post exactly one DECISION comment. Any other first line is treated as no verdict.\n",
@@ -309,10 +326,18 @@ pub enum Verdict {
     Changes(Vec<String>),
 }
 
+/// The line a reviewer lists the criteria it did not run on (`Not run: <criterion> (<reason>)`).
+const NOT_RUN: &str = "not run:";
+
+fn starts_with_ignore_case(line: &str, tag: &str) -> bool {
+    line.get(..tag.len()).is_some_and(|h| h.eq_ignore_ascii_case(tag))
+}
+
 /// Parse a reviewer's DECISION body. The first non-blank line is `approve` or `changes:`
 /// (case-insensitive); `changes:` collects the following `-`/`*` bullets (wrapped lines are joined,
 /// text after the colon counts as a finding). `changes:` without any finding and anything else
-/// yield `None`.
+/// yield `None`. A `Not run:` line (and the lines wrapped under it) is the reviewer's account of
+/// what it did not run, never a finding, wherever it stands in the body.
 pub fn parse_verdict(body: &str) -> Option<Verdict> {
     let mut lines = body.lines().map(str::trim).skip_while(|l| l.is_empty());
     let first = lines.next()?;
@@ -328,18 +353,25 @@ pub fn parse_verdict(body: &str) -> Option<Verdict> {
     if !rest.is_empty() {
         findings.push(rest.to_string());
     }
+    // inside a `Not run:` line and its wrapped continuation, which ends at the next bullet
+    let mut in_not_run = false;
     for line in lines {
-        if let Some(text) = line
+        let bullet = line
             .strip_prefix("- ")
             .or_else(|| line.strip_prefix("* "))
             .or_else(|| line.strip_prefix('-'))
             .or_else(|| line.strip_prefix('*'))
+            .map(str::trim);
+        if starts_with_ignore_case(line, NOT_RUN)
+            || bullet.is_some_and(|t| starts_with_ignore_case(t, NOT_RUN))
         {
-            let text = text.trim();
+            in_not_run = true;
+        } else if let Some(text) = bullet {
+            in_not_run = false;
             if !text.is_empty() {
                 findings.push(text.to_string());
             }
-        } else if !line.is_empty() {
+        } else if !line.is_empty() && !in_not_run {
             if let Some(last) = findings.last_mut() {
                 last.push(' ');
                 last.push_str(line);

@@ -512,7 +512,158 @@ fn review_brief_is_read_only() {
     }
 }
 
+/// The "Review steps" section of the review brief (up to the Verdict).
+fn review_steps(b: &str) -> &str {
+    let from = b.find("## Review steps").expect("review steps section");
+    let to = b.find("## Verdict").expect("verdict section");
+    &b[from..to]
+}
+
+#[test]
+fn review_brief_requires_running_every_criterion_that_needs_a_command() {
+    let b = review_brief();
+    let s = review_steps(&b);
+    assert!(
+        s.contains("every acceptance criterion that can only be known by running a command"),
+        "{s}"
+    );
+    assert!(s.contains("run that command yourself"), "{s}");
+    assert!(
+        s.contains("A sentence in the author's report is not evidence"),
+        "{s}"
+    );
+}
+
+#[test]
+fn review_brief_names_the_two_exceptions_so_nothing_is_skipped_silently() {
+    let b = review_brief();
+    let s = review_steps(&b);
+    assert!(s.contains("queue gate"), "{s}");
+    assert!(
+        s.contains("already ran on this exact commit"),
+        "the gates the queue ran are machine evidence:\n{s}"
+    );
+    assert!(s.contains("needs a write"), "{s}");
+    assert!(s.contains("read-only"), "{s}");
+}
+
+#[test]
+fn review_brief_says_a_criterion_neither_read_nor_run_nor_listed_is_a_reason_for_changes() {
+    let b = review_brief();
+    let s = review_steps(&b);
+    assert!(
+        s.contains("neither readable from the diff, nor run, nor listed on `Not run:`"),
+        "{s}"
+    );
+    assert!(s.contains("reason for `changes`"), "{s}");
+}
+
+#[test]
+fn review_brief_asks_for_a_not_run_line_with_the_reason_next_to_the_ran_line() {
+    let b = review_brief();
+    let verdict = &b[b.find("## Verdict").unwrap()..];
+    assert!(verdict.contains("`Not run:`"), "{verdict}");
+    assert!(verdict.contains("(not a bullet)"), "{verdict}");
+    assert!(
+        verdict.contains("the reason (queue gate, or needs a write)"),
+        "{verdict}"
+    );
+}
+
+/// The fenced example that opens with `first`, as a reviewer would copy it.
+fn example_body(brief: &str, first: &str) -> String {
+    brief
+        .split("```\n")
+        .skip(1)
+        .step_by(2)
+        .find(|b| b.starts_with(first))
+        .unwrap_or_else(|| panic!("no fenced `{first}` example in the brief:\n{brief}"))
+        .to_string()
+}
+
+#[test]
+fn review_brief_example_approve_verdict_has_both_lines_and_parses_to_approve() {
+    let b = review_brief();
+    let body = example_body(&b, "approve");
+    assert!(body.lines().nth(1).unwrap().starts_with("Ran:"), "{body}");
+    assert!(body.lines().nth(2).unwrap().starts_with("Not run:"), "{body}");
+    assert_eq!(parse_verdict(&body), Some(Verdict::Approve), "{body}");
+}
+
+#[test]
+fn review_brief_example_changes_verdict_carries_the_not_run_line_and_still_has_one_finding() {
+    let b = review_brief();
+    let body = example_changes_body(&b);
+    assert!(body.lines().nth(2).unwrap().starts_with("Not run:"), "{body}");
+}
+
 // ---- verdict parser --------------------------------------------------------------------------
+
+#[test]
+fn parse_verdict_accepts_a_not_run_line_in_an_approve_verdict() {
+    let body = "approve\nRan: cargo test -p klobuk-core --test brief\nNot run: cargo test --workspace (queue gate)\n";
+    assert_eq!(parse_verdict(body), Some(Verdict::Approve));
+}
+
+#[test]
+fn parse_verdict_never_turns_a_not_run_line_into_a_finding() {
+    // before the bullets, between them, after them, inline after the colon, in any case
+    let before = "changes:\nRan: cargo test\nNot run: cargo fmt (queue gate)\n- the real finding\n";
+    let after = "changes:\n- the real finding\nNot run: cargo fmt (queue gate)\n";
+    let between = "changes:\n- first\nNot run: edit a file to see the test fail (needs a write)\n- second\n";
+    let inline = "changes: the real finding\nNot run: cargo fmt (queue gate)\n";
+    let shouting = "CHANGES:\n- the real finding\nNOT RUN: cargo fmt (queue gate)\n";
+    for body in [before, after, inline, shouting] {
+        assert_eq!(
+            parse_verdict(body),
+            Some(Verdict::Changes(vec!["the real finding".into()])),
+            "{body}"
+        );
+    }
+    assert_eq!(
+        parse_verdict(between),
+        Some(Verdict::Changes(vec!["first".into(), "second".into()])),
+        "{between}"
+    );
+}
+
+#[test]
+fn parse_verdict_skips_the_wrapped_continuation_of_a_not_run_line() {
+    let body = "changes:\n- the real finding\nNot run: cargo publish --dry-run --workspace\n  (needs a write: it packs the tree)\n- second\n";
+    assert_eq!(
+        parse_verdict(body),
+        Some(Verdict::Changes(vec!["the real finding".into(), "second".into()])),
+        "{body}"
+    );
+}
+
+#[test]
+fn parse_verdict_with_only_a_not_run_line_has_no_findings() {
+    assert_eq!(parse_verdict("changes:\nNot run: x (queue gate)"), None);
+}
+
+#[test]
+fn parse_verdict_without_a_not_run_line_reads_as_before() {
+    assert_eq!(
+        parse_verdict("changes:\nRan: cargo test\n- a\n- b\n"),
+        Some(Verdict::Changes(vec!["a".into(), "b".into()]))
+    );
+    assert_eq!(
+        parse_verdict("approve\nRan: cargo test\n"),
+        Some(Verdict::Approve)
+    );
+}
+
+#[test]
+fn parse_verdict_keeps_a_finding_that_merely_mentions_not_run_in_the_middle() {
+    let body = "changes:\n- the criterion was Not run: by the author, nothing proves it\n";
+    assert_eq!(
+        parse_verdict(body),
+        Some(Verdict::Changes(vec![
+            "the criterion was Not run: by the author, nothing proves it".into()
+        ]))
+    );
+}
 
 #[test]
 fn parse_verdict_approve() {

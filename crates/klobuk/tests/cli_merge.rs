@@ -3332,3 +3332,221 @@ fn uncommitted_files_the_branch_does_not_touch_block_nothing() {
         "left alone"
     );
 }
+
+// ---- review depth, no home path, the kept brief, the send-back text (asf-214) -------------------
+
+/// The directory of the klobuk test binary, forward slashes: what a home directory would leak through.
+fn klobuk_dir(f: &F) -> String {
+    let cmd = f.repo.klobuk();
+    Path::new(cmd.get_program())
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// `klobuk <args> --json` with the directory of the test binary first on `PATH` (`on_path`), as when it is
+/// installed, or with that directory taken off it. The running binary is then the `klobuk` a shell finds, or not.
+fn ok_with_path(f: &F, args: &[&str], on_path: bool) -> serde_json::Value {
+    let mut cmd = f.repo.klobuk();
+    let dir = Path::new(cmd.get_program()).parent().unwrap().to_path_buf();
+    let rest = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(&rest)
+        .filter(|d| !d.join("klobuk.exe").is_file() && !d.join("klobuk").is_file())
+        .collect();
+    if on_path {
+        dirs.insert(0, dir);
+    }
+    let out = cmd
+        .env("PATH", std::env::join_paths(dirs).unwrap())
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("not json: {e}\n{}", String::from_utf8_lossy(&out.stderr)));
+    assert!(out.status.success() && v["ok"] == true, "{v}");
+    v["result"].clone()
+}
+
+/// The newest run of the review issue `rid`: the review's own run id names its folder under `.factory/runs`.
+fn review_run_id(f: &F, rid: &str) -> String {
+    store(f)
+        .runs(Some(&rid.parse().unwrap()), false)
+        .unwrap()
+        .pop()
+        .expect("the review has a run")
+        .id
+}
+
+/// The brief a review round keeps in the repository root.
+fn kept_review_brief(f: &F, rid: &str) -> String {
+    let path = f
+        .repo
+        .path()
+        .join(".factory/runs")
+        .join(review_run_id(f, rid))
+        .join("brief.md");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[test]
+fn the_review_brief_survives_the_removal_of_the_review_worktree_after_a_merge() {
+    let f = reviewing();
+    let rid = review_id(&f);
+    decide_as(&f, &rid, "approve\nRan: none\nNot run: none");
+    let res = f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(res["items"][0]["state"], "merged", "{res}");
+    assert!(
+        !f.repo.path().join(".worktrees").join(&rid).exists(),
+        "the review worktree is gone, so the copy below is not the one that lived in it"
+    );
+    let kept = kept_review_brief(&f, &rid);
+    assert!(kept.starts_with(&format!("# Review {}", f.issue)), "{kept}");
+    assert!(
+        kept.contains("`Not run:`"),
+        "the depth rule is in the kept brief:\n{kept}"
+    );
+    assert!(kept.contains("base_sha"), "{kept}");
+}
+
+#[test]
+fn every_review_round_keeps_its_own_brief() {
+    let f = reviewing();
+    let first = review_id(&f);
+    decide_as(&f, &first, "changes:\n- src/greet.rs: no test");
+    f.repo.ok(&["merge", "tick", "--once"]);
+    finish_again(&f, "src/greet.rs", "pub fn hello() { /* tested */ }\n");
+    f.repo.ok(&["merge", "tick", "--once"]);
+    let second = review_id(&f);
+    assert_ne!(first, second, "the second round has a review issue of its own");
+    assert_ne!(
+        review_run_id(&f, &first),
+        review_run_id(&f, &second),
+        "and a run of its own"
+    );
+    for rid in [&first, &second] {
+        assert!(kept_review_brief(&f, rid).contains("## Review steps"), "{rid}");
+    }
+}
+
+/// A finished, verified item that went to review under `self_test`, answered with `changes` on a worker
+/// whose agent is gone: the review file and the one-line prompt are written.
+fn sent_back_under(self_test: &str) -> F {
+    let f = setup();
+    if self_test != "targeted" {
+        set_config(
+            &f,
+            "self_test = \"targeted\"",
+            &format!("self_test = \"{self_test}\""),
+        );
+    }
+    require_review(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    f.repo.ok(&["merge", "tick", "--once"]);
+    decide_as(&f, &review_id(&f), "changes:\n- src/greet.rs: no test");
+    f.repo.ok(&["merge", "tick", "--once"]);
+    assert_eq!(send_back_prompts(&f).len(), 1, "the worker was sent back");
+    f
+}
+
+#[test]
+fn the_send_back_after_a_review_follows_a_targeted_self_test() {
+    let f = sent_back_under("targeted");
+    let prompt = &send_back_prompts(&f)[0];
+    assert!(
+        prompt.contains("run the checks from the self-check bullet"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("run the gates"), "{prompt}");
+    let text = std::fs::read_to_string(review_file(&f, 1)).unwrap();
+    assert!(
+        text.contains("Run the checks from the self-check bullet of your brief"),
+        "{text}"
+    );
+    assert!(text.contains("verification runs the full gates again"), "{text}");
+    assert!(
+        !text.contains("Run the gates from the project CLAUDE.md"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_send_back_after_a_review_follows_a_full_self_test() {
+    let f = sent_back_under("full");
+    let prompt = &send_back_prompts(&f)[0];
+    assert!(prompt.contains("run the gates"), "{prompt}");
+    assert!(!prompt.contains("self-check bullet"), "{prompt}");
+    let text = std::fs::read_to_string(review_file(&f, 1)).unwrap();
+    assert!(
+        text.contains("Run the gates from the project CLAUDE.md"),
+        "{text}"
+    );
+    assert!(!text.contains("self-check bullet"), "{text}");
+}
+
+/// The program that `command` (the text before ` issue <sub>` in `text`) names.
+fn program_before<'a>(text: &'a str, command: &str) -> &'a str {
+    let at = text
+        .find(command)
+        .unwrap_or_else(|| panic!("`{command}` not in:\n{text}"));
+    text[..at].rsplit('`').next().unwrap()
+}
+
+#[test]
+fn a_review_and_its_send_back_say_klobuk_when_the_binary_is_on_path_and_hide_the_home_directory() {
+    let f = setup();
+    require_review(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    ok_with_path(&f, &["merge", "tick", "--once"], true);
+    let rid = review_id(&f);
+    let dir = klobuk_dir(&f);
+
+    let brief = kept_review_brief(&f, &rid);
+    assert_eq!(program_before(&brief, " issue comment"), "klobuk", "{brief}");
+    assert!(
+        !brief.contains(&dir),
+        "no binary directory in the review brief:\n{brief}"
+    );
+    let live = std::fs::read_to_string(
+        f.repo
+            .path()
+            .join(".worktrees")
+            .join(&rid)
+            .join(".factory/runs")
+            .join(&rid)
+            .join("brief.md"),
+    )
+    .unwrap();
+    assert_eq!(live, brief, "the kept copy is the brief the reviewer got");
+
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: no test");
+    ok_with_path(&f, &["merge", "tick", "--once"], true);
+    let text = std::fs::read_to_string(review_file(&f, 1)).unwrap();
+    assert_eq!(program_before(&text, " issue finish"), "klobuk", "{text}");
+    assert!(
+        !text.contains(&dir),
+        "no binary directory in the send-back file:\n{text}"
+    );
+}
+
+#[test]
+fn a_review_and_its_send_back_name_the_full_path_when_the_binary_is_not_on_path() {
+    let f = setup();
+    require_review(&f);
+    finished_run(&f, &[("src/greet.rs", "pub fn hello() {}\n")]);
+    ok_with_path(&f, &["merge", "tick", "--once"], false);
+    let rid = review_id(&f);
+
+    let brief = kept_review_brief(&f, &rid);
+    let program = program_before(&brief, " issue comment");
+    assert!(
+        program.contains('/') && program.contains("klobuk"),
+        "{program:?} in:\n{brief}"
+    );
+
+    decide_as(&f, &rid, "changes:\n- src/greet.rs: no test");
+    ok_with_path(&f, &["merge", "tick", "--once"], false);
+    let text = std::fs::read_to_string(review_file(&f, 1)).unwrap();
+    assert_eq!(program_before(&text, " issue finish"), program, "{text}");
+}

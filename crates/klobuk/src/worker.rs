@@ -224,12 +224,51 @@ fn gate_rounds_used_up(ctx: &Ctx, id: &IssueId, rounds: usize) -> Option<String>
     })
 }
 
+/// How an agent is told to call klobuk in a brief or a prompt: the bare `klobuk` when the running binary
+/// is the one a shell finds on `PATH`, else its full path. The full path carries the home directory, and an
+/// agent that copies the command into a comment puts the account name into the public export.
+// shortcut: assumes the agent's shell has the same PATH as this process, upgrade to a probe from inside the
+// agent's own environment if a worker is ever started under a different PATH (the first "command not found").
+pub(crate) fn klobuk_cmd() -> String {
+    klobuk_cmd_for(&crate::ctx::klobuk_bin(), std::env::var_os("PATH").as_deref())
+}
+
+/// [`klobuk_cmd`] for the binary at `full` and the given `PATH` value. The first `klobuk` on `PATH` is the
+/// one a shell runs, so a different file there (or none) keeps the full path.
+fn klobuk_cmd_for(full: &str, path_var: Option<&std::ffi::OsStr>) -> String {
+    const NAME: &str = "klobuk";
+    let on_path = path_var.and_then(|p| {
+        std::env::split_paths(p)
+            .flat_map(|dir| [dir.join(NAME), dir.join("klobuk.exe")])
+            .find(|c| c.is_file())
+    });
+    let same = on_path.is_some_and(|found| {
+        matches!((std::fs::canonicalize(found), std::fs::canonicalize(full)), (Ok(a), Ok(b)) if a == b)
+    });
+    if same {
+        NAME.to_string()
+    } else {
+        full.to_string()
+    }
+}
+
 /// How a sent-back worker checks its fix, the way its brief's self-check bullet says: every gate in
 /// `full`, the fast gates plus its own tests in `targeted` (verification runs the full gates again).
-fn recheck(self_test: SelfTest) -> &'static str {
+pub(crate) fn recheck(self_test: SelfTest) -> &'static str {
     match self_test {
         SelfTest::Full => "run the gates",
         SelfTest::Targeted => "run the checks from the self-check bullet of your brief",
+    }
+}
+
+/// The step of a send-back file that says how the worker checks its fix, by `[worker] self_test`.
+pub(crate) fn fix_check_step(self_test: SelfTest) -> &'static str {
+    match self_test {
+        SelfTest::Full => "Run the gates from the project CLAUDE.md and make them pass.",
+        SelfTest::Targeted => {
+            "Run the checks from the self-check bullet of your brief and make them pass; \
+             verification runs the full gates again after you finish."
+        }
     }
 }
 
@@ -247,15 +286,10 @@ fn fix_todo(fix: Fix, self_test: SelfTest) -> String {
 /// What a worker sent back to fix a gate or a conflict reads first: the evidence as data, then the way
 /// back to `klobuk issue finish`. UTF-8, LF.
 fn fix_file_text(ctx: &Ctx, id: &IssueId, round: usize, failure: &Failure) -> String {
-    let klobuk = crate::ctx::klobuk_bin();
+    let klobuk = klobuk_cmd();
     let report = format!("{FACTORY_DIR}/{RUNS_DIR}/{id}/report.md");
     let main = &ctx.config.repo.default_branch;
-    let check = match ctx.config.worker.self_test {
-        SelfTest::Full => "Run the gates from the project CLAUDE.md and make them pass.".to_string(),
-        SelfTest::Targeted => "Run the checks from the self-check bullet of your brief and make them pass; \
-                               verification runs the full gates again after you finish."
-            .to_string(),
-    };
+    let check = fix_check_step(ctx.config.worker.self_test);
     let (title, what, steps) = match failure.fix {
         Fix::Gate => (
             format!("Gate failure {round} for {id}"),
@@ -1391,7 +1425,10 @@ impl<'a> Worker<'a> {
         let comments = store.comments(&issue.id)?;
         let runs_dir = Self::runs_dir(wt_abs, &issue.id);
         std::fs::create_dir_all(&runs_dir)?;
+        // settings.json keeps the full path (hooks must not depend on PATH); every text an agent reads and
+        // may copy into a comment says `klobuk` when it can
         let klobuk_bin = crate::ctx::klobuk_bin();
+        let klobuk_text = klobuk_cmd();
         let report_rel = format!("{FACTORY_DIR}/{RUNS_DIR}/{}/report.md", issue.id);
         let brief = render_brief(&BriefInput {
             issue,
@@ -1402,7 +1439,7 @@ impl<'a> Worker<'a> {
             branch: &run.branch,
             report_path: &report_rel,
             budget_usd: run.budget_usd.unwrap_or(0.0),
-            klobuk_bin: &klobuk_bin,
+            klobuk_bin: &klobuk_text,
             self_test: self.ctx.config.worker.self_test,
             gates: &self.ctx.config.gates,
         });
@@ -1423,7 +1460,7 @@ impl<'a> Worker<'a> {
         let brief_rel = format!("{FACTORY_DIR}/{RUNS_DIR}/{}/brief.md", issue.id);
         std::fs::write(
             wt_abs.join("CLAUDE.local.md"),
-            render_claude_local(&issue.id, &brief_rel, &klobuk_bin),
+            render_claude_local(&issue.id, &brief_rel, &klobuk_text),
         )?;
         Ok(settings_path)
     }
@@ -1910,9 +1947,14 @@ impl<'a> Worker<'a> {
             worktree: &review.worktree,
             branch: &run.branch,
             gates: &gates,
-            klobuk_bin: &klobuk_bin,
+            klobuk_bin: &klobuk_cmd(),
         });
-        std::fs::write(runs_dir.join("brief.md"), brief)?;
+        std::fs::write(runs_dir.join("brief.md"), &brief)?;
+        // the review worktree is removed after the merge and takes its copy along: keep one next to the
+        // reports, under the review run's id, the way `archive_report` does for the worker's report
+        let kept = self.ctx.root.join(FACTORY_DIR).join(RUNS_DIR).join(&review.id);
+        std::fs::create_dir_all(&kept)?;
+        std::fs::write(kept.join("brief.md"), &brief)?;
 
         let mut allowed: Vec<String> = REVIEW_TOOLS.iter().map(|t| t.to_string()).collect();
         allowed.extend(gates.iter().map(|g| format!("Bash({g})")));
@@ -2618,7 +2660,7 @@ impl<'a> Worker<'a> {
     }
 
     pub fn nudge(&self, id: &IssueId) -> Result<Run, AppError> {
-        let klobuk = crate::ctx::klobuk_bin();
+        let klobuk = klobuk_cmd();
         let text = format!(
             "Reminder from klobuk: when the acceptance criteria hold, commit everything, write {FACTORY_DIR}/{RUNS_DIR}/{id}/report.md \
              and run `{klobuk} issue finish {id} --report {FACTORY_DIR}/{RUNS_DIR}/{id}/report.md`. If you are blocked, post a BLOCKER comment."
@@ -3326,6 +3368,69 @@ mod tests {
             tail: tail.into(),
             attempts: 1,
         }
+    }
+
+    /// A directory holding a file that stands for a `klobuk` binary; returns the dir and the file's
+    /// forward-slash path (what `ctx::klobuk_bin` would give).
+    fn fake_klobuk(prefix: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+        let exe = dir.path().join("klobuk.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let full = exe.to_string_lossy().replace('\\', "/");
+        (dir, full)
+    }
+
+    fn path_of(dirs: &[&Path]) -> std::ffi::OsString {
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    #[test]
+    fn the_bare_name_is_used_when_the_running_binary_is_the_one_on_path() {
+        let (dir, full) = fake_klobuk("klobuk-bin-");
+        let path = path_of(&[dir.path()]);
+        assert_eq!(klobuk_cmd_for(&full, Some(&path)), "klobuk");
+    }
+
+    #[test]
+    fn the_full_path_is_used_when_the_binary_is_not_on_path() {
+        let (_dir, full) = fake_klobuk("klobuk-bin-");
+        let other = tempfile::Builder::new()
+            .prefix("klobuk-other-")
+            .tempdir()
+            .unwrap();
+        let path = path_of(&[other.path()]);
+        assert_eq!(klobuk_cmd_for(&full, Some(&path)), full);
+        assert_eq!(klobuk_cmd_for(&full, None), full, "no PATH at all");
+    }
+
+    #[test]
+    fn the_full_path_is_used_when_another_klobuk_comes_first_on_path() {
+        let (running, full) = fake_klobuk("klobuk-running-");
+        let (shadow, _) = fake_klobuk("klobuk-shadow-");
+        let path = path_of(&[shadow.path(), running.path()]);
+        assert_eq!(
+            klobuk_cmd_for(&full, Some(&path)),
+            full,
+            "`klobuk` in a shell would run the other binary"
+        );
+    }
+
+    #[test]
+    fn a_path_entry_that_is_not_a_directory_is_skipped() {
+        let (dir, full) = fake_klobuk("klobuk-bin-");
+        let missing = dir.path().join("no-such-dir");
+        let path = path_of(&[missing.as_path(), dir.path()]);
+        assert_eq!(klobuk_cmd_for(&full, Some(&path)), "klobuk");
+    }
+
+    #[test]
+    fn only_the_klobuk_name_counts_not_any_binary_in_a_path_directory() {
+        let dir = tempfile::Builder::new().prefix("klobuk-bin-").tempdir().unwrap();
+        let exe = dir.path().join("klobuk-test-1a2b3c.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let full = exe.to_string_lossy().replace('\\', "/");
+        let path = path_of(&[dir.path()]);
+        assert_eq!(klobuk_cmd_for(&full, Some(&path)), full);
     }
 
     #[test]

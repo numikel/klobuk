@@ -18,8 +18,8 @@ use crate::cli::{Cli, MergeCmd};
 use crate::ctx::{Ctx, FACTORY_DIR};
 use crate::output::{AppError, ErrorCode, Rendered};
 use crate::worker::{
-    is_environmental, Failure, Finished, Fix, GateMode, GateSlot, Job, MainJob, MergeJob, Worker, RUNS_DIR,
-    RUN_VERIFIED, SENT_BACK,
+    fix_check_step, is_environmental, klobuk_cmd, recheck, Failure, Finished, Fix, GateMode, GateSlot, Job,
+    MainJob, MergeJob, Worker, RUNS_DIR, RUN_VERIFIED, SENT_BACK,
 };
 
 use super::lane;
@@ -1668,8 +1668,9 @@ fn poll_review(
 
 /// What a worker sent back by a reviewer reads first: the findings as data, then the way back to
 /// `klobuk issue finish`. UTF-8, LF.
-fn review_file_text(id: &IssueId, round: usize, list: &str) -> String {
-    let klobuk = crate::ctx::klobuk_bin();
+fn review_file_text(ctx: &Ctx, id: &IssueId, round: usize, list: &str) -> String {
+    let klobuk = klobuk_cmd();
+    let check = fix_check_step(ctx.config.worker.self_test);
     let report = format!("{FACTORY_DIR}/{RUNS_DIR}/{id}/report.md");
     format!(
         "# Review round {round} for {id}: changes requested\n\n\
@@ -1680,7 +1681,7 @@ fn review_file_text(id: &IssueId, round: usize, list: &str) -> String {
          {list}\n\n\
          ## What to do\n\n\
          1. Fix each finding test-first: write or extend a test that fails for the finding, see it fail, then make it pass.\n\
-         2. Run the gates from the project CLAUDE.md and make them pass.\n\
+         2. {check}\n\
          3. Commit with explicit paths; leave the working tree clean.\n\
          4. Update `{report}` and finish again: `{klobuk} issue finish {id} --report {report}`.\n\
          5. Stop. The orchestrator verifies and queues the branch for the next review round.\n"
@@ -1711,13 +1712,14 @@ fn send_back(
     let written = file
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| std::fs::write(&file, review_file_text(id, round, list)));
+        .and_then(|()| std::fs::write(&file, review_file_text(ctx, id, round, list)));
     if let Err(e) = written {
         return Ok(Err(format!("cannot write {file_rel}: {e}")));
     }
+    let check = recheck(ctx.config.worker.self_test);
     let prompt = format!(
         "The reviewer asked for changes on {id} (review round {round}). Read {file_rel}, fix the findings \
-         test-first, run the gates, commit and finish again the way your brief says."
+         test-first, {check}, commit and finish again the way your brief says."
     );
     let why = format!("sent back to the worker: review round {round} asked for changes");
     let run = match Worker::new(ctx).and_then(|w| w.send_back(id, &prompt, &why)) {

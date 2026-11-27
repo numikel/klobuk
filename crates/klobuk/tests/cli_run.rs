@@ -234,6 +234,102 @@ fn written_brief(f: &F) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+/// `klobuk run start <issue>` with the directory of the test binary first on `PATH` (`on_path`), as when it
+/// is installed, or with every directory that holds a `klobuk` taken off it: the running binary is then the
+/// `klobuk` a shell finds, or it is not.
+fn start_with_path(f: &F, on_path: bool) {
+    let mut cmd = f.repo.klobuk();
+    let dir = Path::new(cmd.get_program()).parent().unwrap().to_path_buf();
+    let rest = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&rest)
+        .filter(|d| !d.join("klobuk.exe").is_file() && !d.join("klobuk").is_file())
+        .collect();
+    if on_path {
+        dirs.insert(0, dir);
+    }
+    let out = cmd
+        .env("PATH", std::env::join_paths(dirs).unwrap())
+        .args(["run", "start", &f.issue, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Every text a started worker reads and may copy into a comment: the brief and `CLAUDE.local.md`.
+fn worker_texts(f: &F) -> String {
+    format!(
+        "{}\n{}",
+        written_brief(f),
+        std::fs::read_to_string(wt(f).join("CLAUDE.local.md")).unwrap()
+    )
+}
+
+/// The program named right before `command` in `text`, between the backticks of a quoted command.
+fn program_before<'a>(text: &'a str, command: &str) -> &'a str {
+    let at = text
+        .find(command)
+        .unwrap_or_else(|| panic!("`{command}` not in:\n{text}"));
+    text[..at].rsplit('`').next().unwrap()
+}
+
+#[test]
+fn start_says_klobuk_in_every_text_a_worker_reads_when_the_binary_is_on_path() {
+    let f = setup();
+    start_with_path(&f, true);
+    let texts = worker_texts(&f);
+    for command in [
+        " issue inbox",
+        " issue finish",
+        " issue comment",
+        " issue handoff",
+    ] {
+        assert_eq!(program_before(&texts, command), "klobuk", "{command}:\n{texts}");
+    }
+    let bin_dir = Path::new(f.repo.klobuk().get_program())
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(
+        !texts.contains(&bin_dir),
+        "the binary's directory leaks:\n{texts}"
+    );
+    for home in ["USERPROFILE", "HOME"] {
+        if let Some(h) = std::env::var_os(home).map(|h| h.to_string_lossy().replace('\\', "/")) {
+            assert!(!texts.contains(&h), "{home} leaks:\n{texts}");
+        }
+    }
+    // the hooks in settings.json do not depend on PATH: they keep the full path, and the permission rule for it
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(wt(&f).join(".factory/runs").join(&f.issue).join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    let stop = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(stop.contains('/') && stop.ends_with("hook stop"), "{stop}");
+}
+
+#[test]
+fn start_names_the_full_path_in_every_text_when_the_binary_is_not_on_path() {
+    let f = setup();
+    start_with_path(&f, false);
+    let texts = worker_texts(&f);
+    let first = program_before(&texts, " issue inbox");
+    assert!(
+        first.contains('/') && first.contains("klobuk"),
+        "{first:?}:\n{texts}"
+    );
+    for command in [" issue finish", " issue comment", " issue handoff"] {
+        assert_eq!(program_before(&texts, command), first, "{command}:\n{texts}");
+    }
+}
+
 #[test]
 fn start_writes_a_targeted_self_check_by_default_with_the_gates_of_the_config() {
     let f = setup();

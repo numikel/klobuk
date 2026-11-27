@@ -278,9 +278,29 @@ With `[review] required = true` (or a label from `[review] on_labels`) the queue
 stage after the gates: a second worker with a clean context, running on `[review] model` (default
 `opus`), gets a detached checkout of the branch in `.worktrees/<review-id>`, read-only tools and a
 brief with the diff and the acceptance criteria. It never edits; it ends with one DECISION comment
-on the issue. `approve` lets the merge continue. `changes:` with findings writes them to
+on the issue.
+
+The reviewer settles every acceptance criterion in one of three ways: it reads it from the diff, it
+runs it, or it lists it on a `Not run:` line. For every criterion that can only be known by running a
+command (a `verify` command, a dry run of a publish, a targeted test) the reviewer runs that command
+itself; a sentence in the author's report is not evidence. Two cases are exempt, and the brief names
+both so nothing is skipped silently: the gates the queue already ran on this exact commit (listed in
+the brief, never rerun), and a check that needs a write, such as editing a file to prove that a test
+fails, which a read-only reviewer cannot do. The verdict carries a plain `Ran:` line with the commands
+it ran and a plain `Not run:` line with every criterion it did not run and the reason (`queue gate`
+or `needs a write`; `Not run: none` when there is nothing to list). A criterion that is neither
+readable from the diff, nor run, nor on `Not run:` is a reason for `changes`. The `Not run:` line is
+for you: it is read as part of the verdict but never sent to the author as a finding. The review
+brief is kept under `.factory/runs/<review-run-id>/brief.md` in the repository, next to the
+reports, because the review worktree is removed after the merge. Briefs and send-back files call
+`klobuk` by its bare name when the running binary is the one on `PATH` and by its full path
+otherwise, so the account's home directory stays out of anything an agent may quote in a comment.
+
+`approve` lets the merge continue. `changes:` with findings writes them to
 `.factory/runs/<id>/review-<n>.md` in the worker's worktree, prompts the worker with one line and
-reopens its run; the worker fixes, runs the gates and finishes again, and the same queue item is
+reopens its run; the worker fixes, runs the checks its brief names (every gate with
+`worker.self_test = full`, the fast gates and its own tests with `targeted`, the default) and
+finishes again, and the same queue item is
 re-queued without an operator command. Only when the worker cannot be reached do you get a BLOCKER
 with the findings and `klobuk merge retry <id>`. The review issue and its run are closed as soon as
 the verdict is read, so reviewers never hold worker slots; at most `[review] max_parallel`
