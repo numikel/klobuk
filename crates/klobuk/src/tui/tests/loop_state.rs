@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::tui::snapshot::LoopInfo;
-use klobuk_store::serve_pulse::{LoopState, ServeMode};
+use klobuk_store::serve_pulse::{LoopState, PulseWait, ServeMode};
 
 fn with_loop(mut s: Snapshot, state: LoopState, mode: ServeMode) -> Snapshot {
     s.serve = Some(LoopInfo { state, mode });
@@ -11,7 +11,26 @@ fn with_loop(mut s: Snapshot, state: LoopState, mode: ServeMode) -> Snapshot {
 }
 
 fn running(mode: ServeMode, age_s: i64) -> LoopState {
-    LoopState::Running { mode, age_s }
+    LoopState::Running {
+        mode,
+        age_s,
+        waiting: Vec::new(),
+    }
+}
+
+/// A loop that is alive and idle: it waits for the owner on `what`.
+fn waiting(what: &[(&str, &str)]) -> LoopState {
+    LoopState::Running {
+        mode: ServeMode::Dispatch,
+        age_s: 4,
+        waiting: what
+            .iter()
+            .map(|(issue, what)| PulseWait {
+                issue: (*issue).into(),
+                what: (*what).into(),
+            })
+            .collect(),
+    }
 }
 
 fn stopped(reason: Option<&str>, age_s: i64) -> LoopState {
@@ -44,6 +63,45 @@ fn the_header_shows_a_fresh_loop_dim_with_its_age() {
     );
     let (_, m) = cell_style(&a, "klobuk ·", "loop ok 12 s");
     assert!(m.contains(Modifier::DIM), "{m:?}");
+}
+
+#[test]
+fn the_header_says_the_loop_is_alive_and_waiting_for_you_and_for_what() {
+    let one = with_loop(snapshot(), waiting(&[("asf-7", "question")]), ServeMode::Dispatch);
+    let a = app_on(View::Board, one);
+    assert!(
+        header(&a).contains("runtime ok · loop waiting for you: asf-7 question · workers"),
+        "{}",
+        header(&a)
+    );
+    let (_, m) = cell_style(&a, "klobuk ·", "loop waiting for you");
+    assert!(
+        !m.contains(Modifier::DIM),
+        "it asks for attention, so it is not dim: {m:?}"
+    );
+    let many = with_loop(
+        snapshot(),
+        waiting(&[("asf-7", "worker waits for input"), ("asf-9", "issue blocked")]),
+        ServeMode::Dispatch,
+    );
+    assert!(
+        header(&app_on(View::Board, many))
+            .contains("loop waiting for you: asf-7 worker waits for input (+1)"),
+        "the most urgent first, the rest counted"
+    );
+}
+
+#[test]
+fn a_waiting_loop_is_alive_so_it_has_no_stopped_banner() {
+    let s = with_loop(snapshot(), waiting(&[("asf-7", "question")]), ServeMode::Dispatch);
+    assert_eq!(s.loop_notice(), None);
+    for view in View::ALL.iter().copied().filter(|v| *v != View::Now) {
+        let text = render_to_text(&app_on(view, s.clone()), 120, 30);
+        assert!(
+            !text.contains("the loop stopped") && !text.contains("LOOP STOPPED"),
+            "{view:?}:\n{text}"
+        );
+    }
 }
 
 #[test]

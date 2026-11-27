@@ -200,9 +200,10 @@ fn until_done_reports_stuck_with_exit_3_and_ok_true() {
 fn until_done_with_dispatch_is_stuck_only_when_the_plan_has_no_slot() {
     let repo = Repo::initialised();
     use_fake_runtime(&repo);
-    // `a` is blocked by hand, so `b` can never be promoted and nothing is plannable or running
+    // `a` is cancelled, so `b` can never be promoted: a dead end, nothing is plannable or running and
+    // nothing waits for the owner (a `blocked` `a` would, see `until_done_waits_for_what_the_owner_can_resolve`)
     let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
-    repo.ok(&["issue", "status", &a, "blocked"]);
+    repo.ok(&["issue", "status", &a, "cancelled"]);
     repo.create_issue("b", &["--dep", &a, "--scope", "src/b.rs"]);
     // this test is about `stuck`: no alert report may precede the single summary object
     set_notify(&repo, "[notify]\non_new = false\n");
@@ -210,7 +211,12 @@ fn until_done_with_dispatch_is_stuck_only_when_the_plan_has_no_slot() {
     assert_eq!(code, 3, "{v}");
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["result"]["reason"], "stuck", "{v}");
-    assert_eq!(v["result"]["open"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!(v["result"]["open"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(
+        v["result"]["waiting"],
+        serde_json::json!([]),
+        "nothing asks for the owner: {v}"
+    );
 }
 
 #[test]
@@ -282,6 +288,8 @@ fn until_done_flag_combinations_are_usage_errors() {
         &["serve", "--once", "--until-done"][..],
         &["serve", "--max-ticks", "2"][..],
         &["serve", "--until-done", "--max-ticks", "0"][..],
+        &["serve", "--exit-when-waiting"][..],
+        &["serve", "--once", "--exit-when-waiting"][..],
     ] {
         let out = repo.klobuk().args(args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
@@ -589,17 +597,32 @@ fn serve_once_reports_questions_waiting_in_json_and_text() {
 fn until_done_summary_reports_questions_waiting_until_they_are_answered() {
     let repo = Repo::initialised();
     use_fake_runtime(&repo);
-    // without --dispatch nothing is ever started: the loop is stuck after one tick
+    // without --dispatch nothing is ever started; --exit-when-waiting ends the loop after one tick
+    // although the question could be answered (the default would wait for it)
     let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
     let qid = ask_human(&repo, &a, "which crate?");
 
-    let (v, code) = last_line_json(&repo, &["serve", "--until-done"]);
+    let (v, code) = last_line_json(&repo, &["serve", "--until-done", "--exit-when-waiting"]);
     assert_eq!(code, 3, "{v}");
     assert_eq!(v["result"]["reason"], "stuck", "{v}");
     assert_eq!(v["result"]["questions_waiting"], 1, "{v}");
-    let human = repo.klobuk().args(["serve", "--until-done"]).output().unwrap();
+    assert_eq!(
+        v["result"]["waiting"],
+        serde_json::json!([{ "issue": a.clone(), "kind": "question", "reason": "which crate?" }]),
+        "{v}"
+    );
+    let human = repo
+        .klobuk()
+        .args(["serve", "--until-done", "--exit-when-waiting"])
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(3));
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(text.contains("1 waiting for you"), "{text}");
+    assert!(
+        text.contains(&format!("waits for you: {a}: question — which crate?")),
+        "{text}"
+    );
 
     repo.ok(&[
         "--lane",
@@ -622,7 +645,242 @@ fn until_done_summary_reports_questions_waiting_until_they_are_answered() {
         "an answered question stops counting: {v}"
     );
     let human = repo.klobuk().args(["serve", "--until-done"]).output().unwrap();
+    assert_eq!(
+        human.status.code(),
+        Some(3),
+        "answered, nothing waits for the owner and nothing starts without --dispatch: a dead end"
+    );
     assert!(!String::from_utf8_lossy(&human.stdout).contains("waiting for you"));
+}
+
+// ---- waiting for the owner is the default of --until-done (asf-217) ----
+
+/// The pulse the loop keeps writing, or `Null` for the instant a rewrite makes it unreadable.
+fn pulse_now(repo: &Repo) -> serde_json::Value {
+    std::fs::read_to_string(repo.path().join(".factory/runs/serve.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// `(issue, what)` of what the pulse says the idle loop waits for.
+fn pulse_waiting(repo: &Repo) -> Vec<(String, String)> {
+    pulse_now(repo)["waiting"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|w| {
+                    (
+                        w["issue"].as_str().unwrap_or_default().to_string(),
+                        w["what"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The notice the loop prints when it becomes idle on the owner (the summary has a `reason`, it has not).
+fn waiting_notice(lines: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    lines.iter().find(|l| {
+        l["result"]["reason"].is_null() && l["result"]["waiting"].as_array().is_some_and(|w| !w.is_empty())
+    })
+}
+
+#[test]
+fn until_done_waits_for_a_blocked_worker_and_finishes_the_work_after_the_answer() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let a = repo.create_issue("a", &["--ready", "--scope", "src/**"]);
+    repo.ok(&["run", "start", &a]);
+    // the worker sits on a permission prompt: `run watch` (the loop's first tick) turns the run `blocked`
+    fake_runtime(&repo)
+        .script(serde_json::json!({ "info": [{"state": "blocked"}], "screen": "Allow Bash(rm -rf)? (y/n)" }))
+        .unwrap();
+
+    let mut live = LiveServe::start(&repo, &LOOP);
+    assert_eq!(
+        live.first["result"]["watch"]["transitions"][0]["to"], "blocked",
+        "{}",
+        live.first
+    );
+    // nothing runs and the only obstacle is the owner: the loop says so and does not exit
+    live.wait_until(|lines| waiting_notice(lines).is_some());
+    let notice = waiting_notice(&live.seen).unwrap().clone();
+    assert_eq!(notice["result"]["waiting"][0]["issue"], a.as_str(), "{notice}");
+    assert_eq!(notice["result"]["waiting"][0]["kind"], "run_blocked", "{notice}");
+    live.wait_until(|_| pulse_waiting(&repo) == [(a.clone(), "worker waits for input".to_string())]);
+    // still alive: the pulse keeps ticking while it waits
+    let ticks = pulse_now(&repo)["ticks"].as_u64().unwrap_or(0);
+    live.wait_until(|_| pulse_now(&repo)["ticks"].as_u64().unwrap_or(0) >= ticks + 2);
+    assert!(live.running());
+
+    // the owner answers; the worker does its job and finishes. Nobody restarts the loop.
+    repo.ok(&["run", "reply", &a, "y"]);
+    let wt = repo.path().join(".worktrees").join(&a);
+    commit_in(&wt, "src/x.rs", "x\n");
+    let report = wt.join(".factory").join("runs").join(&a).join("report.md");
+    std::fs::write(&report, "# done\n").unwrap();
+    repo.ok(&[
+        "--lane",
+        &a,
+        "issue",
+        "finish",
+        &a,
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+
+    let (lines, stderr) = live.finish();
+    let summary = &lines.last().expect("the summary")["result"];
+    assert_eq!(summary["reason"], "all_done", "{lines:?}\n{stderr}");
+    assert_eq!(summary["waiting"], serde_json::json!([]), "{summary}");
+    let status = repo.ok(&["issue", "show", &a])["issue"]["status"].clone();
+    assert_eq!(status, "done", "{lines:?}");
+    let p = pulse_now(&repo);
+    assert_eq!(p["stop_reason"], "all_done", "{p}");
+    assert_eq!(
+        p["waiting"],
+        serde_json::json!([]),
+        "a stopped loop waits for nobody: {p}"
+    );
+}
+
+#[test]
+fn until_done_waits_for_what_the_owner_can_resolve_and_the_dead_ends_still_exit() {
+    // A question nobody answered and a blocked issue are things only the owner can resolve; the loop
+    // (no --dispatch here, so nothing could start by itself) must wait for them, not exit `stuck`.
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let q = repo.create_issue("asks", &["--scope", "src/q.rs"]);
+    let qid = ask_human(&repo, &q, "which crate?");
+    let blocked = repo.create_issue("blocked", &["--scope", "src/b.rs"]);
+    repo.ok(&["issue", "status", &blocked, "blocked"]);
+
+    let mut live = LiveServe::start(&repo, &LOOP);
+    live.wait_until(|lines| waiting_notice(lines).is_some());
+    let notice = waiting_notice(&live.seen).unwrap().clone();
+    let kinds: Vec<(String, String)> = notice["result"]["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| {
+            (
+                w["issue"].as_str().unwrap().to_string(),
+                w["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (q.clone(), "question".to_string()),
+            (blocked.clone(), "issue_blocked".to_string())
+        ],
+        "the most urgent first: {notice}"
+    );
+    live.wait_until(|_| pulse_waiting(&repo).len() == 2);
+
+    // the owner unblocks the issue and answers the question: nothing waits any more and nothing can
+    // start without --dispatch, so what remains is a dead end and the loop ends `stuck`, exit 3
+    repo.ok(&["issue", "status", &blocked, "ready"]);
+    repo.ok(&[
+        "--lane",
+        "human",
+        "issue",
+        "comment",
+        &q,
+        "--type",
+        "ANSWER",
+        "--to",
+        &q,
+        "--reply-to",
+        &qid.to_string(),
+        "--body",
+        "klobuk-core",
+    ]);
+    let (lines, stderr) = live.finish();
+    let summary = &lines.last().expect("the summary")["result"];
+    assert_eq!(summary["reason"], "stuck", "{lines:?}\n{stderr}");
+    assert_eq!(summary["waiting"], serde_json::json!([]), "{summary}");
+}
+
+#[test]
+fn exit_when_waiting_ends_the_loop_where_the_default_waits() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
+    repo.ok(&["issue", "status", &a, "blocked"]);
+
+    // the old behaviour, for scripts that want the exit code
+    let (v, code) = last_line_json(&repo, &["serve", "--until-done", "--exit-when-waiting"]);
+    assert_eq!(code, 3, "{v}");
+    assert_eq!(v["result"]["reason"], "stuck", "{v}");
+    assert_eq!(v["result"]["waiting"][0]["issue"], a.as_str(), "{v}");
+    assert_eq!(v["result"]["waiting"][0]["kind"], "issue_blocked", "{v}");
+    assert_eq!(pulse_now(&repo)["stop_reason"], "stuck");
+
+    // the same repository without the flag keeps waiting
+    let mut live = LiveServe::start(&repo, &LOOP);
+    live.wait_until(|_| pulse_waiting(&repo) == [(a.clone(), "issue blocked".to_string())]);
+    assert!(live.running());
+    live.stop();
+}
+
+#[test]
+fn max_ticks_ends_a_loop_in_both_modes() {
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let a = repo.create_issue("a", &["--scope", "src/a.rs"]);
+    repo.ok(&["issue", "status", &a, "blocked"]);
+    // waiting (the default): only the limit ends the loop, and that is not a failure
+    let (v, code) = last_line_json(
+        &repo,
+        &["serve", "--until-done", "--max-ticks", "2", "--interval", "1"],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["result"]["reason"], "max_ticks", "{v}");
+    assert_eq!(v["result"]["ticks"], 2, "{v}");
+    assert_eq!(v["result"]["waiting"][0]["issue"], a.as_str(), "{v}");
+
+    // --exit-when-waiting: work that keeps the loop busy is still cut by the limit
+    let repo = Repo::initialised();
+    use_fake_runtime(&repo);
+    let b = repo.create_issue("b", &["--ready", "--scope", "src/b.rs"]);
+    let (v, code) = last_line_json(
+        &repo,
+        &[
+            "serve",
+            "--until-done",
+            "--exit-when-waiting",
+            "--dispatch",
+            "--max-ticks",
+            "2",
+            "--interval",
+            "1",
+        ],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["result"]["reason"], "max_ticks", "{v}");
+    assert_eq!(v["result"]["open"], serde_json::json!([b]), "{v}");
+}
+
+#[test]
+fn the_reminders_keep_firing_while_the_loop_waits() {
+    let (repo, id) = repo_with_an_old_blocked_issue();
+    set_notify(&repo, "[notify]\non_new = false\n");
+
+    let mut live = LiveServe::start(&repo, &LOOP);
+    assert_eq!(
+        live.first["result"]["reminders"][0]["issue"],
+        id.as_str(),
+        "{}",
+        live.first
+    );
+    live.wait_until(|_| pulse_waiting(&repo) == [(id.clone(), "issue blocked".to_string())]);
+    assert!(live.running(), "the loop waits for the owner, it does not exit");
+    live.stop();
+    assert_eq!(notifications(&repo).len(), 1, "the reminder went out once");
 }
 
 /// A repository on the fake runtime with one blocked issue that has waited since 2020.

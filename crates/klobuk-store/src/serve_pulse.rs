@@ -51,6 +51,14 @@ impl ServeMode {
     }
 }
 
+/// One thing the loop waits for the owner on: the issue and a few plain words (`question`,
+/// `worker waits for input`). Written only while `klobuk serve --until-done` is idle on the owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PulseWait {
+    pub issue: String,
+    pub what: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pulse {
     pub pid: u32,
@@ -63,6 +71,10 @@ pub struct Pulse {
     #[serde(default = "default_start_timeout_s")]
     pub start_timeout_s: u64,
     pub ticks: u64,
+    /// What the loop is idle on right now: it is alive, has nothing to run and waits for the owner. Empty
+    /// while it works, and after a stop. A pulse written before the field existed reads as empty.
+    #[serde(default)]
+    pub waiting: Vec<PulseWait>,
     /// Set by a clean stop only.
     pub stopped_at: Option<String>,
     /// `all_done`, `max_ticks`, `stuck`, `interrupted` or `error: <message>`.
@@ -80,9 +92,17 @@ impl Pulse {
             max_ticks,
             start_timeout_s: DEFAULT_START_TIMEOUT_S,
             ticks: 0,
+            waiting: Vec::new(),
             stopped_at: None,
             stop_reason: None,
         }
+    }
+
+    /// Records what the idle loop waits for (empty: it is not idle on the owner). Returns whether it changed.
+    pub fn set_waiting(&mut self, waiting: Vec<PulseWait>) -> bool {
+        let changed = self.waiting != waiting;
+        self.waiting = waiting;
+        changed
     }
 
     /// Records a finished tick.
@@ -100,6 +120,7 @@ impl Pulse {
     pub fn stop(&mut self, reason: impl Into<String>, now: &str) {
         self.stopped_at = Some(now.to_string());
         self.stop_reason = Some(reason.into());
+        self.waiting.clear();
     }
 }
 
@@ -112,6 +133,8 @@ pub enum LoopState {
         mode: ServeMode,
         /// Seconds since the last tick.
         age_s: i64,
+        /// What the loop is idle on (see [`Pulse::waiting`]); empty while it works.
+        waiting: Vec<PulseWait>,
     },
     Stopped {
         /// `None`: it stopped without saying why (killed, crashed, machine restarted).
@@ -178,7 +201,11 @@ pub fn judge(pulse: Option<&Pulse>, now: OffsetDateTime, pid_alive: Option<bool>
     if age_s as u64 > stale_after_s(p) || pid_alive == Some(false) {
         return stopped(None, &p.last_tick_at);
     }
-    LoopState::Running { mode: p.mode, age_s }
+    LoopState::Running {
+        mode: p.mode,
+        age_s,
+        waiting: p.waiting.clone(),
+    }
 }
 
 impl LoopState {
@@ -186,10 +213,26 @@ impl LoopState {
         matches!(self, LoopState::Running { .. })
     }
 
-    /// The header segment: `loop ok 12 s`, `loop observe`, `LOOP STOPPED 14 min`, `loop not running`.
+    /// Alive, idle, and waiting for the owner (see [`Pulse::waiting`]).
+    pub fn is_waiting(&self) -> bool {
+        matches!(self, LoopState::Running { waiting, .. } if !waiting.is_empty())
+    }
+
+    /// The header segment: `loop ok 12 s`, `loop observe`, `loop waiting for you: asf-7 question (+2)`,
+    /// `LOOP STOPPED 14 min`, `loop not running`.
     pub fn header(&self) -> String {
         match self {
             LoopState::NeverStarted => "loop not running".into(),
+            LoopState::Running { waiting, .. } if !waiting.is_empty() => {
+                let more = match waiting.len() - 1 {
+                    0 => String::new(),
+                    n => format!(" (+{n})"),
+                };
+                format!(
+                    "loop waiting for you: {} {}{more}",
+                    waiting[0].issue, waiting[0].what
+                )
+            }
             LoopState::Running {
                 mode: ServeMode::Observe,
                 ..
@@ -257,7 +300,7 @@ impl LoopState {
                 Some("max_ticks") => format!(
                     "The loop reached its tick limit ({ticks} tick(s)): `--max-ticks` or `[serve] max_ticks`. Leave the limit out or raise it."
                 ),
-                Some("stuck") => "Nothing is running and nothing can start without you: answer the question or unblock the issue, then start the loop.".to_string(),
+                Some("stuck") => "Nothing is running and nothing can start. If something waits for you (a question, a blocked issue or run), the loop was started with `--exit-when-waiting`: answer or unblock it, then start the loop. If nothing does, the open issues cannot move on their own (a dependency that can never close, a ready issue without `--dispatch`).".to_string(),
                 Some("all_done") => "Every open issue is finished.".to_string(),
                 Some(other) => format!("The loop stopped with: {other}."),
             },
@@ -346,7 +389,8 @@ mod tests {
             judge(Some(&p), at(112), None),
             LoopState::Running {
                 mode: ServeMode::Dispatch,
-                age_s: 12
+                age_s: 12,
+                waiting: Vec::new(),
             }
         );
     }
@@ -455,7 +499,11 @@ mod tests {
 
     #[test]
     fn header_texts() {
-        let running = |mode, age_s| LoopState::Running { mode, age_s };
+        let running = |mode, age_s| LoopState::Running {
+            mode,
+            age_s,
+            waiting: Vec::new(),
+        };
         assert_eq!(running(ServeMode::Dispatch, 12).header(), "loop ok 12 s");
         assert_eq!(running(ServeMode::Observe, 12).header(), "loop observe");
         assert_eq!(LoopState::NeverStarted.header(), "loop not running");
@@ -499,6 +547,7 @@ mod tests {
         let running = LoopState::Running {
             mode: ServeMode::Dispatch,
             age_s: 1,
+            waiting: Vec::new(),
         };
         assert_eq!(running.banner(ServeMode::Dispatch, None), None);
     }
@@ -523,6 +572,7 @@ mod tests {
         let running = LoopState::Running {
             mode: ServeMode::Observe,
             age_s: 1,
+            waiting: Vec::new(),
         };
         assert_eq!(running.explain(ServeMode::Observe, None), None);
         let never = LoopState::NeverStarted.explain(ServeMode::Observe, None).unwrap();
@@ -548,6 +598,45 @@ mod tests {
         );
         std::fs::write(pulse_path(dir.path()), "{ not json").unwrap();
         assert!(read(dir.path()).is_err());
+    }
+
+    fn wait(issue: &str, what: &str) -> PulseWait {
+        PulseWait {
+            issue: issue.into(),
+            what: what.into(),
+        }
+    }
+
+    #[test]
+    fn an_idle_loop_says_what_it_waits_for_and_is_still_running() {
+        let mut p = pulse(10);
+        assert!(p.set_waiting(vec![wait("asf-7", "question"), wait("asf-9", "issue blocked")]));
+        assert!(!p.set_waiting(p.waiting.clone()), "the same list is no change");
+        let state = judge(Some(&p), at(5), Some(true));
+        assert!(state.is_running() && state.is_waiting(), "{state:?}");
+        assert_eq!(state.header(), "loop waiting for you: asf-7 question (+1)");
+        assert_eq!(state.banner(ServeMode::Dispatch, None), None, "alive: no banner");
+        p.set_waiting(vec![wait("asf-7", "worker waits for input")]);
+        assert_eq!(
+            judge(Some(&p), at(5), None).header(),
+            "loop waiting for you: asf-7 worker waits for input"
+        );
+        p.set_waiting(Vec::new());
+        let state = judge(Some(&p), at(5), None);
+        assert!(!state.is_waiting());
+        assert_eq!(state.header(), "loop ok 5 s");
+    }
+
+    #[test]
+    fn a_stop_clears_what_the_loop_waited_for_and_an_old_pulse_reads_as_not_waiting() {
+        let mut p = pulse(10);
+        p.set_waiting(vec![wait("asf-7", "question")]);
+        p.stop("max_ticks", &ts(9));
+        assert!(p.waiting.is_empty());
+        let mut v = serde_json::to_value(pulse(10)).unwrap();
+        v.as_object_mut().unwrap().remove("waiting");
+        let old: Pulse = serde_json::from_value(v).unwrap();
+        assert!(old.waiting.is_empty());
     }
 
     #[test]

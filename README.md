@@ -214,10 +214,33 @@ klobuk run start mp-3 --approve <inputs_hash>   # refuses if the plan changed si
 ```
 
 `klobuk serve --once` runs a single tick, which is handy in scripts and tests. For an unattended
-run use `klobuk serve --dispatch --until-done [--max-ticks N]`: the loop stops on its own and prints a
-summary with the reason `all_done` (exit 0), `max_ticks` (exit 0) or `stuck` (exit 3: open issues
-remain but no worker is active, nothing is queued and the plan has no slot, which includes workers
-waiting for your answer).
+run use `klobuk serve --dispatch --until-done [--max-ticks N] [--exit-when-waiting]`: the loop stops
+on its own and prints a summary with the reason `all_done` (exit 0), `max_ticks` (exit 0) or `stuck`
+(exit 3). Errors exit 1, a wrong combination of flags 2.
+
+**Waiting for you is the default.** When nothing runs and nothing can start, the loop looks at why.
+If something asks for you, it is *parked*: it stays alive, keeps ticking (reminders and
+notifications go on) and picks the work up as soon as you answer, with no restart. These wait for you:
+
+- a worker waiting for input (a permission prompt, an AskUserQuestion), and a stalled, over-budget
+  or failed run;
+- an unanswered QUESTION to `human`;
+- an issue in `blocked`;
+- a failed or blocked merge item.
+
+It is the same list as the NEEDS YOU rows of the TUI. When nothing asks for you, the loop is at a
+true dead end and ends with `stuck` (exit 3): an open issue that depends on a cancelled issue (or on
+a cycle), or a `ready` issue when the loop runs without `--dispatch`, because no answer can change
+that.
+
+While it waits, the loop says so: it prints one notice (`serve is alive and waiting for you`) with
+what it waits for, writes it to the pulse (`.factory/runs/serve.json`, field `waiting`), and the TUI
+header reads `loop waiting for you: mp-3 question (+1)`. The summary lists the same under `waiting`.
+
+Scripts that want the exit code instead of a patient loop pass `--exit-when-waiting`: the loop then
+ends with `stuck` (exit 3) as soon as nothing runs or can start, whether or not something waits for
+you, and the summary names what it was. `--max-ticks N` ends the loop in both modes with `max_ticks`
+(exit 0).
 
 ### 5. Watch and answer
 
@@ -521,7 +544,7 @@ reported and never fatal.
 | `klobuk lane list` / `check` / `clean <id> [--dry-run]` | Claims and worktrees |
 | `klobuk method list` / `validate <dir>` | Methodologies |
 | `klobuk gh sync [--dry-run]` | Mirror issues to GitHub |
-| `klobuk serve [--interval s] [--once] [--dispatch] [--until-done [--max-ticks N]]` | The orchestrator loop; `--until-done` stops with `all_done`, `max_ticks` or `stuck` |
+| `klobuk serve [--interval s] [--once] [--dispatch] [--until-done [--max-ticks N] [--exit-when-waiting]]` | The orchestrator loop; `--until-done` stops with `all_done` (exit 0), `max_ticks` (0) or `stuck` (3), and waits for you while something asks for you unless `--exit-when-waiting` |
 | `klobuk tui [--view board\|agents\|inbox\|queue\|log\|config] [--once]` | Terminal UI |
 | `klobuk export [--out f] [--strict]` / `klobuk import <f> [--mode upsert\|replace]` | JSONL export and import; the export rewrites home paths to `~` and warns about e-mail addresses and secret-like strings, `--strict` exits 1 on a warning |
 | `klobuk hook pre-tool\|post-tool\|stop\|status` | Claude Code hooks (called by the worker's settings, not by you) |

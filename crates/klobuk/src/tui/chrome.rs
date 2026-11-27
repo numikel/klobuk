@@ -55,7 +55,8 @@ fn header_line(app: &App) -> Line<'static> {
     // right after the runtime so a narrow terminal never cuts it off
     if let Some(info) = &s.serve {
         spans.push(Span::raw(" · "));
-        let style = if info.state.is_running() {
+        // alive but idle on the owner is warn too: the loop is fine, it waits for you
+        let style = if info.state.is_running() && !info.state.is_waiting() {
             t.dim()
         } else {
             t.warn()

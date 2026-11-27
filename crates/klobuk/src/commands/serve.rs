@@ -13,7 +13,18 @@
 //! it runs the gates inside the call and returns when they are done.
 //!
 //! `--until-done` also checks after each tick whether to stop (`all_done`, `stuck`, `max_ticks`)
-//! and prints a final `{ticks, reason, open, runs, questions_waiting}` summary.
+//! and prints a final `{ticks, reason, open, runs, questions_waiting, waiting}` summary.
+//!
+//! **Waiting is the default.** Nothing runs, nothing can start and open issues remain: that is either
+//! a loop *parked on the owner* or a true dead end, and the line between them is `owner_waits`, the
+//! definition that the NEEDS YOU rows and the reminders use (a BLOCKER announcement apart, which
+//! fades by itself). Parked on the owner: a worker waiting for input, an unanswered QUESTION to the
+//! human, a blocked issue, a stalled, over-budget or failed run, a failed or blocked merge item. The
+//! loop keeps ticking, announces once what it waits for, writes it to the pulse and goes on when the
+//! answer arrives. A dead end ends with `stuck` (exit 3): nothing asks for the owner, so no answer
+//! can change anything (a dependency on a cancelled issue or in a cycle, a ready issue when the loop
+//! runs without `--dispatch`). `--exit-when-waiting` ends a parked loop with `stuck` too, for
+//! scripts that want the exit code. `--max-ticks` ends either mode.
 //!
 //! The config is re-read at the start of every tick (see `ConfigWatch`), so edits take effect
 //! without restarting the loop. Tick reports and the summary carry `questions_waiting`: the
@@ -33,8 +44,9 @@
 use std::io::Write;
 use std::time::Duration;
 
+use klobuk_core::remind::{EventIndex, WaitKind};
 use klobuk_core::{IssueFilter, IssueId, IssueStore, IssueType, MergeState, RunState};
-use klobuk_store::serve_pulse::{self, LoopState, Pulse, ServeMode};
+use klobuk_store::serve_pulse::{self, LoopState, Pulse, PulseWait, ServeMode};
 use serde::Serialize;
 use serde_json::json;
 
@@ -88,6 +100,55 @@ fn questions_waiting(ctx: &Ctx) -> Result<usize, AppError> {
         n += unanswered_questions(&ctx.store.comments(&issue.id)?).len();
     }
     Ok(n + blocked_runs(ctx.store.runs(None, true)?.iter().map(|r| r.state)))
+}
+
+/// One thing the idle loop waits for the owner on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OwnerWait {
+    pub issue: IssueId,
+    pub kind: WaitKind,
+    /// A few plain words on why (a question's text, a merge error); may be empty.
+    pub reason: String,
+}
+
+impl OwnerWait {
+    /// What the pulse, the TUI header and the notice call it.
+    fn what(&self) -> &'static str {
+        match self.kind {
+            WaitKind::Question => "question",
+            WaitKind::RunBlocked => "worker waits for input",
+            WaitKind::RunStalled => "worker stalled",
+            WaitKind::RunOverBudget => "worker over budget",
+            WaitKind::RunFailed => "run failed",
+            WaitKind::IssueBlocked => "issue blocked",
+            WaitKind::MergeFailed => "merge failed",
+            WaitKind::MergeBlocked => "merge blocked",
+            WaitKind::Blocker => "blocker",
+        }
+    }
+
+    fn line(&self) -> String {
+        match self.reason.as_str() {
+            "" => format!("{}: {}", self.issue, self.what()),
+            r => format!("{}: {} — {r}", self.issue, self.what()),
+        }
+    }
+}
+
+/// What waits for the owner right now, most urgent first: the NEEDS YOU / reminder rule
+/// (`remind::collect`). A BLOCKER comment is left out: it is an announcement that fades after hours, not
+/// a state, and whatever it blocks shows up as a blocked issue or run.
+fn owner_waits(ctx: &Ctx) -> Result<Vec<OwnerWait>, AppError> {
+    let now = time::OffsetDateTime::now_utc();
+    Ok(remind::collect(ctx, &EventIndex::default(), now)?
+        .into_iter()
+        .filter(|w| w.kind != WaitKind::Blocker)
+        .map(|w| OwnerWait {
+            issue: w.issue,
+            kind: w.kind,
+            reason: w.reason,
+        })
+        .collect())
 }
 
 /// The line that tells the operator something needs them; empty when nothing does.
@@ -368,6 +429,15 @@ struct Assessment {
     can_start: bool,
     /// See `questions_waiting`.
     questions_waiting: usize,
+    /// Everything that waits for the owner (see `owner_waits`), whether or not the loop is idle.
+    waits: Vec<OwnerWait>,
+}
+
+impl Assessment {
+    /// Nothing runs and nothing can start, but something waits for the owner: the loop is parked on them.
+    fn parked_on_owner(&self) -> bool {
+        !self.busy && !self.can_start && !self.waits.is_empty()
+    }
 }
 
 fn run_is_busy(s: RunState) -> bool {
@@ -420,6 +490,7 @@ fn assess(ctx: &Ctx, dispatch: bool, gate: &GateSlot) -> Result<Assessment, AppE
         gate_busy,
         can_start,
         questions_waiting: questions_waiting(ctx)?,
+        waits: owner_waits(ctx)?,
     })
 }
 
@@ -429,11 +500,20 @@ fn assess(ctx: &Ctx, dispatch: bool, gate: &GateSlot) -> Result<Assessment, AppE
 /// (or a check of main still owed) keeps the loop going even with nothing open and past the tick limit:
 /// the gate command is a child of this process and would outlive it, and the next serve would start a
 /// second gate run in the same worktree. The run has a timeout, so the wait is bounded.
-fn decide(a: &Assessment, ticks: u64, max_ticks: Option<u64>, tick_ok: bool) -> Option<StopReason> {
+///
+/// `stuck` needs a dead end: nothing runs, nothing can start and nothing waits for the owner. A loop
+/// that is only parked on the owner (`Assessment::parked_on_owner`) goes on, unless `exit_when_waiting`.
+fn decide(
+    a: &Assessment,
+    ticks: u64,
+    max_ticks: Option<u64>,
+    tick_ok: bool,
+    exit_when_waiting: bool,
+) -> Option<StopReason> {
     if a.open.is_empty() && !a.gate_busy {
         return Some(StopReason::AllDone);
     }
-    if tick_ok && !a.busy && !a.can_start {
+    if tick_ok && !a.busy && !a.can_start && (exit_when_waiting || a.waits.is_empty()) {
         return Some(StopReason::Stuck);
     }
     if max_ticks.is_some_and(|n| ticks >= n) && !a.gate_busy {
@@ -449,6 +529,8 @@ pub struct Summary {
     pub open: Vec<IssueId>,
     pub runs: Vec<RunBrief>,
     pub questions_waiting: usize,
+    /// What waits for the owner when the loop stopped; `[]` when nothing does.
+    pub waiting: Vec<OwnerWait>,
 }
 
 fn summary_text(s: &Summary) -> String {
@@ -466,9 +548,36 @@ fn summary_text(s: &Summary) -> String {
         for r in &s.runs {
             out.push_str(&format!("\nrun {} {}", r.issue, r.state));
         }
+        for w in &s.waiting {
+            out.push_str(&format!("\nwaits for you: {}", w.line()));
+        }
     }
     out.push_str(&waiting_line(s.questions_waiting));
     out
+}
+
+/// Printed once when the loop becomes idle on the owner (and again when what it waits for changes), so
+/// that a quiet loop is not mistaken for a dead one.
+#[derive(Serialize)]
+pub struct WaitingNotice {
+    pub ticks: u64,
+    pub waiting: Vec<OwnerWait>,
+}
+
+fn notice_text(n: &WaitingNotice) -> String {
+    let mut out = format!(
+        "serve is alive and waiting for you (tick {}): nothing runs, it goes on when you answer",
+        n.ticks
+    );
+    for w in &n.waiting {
+        out.push_str(&format!("\nwaits for you: {}", w.line()));
+    }
+    out
+}
+
+/// What identifies a wait for the notice: a new reason on the same issue and kind is not news.
+fn wait_keys(waits: &[OwnerWait]) -> Vec<(IssueId, WaitKind)> {
+    waits.iter().map(|w| (w.issue.clone(), w.kind)).collect()
 }
 
 /// `stuck` is a successful report with exit 3, which `Rendered` cannot express, so it is printed
@@ -480,6 +589,7 @@ fn finish(cli: &Cli, ticks: u64, reason: StopReason, a: Assessment) -> Result<Re
         open: a.open,
         runs: a.runs,
         questions_waiting: a.questions_waiting,
+        waiting: a.waits,
     };
     let rendered = Rendered::new(&summary, summary_text(&summary))?;
     if reason == StopReason::Stuck {
@@ -573,6 +683,20 @@ impl Heartbeat {
         self.save();
     }
 
+    /// What the idle loop waits for the owner on (empty while it works); written when it changed.
+    fn set_waiting(&mut self, waits: &[OwnerWait]) {
+        let list = waits
+            .iter()
+            .map(|w| PulseWait {
+                issue: w.issue.to_string(),
+                what: w.what().to_string(),
+            })
+            .collect();
+        if self.pulse.set_waiting(list) {
+            self.save();
+        }
+    }
+
     fn save(&mut self) {
         if let Err(e) = serve_pulse::write(&self.root, &self.pulse) {
             if !self.warned {
@@ -652,6 +776,8 @@ fn serve_loop(
 ) -> Result<Rendered, AppError> {
     let mut watch = ConfigWatch::new(ctx);
     let mut ticks: u64 = 0;
+    // what the last printed notice said the loop waits for; empty while it does not wait
+    let mut announced: Vec<(IssueId, WaitKind)> = Vec::new();
     loop {
         ticks += 1;
         if let Some(warning) = watch.refresh(ctx) {
@@ -682,10 +808,38 @@ fn serve_loop(
         hb.beat(ticks);
         if a.until_done {
             let assessment = assess(ctx, a.dispatch, gate)?;
-            if let Some(reason) = decide(&assessment, ticks, hb.pulse.max_ticks, tick_ok) {
+            if let Some(reason) = decide(
+                &assessment,
+                ticks,
+                hb.pulse.max_ticks,
+                tick_ok,
+                a.exit_when_waiting,
+            ) {
                 // before `finish`, which exits the process for `stuck`
                 hb.stop(reason.as_str());
                 return finish(cli, ticks, reason, assessment);
+            }
+            // Going on: when the loop is idle on the owner, say so in the pulse and (once) on stdout.
+            let parked: &[OwnerWait] = if assessment.parked_on_owner() {
+                &assessment.waits
+            } else {
+                &[]
+            };
+            hb.set_waiting(parked);
+            let keys = wait_keys(parked);
+            if keys != announced {
+                if !parked.is_empty() {
+                    let notice = WaitingNotice {
+                        ticks,
+                        waiting: parked.to_vec(),
+                    };
+                    print_ok(
+                        cli.json,
+                        cli.quiet,
+                        &Rendered::new(&notice, notice_text(&notice))?,
+                    );
+                }
+                announced = keys;
             }
         }
         std::thread::sleep(Duration::from_secs(hb.pulse.interval_s));
@@ -708,7 +862,26 @@ mod tests {
             gate_busy: false,
             can_start,
             questions_waiting: 0,
+            waits: Vec::new(),
         }
+    }
+
+    fn asks(n: u32) -> OwnerWait {
+        OwnerWait {
+            issue: id(n),
+            kind: WaitKind::Question,
+            reason: "which crate?".into(),
+        }
+    }
+
+    /// `decide` as the loop runs by default (it waits for the owner).
+    fn decide_waiting(
+        a: &Assessment,
+        ticks: u64,
+        max_ticks: Option<u64>,
+        tick_ok: bool,
+    ) -> Option<StopReason> {
+        decide(a, ticks, max_ticks, tick_ok, false)
     }
 
     #[test]
@@ -720,6 +893,7 @@ mod tests {
             dispatch: false,
             until_done: true,
             max_ticks,
+            exit_when_waiting: false,
         };
         assert_eq!(limits(&args(None, None), &cfg), (10, None));
         cfg.serve.interval_s = 3;
@@ -817,8 +991,8 @@ mod tests {
     #[test]
     fn no_open_issue_is_all_done_even_at_the_tick_limit() {
         let a = assessment(0, false, false);
-        assert_eq!(decide(&a, 1, None, true), Some(StopReason::AllDone));
-        assert_eq!(decide(&a, 3, Some(3), true), Some(StopReason::AllDone));
+        assert_eq!(decide_waiting(&a, 1, None, true), Some(StopReason::AllDone));
+        assert_eq!(decide_waiting(&a, 3, Some(3), true), Some(StopReason::AllDone));
     }
 
     #[test]
@@ -829,12 +1003,12 @@ mod tests {
             ..assessment(0, false, false)
         };
         assert_eq!(
-            decide(&a, 1, None, true),
+            decide_waiting(&a, 1, None, true),
             None,
             "stopping would kill the gate run"
         );
         assert_eq!(
-            decide(&a, 4, Some(4), true),
+            decide_waiting(&a, 4, Some(4), true),
             None,
             "not even the tick limit ends the loop under a gate run: its process would outlive klobuk"
         );
@@ -844,33 +1018,121 @@ mod tests {
             ..assessment(1, false, true)
         };
         assert_eq!(
-            decide(&over, 5, Some(4), true),
+            decide_waiting(&over, 5, Some(4), true),
             Some(StopReason::MaxTicks),
             "once the run is concluded the limit applies"
         );
     }
 
     #[test]
-    fn idle_without_a_slot_is_stuck_after_one_tick() {
+    fn idle_without_a_slot_and_nobody_to_wait_for_is_stuck_after_one_tick() {
         let a = assessment(2, false, false);
-        assert_eq!(decide(&a, 1, None, true), Some(StopReason::Stuck));
-        assert_eq!(decide(&a, 5, Some(5), true), Some(StopReason::Stuck));
+        for exit_when_waiting in [false, true] {
+            assert_eq!(
+                decide(&a, 1, None, true, exit_when_waiting),
+                Some(StopReason::Stuck)
+            );
+            assert_eq!(
+                decide(&a, 5, Some(5), true, exit_when_waiting),
+                Some(StopReason::Stuck)
+            );
+        }
+    }
+
+    #[test]
+    fn idle_with_something_that_waits_for_the_owner_goes_on_unless_told_to_exit() {
+        let a = Assessment {
+            waits: vec![asks(1)],
+            ..assessment(2, false, false)
+        };
+        assert!(a.parked_on_owner());
+        assert_eq!(decide(&a, 1, None, true, false), None, "waiting is the default");
+        assert_eq!(decide(&a, 99, None, true, false), None);
+        assert_eq!(
+            decide(&a, 3, Some(3), true, false),
+            Some(StopReason::MaxTicks),
+            "--max-ticks ends a waiting loop"
+        );
+        assert_eq!(
+            decide(&a, 1, None, true, true),
+            Some(StopReason::Stuck),
+            "--exit-when-waiting"
+        );
+        // the answer arrives: the question is gone and the loop is at a dead end again
+        let answered = Assessment {
+            waits: Vec::new(),
+            ..a.clone()
+        };
+        assert_eq!(decide(&answered, 2, None, true, false), Some(StopReason::Stuck));
+    }
+
+    #[test]
+    fn a_wait_is_not_a_park_while_work_runs_or_can_start() {
+        for (busy, can_start) in [(true, false), (false, true)] {
+            let a = Assessment {
+                waits: vec![asks(1)],
+                ..assessment(2, busy, can_start)
+            };
+            assert!(!a.parked_on_owner(), "busy={busy} can_start={can_start}");
+        }
     }
 
     #[test]
     fn busy_or_plannable_work_keeps_going_until_the_limit() {
         for a in [assessment(1, true, false), assessment(1, false, true)] {
-            assert_eq!(decide(&a, 1, None, true), None);
-            assert_eq!(decide(&a, 1, Some(2), true), None);
-            assert_eq!(decide(&a, 2, Some(2), true), Some(StopReason::MaxTicks));
+            assert_eq!(decide_waiting(&a, 1, None, true), None);
+            assert_eq!(decide_waiting(&a, 1, Some(2), true), None);
+            assert_eq!(decide_waiting(&a, 2, Some(2), true), Some(StopReason::MaxTicks));
         }
     }
 
     #[test]
     fn a_failed_tick_is_never_stuck_but_still_counts_towards_the_limit() {
         let a = assessment(1, false, false);
-        assert_eq!(decide(&a, 1, Some(3), false), None);
-        assert_eq!(decide(&a, 3, Some(3), false), Some(StopReason::MaxTicks));
+        assert_eq!(decide_waiting(&a, 1, Some(3), false), None);
+        assert_eq!(decide_waiting(&a, 3, Some(3), false), Some(StopReason::MaxTicks));
+    }
+
+    #[test]
+    fn the_notice_says_the_loop_is_alive_and_lists_what_it_waits_for() {
+        let n = WaitingNotice {
+            ticks: 4,
+            waiting: vec![asks(7)],
+        };
+        assert_eq!(
+            notice_text(&n),
+            "serve is alive and waiting for you (tick 4): nothing runs, it goes on when you answer\n\
+             waits for you: asf-7: question — which crate?"
+        );
+        // a new reason on the same issue and kind is not news, a new issue is
+        let same = [OwnerWait {
+            reason: "another text".into(),
+            ..asks(7)
+        }];
+        assert_eq!(wait_keys(&same), wait_keys(&n.waiting));
+        assert_ne!(wait_keys(&[asks(8)]), wait_keys(&n.waiting));
+    }
+
+    #[test]
+    fn every_kind_that_the_owner_can_resolve_has_words() {
+        for kind in [
+            WaitKind::Question,
+            WaitKind::RunBlocked,
+            WaitKind::RunStalled,
+            WaitKind::RunOverBudget,
+            WaitKind::RunFailed,
+            WaitKind::IssueBlocked,
+            WaitKind::MergeFailed,
+            WaitKind::MergeBlocked,
+        ] {
+            let w = OwnerWait {
+                issue: id(7),
+                kind,
+                reason: String::new(),
+            };
+            assert!(w.line().starts_with("asf-7: ") && !w.what().is_empty(), "{kind}");
+        }
+        assert_eq!(asks(7).line(), "asf-7: question — which crate?");
     }
 
     #[test]

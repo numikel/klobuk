@@ -141,12 +141,17 @@ pub struct ServeArgs {
     #[arg(long)]
     pub dispatch: bool,
     /// Keep ticking until nothing is left to do, then print a summary and exit
-    /// (reasons: all_done, max_ticks, stuck; stuck exits 3).
+    /// (reasons: all_done, max_ticks, stuck; stuck exits 3). While the only obstacle is something that
+    /// waits for you (a question, a blocked or failed run, issue or merge), the loop keeps waiting.
     #[arg(long, conflicts_with = "once")]
     pub until_done: bool,
     /// With --until-done: stop after this many ticks (>= 1); default `[serve] max_ticks` (none).
     #[arg(long, requires = "until_done", value_parser = clap::value_parser!(u64).range(1..))]
     pub max_ticks: Option<u64>,
+    /// With --until-done: do not wait for you; end with `stuck` (exit 3) as soon as nothing runs or can
+    /// start, even when something waits for your answer (the behaviour before the loop learned to wait).
+    #[arg(long, requires = "until_done", conflicts_with = "once")]
+    pub exit_when_waiting: bool,
 }
 
 #[derive(Args, Debug)]
