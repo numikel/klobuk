@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="396" viewBox="0 0 880 396" role="img" aria-label="The Queue view of klobuk: a branch in the gates of the merge queue and one merged today">
+<title>The Queue view of klobuk: a branch in the gates of the merge queue and one merged today</title>
+<style>text{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:13px;white-space:pre}</style>
+<rect width="880" height="396" fill="#1b1e24"/>
+<g shape-rendering="crispEdges">
+<rect x="384" y="18" width="72" height="18" fill="#56b6c2"/>
+<rect x="0" y="108" width="880" height="18" fill="#444444"/>
+</g>
+<text x="8" y="13" fill="#d7dae0" textLength="152" lengthAdjust="spacing" font-weight="700">klobuk · notekeeper</text>
+<text x="168" y="13" fill="#d7dae0" textLength="64" lengthAdjust="spacing">· main ·</text>
+<text x="240" y="13" fill="#98c379" textLength="80" lengthAdjust="spacing">runtime ok</text>
+<text x="328" y="13" fill="#d7dae0">·</text>
+<text x="344" y="13" fill="#8b8e94" textLength="88" lengthAdjust="spacing">loop ok 4 s</text>
+<text x="440" y="13" fill="#d7dae0" textLength="200" lengthAdjust="spacing">· workers 2/3 · queue 1 ·</text>
+<text x="648" y="13" fill="#e06c75" textLength="88" lengthAdjust="spacing" font-weight="700">■ 1 waiting</text>
+<text x="8" y="31" fill="#d7dae0" textLength="368" lengthAdjust="spacing">[1] Now │ [2] Board │ [3] Agents │ [4] Inbox │</text>
+<text x="384" y="31" fill="#1b1e24" textLength="72" lengthAdjust="spacing">[5] Queue</text>
+<text x="464" y="31" fill="#d7dae0" textLength="176" lengthAdjust="spacing">│ [6] Log │ [7] Config</text>
+<text x="0" y="49" fill="#e5c07b" textLength="528" lengthAdjust="spacing" font-weight="700">■ nk-8 asks: Should note sync use a shared folder or a git remote?</text>
+<text x="0" y="67" fill="#8b8e94" textLength="880" lengthAdjust="spacing">──────────────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="8" y="85" fill="#d7dae0" textLength="128" lengthAdjust="spacing" font-weight="700">IN THE QUEUE (1)</text>
+<text x="208" y="85" fill="#8b8e94" textLength="48" lengthAdjust="spacing">rebase</text>
+<text x="304" y="85" fill="#8b8e94" textLength="40" lengthAdjust="spacing">gates</text>
+<text x="400" y="85" fill="#8b8e94" textLength="48" lengthAdjust="spacing">review</text>
+<text x="544" y="85" fill="#8b8e94" textLength="40" lengthAdjust="spacing">merge</text>
+<text x="640" y="85" fill="#8b8e94" textLength="80" lengthAdjust="spacing">main gates</text>
+<text x="8" y="121" fill="#d7dae0">▾</text>
+<text x="24" y="121" fill="#e5c07b">◆</text>
+<text x="40" y="121" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-7</text>
+<text x="88" y="121" fill="#d7dae0" textLength="72" lengthAdjust="spacing">feat/nk-7</text>
+<text x="208" y="121" fill="#9c9ea1" textLength="48" lengthAdjust="spacing">✓ done</text>
+<text x="304" y="121" fill="#56b6c2" textLength="72" lengthAdjust="spacing">⠋ running</text>
+<text x="400" y="121" fill="#d7dae0">○</text>
+<text x="544" y="121" fill="#d7dae0">○</text>
+<text x="640" y="121" fill="#d7dae0">○</text>
+<text x="744" y="121" fill="#9c9ea1" textLength="40" lengthAdjust="spacing">5 min</text>
+<text x="88" y="139" fill="#8b8e94" textLength="176" lengthAdjust="spacing">attempt 1 · 5 min 20 s</text>
+<text x="104" y="157" fill="#98c379">✓</text>
+<text x="120" y="157" fill="#d7dae0" textLength="208" lengthAdjust="spacing">rebase onto main (a07d3be)</text>
+<text x="848" y="157" fill="#8b8e94" textLength="32" lengthAdjust="spacing">12 s</text>
+<text x="104" y="175" fill="#98c379">✓</text>
+<text x="120" y="175" fill="#d7dae0" textLength="64" lengthAdjust="spacing">gate fmt</text>
+<text x="856" y="175" fill="#8b8e94" textLength="24" lengthAdjust="spacing">3 s</text>
+<text x="104" y="193" fill="#98c379">✓</text>
+<text x="120" y="193" fill="#d7dae0" textLength="88" lengthAdjust="spacing">gate clippy</text>
+<text x="848" y="193" fill="#8b8e94" textLength="32" lengthAdjust="spacing">41 s</text>
+<text x="104" y="211" fill="#56b6c2">●</text>
+<text x="120" y="211" fill="#d7dae0" textLength="72" lengthAdjust="spacing">gate test</text>
+<text x="728" y="211" fill="#8b8e94" textLength="152" lengthAdjust="spacing">running  2 min 19 s</text>
+<text x="104" y="229" fill="#d7dae0" textLength="120" lengthAdjust="spacing">○ review · opus</text>
+<text x="104" y="247" fill="#d7dae0" textLength="56" lengthAdjust="spacing">○ merge</text>
+<text x="104" y="265" fill="#d7dae0" textLength="120" lengthAdjust="spacing">○ gates on main</text>
+<text x="8" y="301" fill="#d7dae0" textLength="128" lengthAdjust="spacing" font-weight="700">MERGED TODAY (1)</text>
+<text x="24" y="337" fill="#8b8e94">✓</text>
+<text x="40" y="337" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-4</text>
+<text x="88" y="337" fill="#d7dae0" textLength="360" lengthAdjust="spacing">7be0f42  review approve · gates on main green</text>
+<text x="704" y="337" fill="#8b8e94" textLength="80" lengthAdjust="spacing">32 min ago</text>
+<text x="0" y="373" fill="#8b8e94" textLength="880" lengthAdjust="spacing">──────────────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="8" y="391" fill="#56b6c2" textLength="40" lengthAdjust="spacing" font-weight="700">j / k</text>
+<text x="56" y="391" fill="#8b8e94" textLength="32" lengthAdjust="spacing">move</text>
+<text x="104" y="391" fill="#56b6c2" font-weight="700">r</text>
+<text x="120" y="391" fill="#8b8e94" textLength="40" lengthAdjust="spacing">retry</text>
+<text x="176" y="391" fill="#56b6c2" font-weight="700">v</text>
+<text x="192" y="391" fill="#8b8e94" textLength="48" lengthAdjust="spacing">verify</text>
+<text x="256" y="391" fill="#56b6c2" textLength="40" lengthAdjust="spacing" font-weight="700">Enter</text>
+<text x="304" y="391" fill="#8b8e94" textLength="40" lengthAdjust="spacing">steps</text>
+<text x="360" y="391" fill="#56b6c2" font-weight="700">f</text>
+<text x="376" y="391" fill="#8b8e94" textLength="112" lengthAdjust="spacing">focus reviewer</text>
+<text x="504" y="391" fill="#56b6c2" font-weight="700">?</text>
+<text x="520" y="391" fill="#8b8e94" textLength="32" lengthAdjust="spacing">help</text>
+<text x="568" y="391" fill="#56b6c2" font-weight="700">q</text>
+<text x="584" y="391" fill="#8b8e94" textLength="32" lengthAdjust="spacing">quit</text>
+</svg>

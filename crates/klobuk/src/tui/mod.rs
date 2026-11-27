@@ -23,6 +23,10 @@ pub mod snapshot;
 pub mod theme;
 pub mod views;
 
+// The README pictures: test builds only (see `shots/mod.rs`), so the binary carries no demo data.
+#[cfg(test)]
+mod shots;
+
 #[cfg(test)]
 mod tests;
 

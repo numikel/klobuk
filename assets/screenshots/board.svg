@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="360" viewBox="0 0 880 360" role="img" aria-label="The Board view of klobuk: a kanban of ten demo tasks, one of them waiting for an answer">
+<title>The Board view of klobuk: a kanban of ten demo tasks, one of them waiting for an answer</title>
+<style>text{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:13px;white-space:pre}</style>
+<rect width="880" height="360" fill="#1b1e24"/>
+<g shape-rendering="crispEdges">
+<rect x="88" y="18" width="72" height="18" fill="#56b6c2"/>
+<rect x="256" y="90" width="120" height="18" fill="#444444"/>
+<rect x="256" y="108" width="56" height="18" fill="#444444"/>
+<rect x="256" y="126" width="120" height="18" fill="#444444"/>
+<rect x="256" y="144" width="56" height="18" fill="#444444"/>
+</g>
+<text x="8" y="13" fill="#d7dae0" textLength="152" lengthAdjust="spacing" font-weight="700">klobuk · notekeeper</text>
+<text x="168" y="13" fill="#d7dae0" textLength="64" lengthAdjust="spacing">· main ·</text>
+<text x="240" y="13" fill="#98c379" textLength="80" lengthAdjust="spacing">runtime ok</text>
+<text x="328" y="13" fill="#d7dae0">·</text>
+<text x="344" y="13" fill="#8b8e94" textLength="88" lengthAdjust="spacing">loop ok 4 s</text>
+<text x="440" y="13" fill="#d7dae0" textLength="200" lengthAdjust="spacing">· workers 2/3 · queue 1 ·</text>
+<text x="648" y="13" fill="#e06c75" textLength="88" lengthAdjust="spacing" font-weight="700">■ 1 waiting</text>
+<text x="8" y="31" fill="#d7dae0" textLength="72" lengthAdjust="spacing">[1] Now │</text>
+<text x="88" y="31" fill="#1b1e24" textLength="72" lengthAdjust="spacing">[2] Board</text>
+<text x="168" y="31" fill="#d7dae0" textLength="472" lengthAdjust="spacing">│ [3] Agents │ [4] Inbox │ [5] Queue │ [6] Log │ [7] Config</text>
+<text x="0" y="49" fill="#e5c07b" textLength="528" lengthAdjust="spacing" font-weight="700">■ nk-8 asks: Should note sync use a shared folder or a git remote?</text>
+<text x="0" y="67" fill="#8b8e94" textLength="880" lengthAdjust="spacing">──────────────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="8" y="85" fill="#d7dae0" textLength="568" lengthAdjust="spacing">backlog 2 · ready 1 · in-progress 2 · blocked 1 · validating 1 · done 3</text>
+<text x="616" y="85" fill="#56b6c2" font-weight="700">/</text>
+<text x="632" y="85" fill="#8b8e94" textLength="48" lengthAdjust="spacing">filter</text>
+<text x="0" y="103" fill="#d7dae0" textLength="72" lengthAdjust="spacing" font-weight="700">backlog 2</text>
+<text x="128" y="103" fill="#d7dae0" textLength="56" lengthAdjust="spacing" font-weight="700">ready 1</text>
+<text x="256" y="103" fill="#d7dae0" textLength="200" lengthAdjust="spacing" font-weight="700">in-progress 2   blocked 1</text>
+<text x="512" y="103" fill="#d7dae0" textLength="88" lengthAdjust="spacing" font-weight="700">in-review 0</text>
+<text x="640" y="103" fill="#d7dae0" textLength="96" lengthAdjust="spacing" font-weight="700">validating 1</text>
+<text x="768" y="103" fill="#d7dae0" textLength="48" lengthAdjust="spacing" font-weight="700">done 3</text>
+<text x="8" y="121" fill="#d7dae0">○</text>
+<text x="24" y="121" fill="#d7dae0" textLength="40" lengthAdjust="spacing" font-weight="700">nk-10</text>
+<text x="136" y="121" fill="#d7dae0">○</text>
+<text x="152" y="121" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-9</text>
+<text x="256" y="121" fill="#d7dae0">▸</text>
+<text x="264" y="121" fill="#98c379">●</text>
+<text x="280" y="121" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-5</text>
+<text x="392" y="121" fill="#d7dae0">○</text>
+<text x="408" y="121" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-8</text>
+<text x="648" y="121" fill="#e5c07b">◆</text>
+<text x="664" y="121" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-7</text>
+<text x="776" y="121" fill="#8b8e94">✓</text>
+<text x="792" y="121" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-4</text>
+<text x="8" y="139" fill="#d7dae0" textLength="96" lengthAdjust="spacing">Man page and</text>
+<text x="136" y="139" fill="#d7dae0" textLength="368" lengthAdjust="spacing">Colour output   Full-text note  Sync through a</text>
+<text x="648" y="139" fill="#d7dae0" textLength="112" lengthAdjust="spacing">Tag and filter</text>
+<text x="776" y="139" fill="#8b8e94" textLength="96" lengthAdjust="spacing">Add and list</text>
+<text x="8" y="157" fill="#d7dae0" textLength="88" lengthAdjust="spacing">completions</text>
+<text x="136" y="157" fill="#d7dae0" textLength="72" lengthAdjust="spacing">for lists</text>
+<text x="264" y="157" fill="#d7dae0" textLength="48" lengthAdjust="spacing">search</text>
+<text x="392" y="157" fill="#d7dae0" textLength="104" lengthAdjust="spacing">shared folder</text>
+<text x="648" y="157" fill="#d7dae0" textLength="40" lengthAdjust="spacing">notes</text>
+<text x="776" y="157" fill="#8b8e94" textLength="40" lengthAdjust="spacing">notes</text>
+<text x="8" y="193" fill="#d7dae0">○</text>
+<text x="24" y="193" fill="#d7dae0" textLength="40" lengthAdjust="spacing" font-weight="700">nk-11</text>
+<text x="264" y="193" fill="#98c379">●</text>
+<text x="280" y="193" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-6</text>
+<text x="776" y="193" fill="#8b8e94">✓</text>
+<text x="792" y="193" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-3</text>
+<text x="8" y="211" fill="#d7dae0" textLength="80" lengthAdjust="spacing">Publish to</text>
+<text x="264" y="211" fill="#d7dae0" textLength="96" lengthAdjust="spacing">Export notes</text>
+<text x="776" y="211" fill="#8b8e94" textLength="88" lengthAdjust="spacing">Store notes</text>
+<text x="8" y="229" fill="#d7dae0" textLength="72" lengthAdjust="spacing">crates.io</text>
+<text x="264" y="229" fill="#d7dae0" textLength="88" lengthAdjust="spacing">to Markdown</text>
+<text x="776" y="229" fill="#8b8e94" textLength="72" lengthAdjust="spacing">in SQLite</text>
+<text x="776" y="265" fill="#8b8e94">✓</text>
+<text x="792" y="265" fill="#d7dae0" textLength="32" lengthAdjust="spacing" font-weight="700">nk-2</text>
+<text x="776" y="283" fill="#8b8e94" textLength="80" lengthAdjust="spacing">Set up the</text>
+<text x="776" y="301" fill="#8b8e94" textLength="56" lengthAdjust="spacing">project</text>
+<text x="0" y="337" fill="#8b8e94" textLength="880" lengthAdjust="spacing">──────────────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="8" y="355" fill="#56b6c2" textLength="40" lengthAdjust="spacing" font-weight="700">h / l</text>
+<text x="56" y="355" fill="#8b8e94" textLength="112" lengthAdjust="spacing">fold or column</text>
+<text x="184" y="355" fill="#56b6c2" font-weight="700">s</text>
+<text x="200" y="355" fill="#8b8e94" textLength="40" lengthAdjust="spacing">start</text>
+<text x="256" y="355" fill="#56b6c2" font-weight="700">a</text>
+<text x="272" y="355" fill="#8b8e94" textLength="48" lengthAdjust="spacing">answer</text>
+<text x="336" y="355" fill="#56b6c2" textLength="40" lengthAdjust="spacing" font-weight="700">Enter</text>
+<text x="384" y="355" fill="#8b8e94" textLength="96" lengthAdjust="spacing">full details</text>
+<text x="496" y="355" fill="#56b6c2" font-weight="700">b</text>
+<text x="512" y="355" fill="#8b8e94" textLength="48" lengthAdjust="spacing">layout</text>
+<text x="576" y="355" fill="#56b6c2" font-weight="700">?</text>
+<text x="592" y="355" fill="#8b8e94" textLength="32" lengthAdjust="spacing">help</text>
+<text x="640" y="355" fill="#56b6c2" font-weight="700">q</text>
+<text x="656" y="355" fill="#8b8e94" textLength="32" lengthAdjust="spacing">quit</text>
+</svg>
