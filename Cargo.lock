@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "klobuk"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "klobuk-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "globset",
  "proptest",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "klobuk-runtime"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "klobuk-core",
  "serde",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "klobuk-store"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "klobuk-core",
  "rusqlite",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "klobuk-vcs"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "klobuk-core",
  "serde",
