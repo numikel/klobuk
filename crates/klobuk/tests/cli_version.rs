@@ -1,5 +1,11 @@
 use assert_cmd::Command;
 
+// The build script itself, so its source picking is tested without building a package.
+#[path = "../build.rs"]
+#[allow(dead_code)]
+mod build_script;
+use build_script::{resolve_sha, sha_from_vcs_info};
+
 /// `klobuk <version> (<7+ hex sha> | unknown)`, one line.
 fn assert_shape(out: &str) {
     let line = out.trim_end();
@@ -33,6 +39,65 @@ fn long_flag_prints_version_and_sha() {
 fn short_flag_matches_long_flag() {
     assert_eq!(version_output("-V"), version_output("--version"));
     assert_shape(&version_output("-V"));
+}
+
+const FULL_SHA: &str = "aac20b6e7e543e6dd4118b246c77225e3a3a1302";
+/// Exactly what `cargo package` writes (cargo-package(1), ".cargo_vcs_info.json format").
+const VCS_INFO_DOC: &str = "{\n \"git\": {\n   \"sha1\": \"aac20b6e7e543e6dd4118b246c77225e3a3a1302\",\n   \"dirty\": true\n },\n \"path_in_vcs\": \"crates/klobuk\"\n}";
+
+fn no_git() -> Option<String> {
+    panic!("git must not be asked when the vcs info settles the commit");
+}
+
+#[test]
+fn vcs_info_gives_the_short_commit() {
+    assert_eq!(sha_from_vcs_info(VCS_INFO_DOC).as_deref(), Some("aac20b6"));
+    // Compact form, no dirty flag, other keys before and after.
+    let compact = format!(r#"{{"path_in_vcs":"","git":{{"sha1":"{FULL_SHA}"}}}}"#);
+    assert_eq!(sha_from_vcs_info(&compact).as_deref(), Some("aac20b6"));
+}
+
+#[test]
+fn vcs_info_that_does_not_parse_gives_nothing() {
+    let bad = [
+        "",
+        "{",
+        "not json at all",
+        r#"{"path_in_vcs":""}"#,
+        r#"{"git":{}}"#,
+        r#"{"git":{"sha1":"#,
+        r#"{"git":{"sha1":"aac20b6"#,
+        r#"{"git":{"sha1":aac20b6e7e5}}"#,
+        r#"{"git":{"sha1":"aac20b"}}"#,
+        r#"{"git":{"sha1":"zzzzzzzzzzzz"}}"#,
+        r#"{"git":{"sha1":""}}"#,
+        r#"{"other":{"sha1":"aac20b6e7e543e6d"}}"#,
+        "{\"git\":{\"sha1\":\"\u{142}\u{142}\u{142}\u{142}\"}}",
+    ];
+    for json in bad {
+        assert_eq!(sha_from_vcs_info(json), None, "{json:?}");
+    }
+}
+
+#[test]
+fn packaged_build_uses_the_vcs_info_and_never_asks_git() {
+    assert_eq!(resolve_sha(Some(VCS_INFO_DOC), no_git), "aac20b6");
+}
+
+#[test]
+fn checkout_without_the_file_uses_git() {
+    assert_eq!(resolve_sha(None, || Some("1234abc".into())), "1234abc");
+}
+
+#[test]
+fn unusable_file_falls_back_to_git() {
+    assert_eq!(resolve_sha(Some("{broken"), || Some("1234abc".into())), "1234abc");
+}
+
+#[test]
+fn neither_source_prints_unknown() {
+    assert_eq!(resolve_sha(None, || None), "unknown");
+    assert_eq!(resolve_sha(Some("{broken"), || None), "unknown");
 }
 
 #[test]
