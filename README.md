@@ -576,6 +576,19 @@ The tests fake gates and workers with `python -c …` and `python <script>`, so 
 PowerShell (`powershell` on Windows, `pwsh` elsewhere) is optional: the one test that runs a gate
 through it prints "skipping" when the program is missing.
 
+### Releasing
+
+A pushed `v*` tag publishes the five crates to crates.io (`.github/workflows/release.yml`), with no
+stored token.
+
+1. Bump the version in the root `Cargo.toml`: `[workspace.package]` and the four `klobuk-*` entries
+   in `[workspace.dependencies]`; commit the updated `Cargo.lock` too.
+2. Merge to `main` and wait for green CI.
+3. Tag the merge commit and push the tag: `git tag v0.1.2 && git push origin v0.1.2`.
+4. The run checks that the tag equals the workspace version, runs the three gates on Windows and
+   Linux, then waits for a required reviewer of the `release` environment: approve it in the
+   Actions tab.
+
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE).

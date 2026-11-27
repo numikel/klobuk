@@ -1,0 +1,85 @@
+# Publishes the five crates to crates.io from a pushed `v*` tag.
+#
+# Auth is crates.io Trusted Publishing (OIDC): no token is stored anywhere. The identity
+# crates.io trusts is the tuple owner/repository/workflow file name/environment, so renaming
+# this file or the `release` environment means updating all five crates on crates.io too.
+# Docs: https://crates.io/docs/trusted-publishing
+#       https://github.com/rust-lang/crates-io-auth-action
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: tag matches workspace version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          ws_version="$(awk '/^\[/{s=$0} s=="[workspace.package]" && /^version *=/{gsub(/.*= *"|".*/,""); print; exit}' Cargo.toml)"
+          echo "tag=${tag_version} workspace=${ws_version}"
+          if [ -z "$ws_version" ] || [ "$tag_version" != "$ws_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match version = \"${ws_version}\" in [workspace.package] of Cargo.toml"
+            exit 1
+          fi
+          # the internal crates pin each other in [workspace.dependencies]; a missed bump there
+          # would publish a crate that depends on the previous release of its sibling
+          for crate in klobuk-core klobuk-store klobuk-vcs klobuk-runtime; do
+            if ! grep -qF "${crate} = { version = \"${tag_version}\"" Cargo.toml; then
+              echo "::error::[workspace.dependencies] does not pin ${crate} to version \"${tag_version}\""
+              exit 1
+            fi
+          done
+
+  gates:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # the tests fake gates and workers with `python -c ...` / `python <script>`
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace --no-fail-fast
+
+  publish:
+    needs: [version, gates]
+    runs-on: ubuntu-latest
+    # waits here until a required reviewer of the `release` environment approves the run
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      # `cargo publish --workspace` needs Cargo 1.90 or newer; stable is far past it
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: publish
+        run: cargo publish --workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
